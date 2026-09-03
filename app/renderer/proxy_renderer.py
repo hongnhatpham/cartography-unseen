@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from math import cos, pi, radians, sin
 from pathlib import Path
 from time import perf_counter
@@ -17,6 +16,18 @@ except ImportError as exc:  # pragma: no cover - rendered as a startup error by 
     ) from exc
 
 from app.renderer.camera import Camera
+from app.renderer.city import (
+    ACTIVE_CHUNK_RADIUS,
+    CityChunk,
+    CityCube,
+    RoadContact,
+    generate_chunk,
+    move_road_contact as move_city_road_contact,
+    plan_chunk_cache,
+    sky_color,
+    spawn_road_contact as spawn_city_road_contact,
+    world_to_chunk,
+)
 from app.types import ConditioningFrame, GeneratedFrame
 
 
@@ -128,11 +139,24 @@ def _transform(
     return translation @ rotate_z @ rotate_y @ rotate_x @ scale_matrix
 
 
-@dataclass(frozen=True, slots=True)
-class SceneObject:
-    mesh: str
-    model: np.ndarray
-    color: tuple[float, float, float]
+def _transform_basis(
+    position: tuple[float, float, float],
+    scale: tuple[float, float, float],
+    basis: tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float],
+    ],
+) -> np.ndarray:
+    """Build a transform from explicit local axes for sloped road pieces."""
+    scale_matrix = np.diag((*scale, 1.0)).astype(np.float32)
+    basis_matrix = np.identity(4, dtype=np.float32)
+    basis_matrix[:3, 0] = basis[0]
+    basis_matrix[:3, 1] = basis[1]
+    basis_matrix[:3, 2] = basis[2]
+    translation = np.identity(4, dtype=np.float32)
+    translation[:3, 3] = position
+    return translation @ basis_matrix @ scale_matrix
 
 
 class ProxyRenderer:
@@ -201,13 +225,30 @@ class ProxyRenderer:
             "cylinder": _cylinder_vertices(),
         }
         self.mesh_buffers = {name: self.ctx.buffer(vertices.tobytes()) for name, vertices in meshes.items()}
+        self.instance_buffers = {
+            name: self.ctx.buffer(reserve=19 * np.dtype("f4").itemsize)
+            for name in meshes
+        }
         self.mesh_vaos = {
             name: self.ctx.vertex_array(
                 self.proxy_program,
-                [(buffer, "3f 3f", "in_position", "in_normal")],
+                [
+                    (buffer, "3f 3f", "in_position", "in_normal"),
+                    (
+                        self.instance_buffers[name],
+                        "4f 4f 4f 4f 3f /i",
+                        "instance_model_0",
+                        "instance_model_1",
+                        "instance_model_2",
+                        "instance_model_3",
+                        "instance_color",
+                    ),
+                ],
             )
             for name, buffer in self.mesh_buffers.items()
         }
+        self._instance_counts = {name: 0 for name in meshes}
+        self._instance_buffer_revision = 0
         quad = np.asarray(
             [
                 (-1, -1, 0, 0), (1, -1, 1, 0), (1, 1, 1, 1),
@@ -255,8 +296,13 @@ class ProxyRenderer:
         self.reproject_ms = 0.0
 
         self.world_seed = world_seed
-        self.scene = self._make_scene(world_seed)
+        self.sky_color = sky_color(world_seed)
+        self._chunks: dict[tuple[int, int], CityChunk] = {}
+        self._chunk_instances: dict[tuple[int, int], np.ndarray] = {}
+        self._active_chunk_coords: tuple[tuple[int, int], ...] = ()
+        self._stream_center: tuple[int, int] | None = None
         self.sequence = 0
+        self._closed = False
 
     def toggle_fullscreen(self) -> bool:
         """Switch display mode without rebuilding the active OpenGL context."""
@@ -329,118 +375,80 @@ class ProxyRenderer:
         self.resize_window_to_render()
 
     @staticmethod
-    def _make_scene(seed: int) -> list[SceneObject]:
-        rng = np.random.default_rng(seed)
-        palette = np.asarray(
-            [
-                (0.12, 0.55, 0.46),
-                (0.22, 0.68, 0.72),
-                (0.52, 0.25, 0.66),
-                (0.77, 0.36, 0.19),
-                (0.72, 0.66, 0.22),
-                (0.25, 0.38, 0.73),
-                (0.68, 0.22, 0.48),
-            ],
-            dtype=np.float32,
-        )
-
-        def color(offset: int = 0) -> tuple[float, float, float]:
-            index = (int(rng.integers(0, len(palette))) + offset) % len(palette)
-            return tuple(float(value) for value in palette[index])
-
-        road_center_z = -200.0
-        road_half_length = 210.0
-        objects = [
-            # Continuous ground, asphalt and raised sidewalks keep the central
-            # path readable to both the viewer and the diffusion model.
-            SceneObject(
-                "cube",
-                _transform((0.0, -0.42, road_center_z), (28.0, 0.34, road_half_length)),
-                (0.10, 0.17, 0.16),
-            ),
-            SceneObject(
-                "cube",
-                _transform((0.0, -0.04, road_center_z), (5.2, 0.06, road_half_length)),
-                (0.13, 0.15, 0.18),
-            ),
-            SceneObject(
-                "cube",
-                _transform((-6.15, 0.06, road_center_z), (0.85, 0.12, road_half_length)),
-                color(1),
-            ),
-            SceneObject(
-                "cube",
-                _transform((6.15, 0.06, road_center_z), (0.85, 0.12, road_half_length)),
-                color(1),
-            ),
-        ]
-
-        # Broken center lines make forward movement legible without placing
-        # geometry across the road. The route reaches past -400 Z, three times
-        # the previous approximately -130 Z corridor.
-        for marker in range(34):
-            z = -4.0 - marker * 12.0
-            objects.append(
-                SceneObject(
-                    "cube",
-                    _transform((0.0, 0.035, z), (0.10, 0.035, 2.6)),
-                    (0.86, 0.78, 0.30),
-                )
+    def _pack_instances(objects: tuple[CityCube, ...]) -> np.ndarray:
+        """Pack column-major transforms and colors for one instanced draw."""
+        packed = np.empty((len(objects), 19), dtype="f4")
+        for index, item in enumerate(objects):
+            model = (
+                _transform(item.position, item.half_extents, item.rotation)
+                if item.basis is None
+                else _transform_basis(item.position, item.half_extents, item.basis)
             )
+            packed[index, :16] = model.T.reshape(16)
+            packed[index, 16:] = item.color
+        return packed
 
-        # A varied but clean-sided city wall runs along both sides of the road.
-        # Box architecture avoids the severe depth discontinuities caused by
-        # the former torus portals while preserving a strong vanishing point.
-        for row in range(50):
-            z = -5.0 - row * 8.0 + float(rng.uniform(-0.7, 0.7))
-            for side_index, side in enumerate((-1.0, 1.0)):
-                half_width = float(rng.uniform(1.6, 3.2))
-                half_height = float(rng.uniform(2.8, 8.5))
-                half_depth = float(rng.uniform(2.3, 3.7))
-                setback = float(rng.uniform(0.3, 2.4))
-                x = side * (7.4 + setback + half_width)
-                building_color = color(row + side_index)
-                objects.append(
-                    SceneObject(
-                        "cube",
-                        _transform((x, half_height, z), (half_width, half_height, half_depth)),
-                        building_color,
-                    )
-                )
+    def _update_city(self, position: np.ndarray) -> None:
+        """Move the fixed chunk window and rebuild GPU instances when needed."""
+        plan = plan_chunk_cache(
+            self._chunks,
+            float(position[0]),
+            float(position[2]),
+            ACTIVE_CHUNK_RADIUS,
+        )
+        if not plan.load and not plan.evict:
+            self._stream_center = plan.center
+            return
 
-                # Stepped rooftops and occasional narrow towers give each seed
-                # a distinct skyline while keeping all geometry road-side.
-                if rng.random() < 0.72:
-                    crown_height = float(rng.uniform(0.45, 1.8))
-                    crown_width = half_width * float(rng.uniform(0.35, 0.72))
-                    crown_depth = half_depth * float(rng.uniform(0.35, 0.72))
-                    objects.append(
-                        SceneObject(
-                            "cube",
-                            _transform(
-                                (x, half_height * 2.0 + crown_height, z),
-                                (crown_width, crown_height, crown_depth),
-                            ),
-                            color(row + side_index + 2),
-                        )
-                    )
-                if rng.random() < 0.22:
-                    mast_height = float(rng.uniform(1.2, 3.5))
-                    objects.append(
-                        SceneObject(
-                            "cylinder",
-                            _transform(
-                                (x, half_height * 2.0 + mast_height, z),
-                                (0.12, mast_height, 0.12),
-                            ),
-                            color(row + side_index + 4),
-                        )
-                    )
-        return objects
+        for coord in plan.evict:
+            del self._chunks[coord]
+            del self._chunk_instances[coord]
+        for coord in plan.load:
+            chunk = generate_chunk(coord, self.world_seed)
+            self._chunks[coord] = chunk
+            self._chunk_instances[coord] = self._pack_instances(chunk.objects)
+
+        self._active_chunk_coords = plan.desired
+        self._stream_center = plan.center
+        cube_data = np.concatenate(
+            tuple(self._chunk_instances[coord] for coord in plan.desired),
+            axis=0,
+        )
+        cube_buffer = self.instance_buffers["cube"]
+        if cube_data.nbytes > cube_buffer.size:
+            cube_buffer.orphan(cube_data.nbytes)
+        cube_buffer.write(cube_data.tobytes())
+        self._instance_counts["cube"] = len(cube_data)
+        self._instance_counts["sphere"] = 0
+        self._instance_counts["cylinder"] = 0
+        self._instance_buffer_revision += 1
+
+    def _city_contains(self, position: np.ndarray) -> bool:
+        return world_to_chunk(float(position[0]), float(position[2])) in self._chunks
+
+    def spawn_road_contact(self) -> RoadContact:
+        """Return a guaranteed walkable spawn point for the current world."""
+        return spawn_city_road_contact(self.world_seed)
+
+    def move_road_contact(
+        self,
+        contact: RoadContact,
+        proposed_x: float,
+        proposed_z: float,
+    ) -> RoadContact:
+        """Clamp a proposed step to the current road and reachable junctions."""
+        return move_city_road_contact(
+            contact, proposed_x, proposed_z, self.world_seed
+        )
 
     def randomize_world(self) -> int:
         self.world_seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint32)[0])
-        self.scene = self._make_scene(self.world_seed)
+        self.sky_color = sky_color(self.world_seed)
+        self._chunks.clear()
+        self._chunk_instances.clear()
+        self._active_chunk_coords = ()
+        self._stream_center = None
+        self._instance_counts = {name: 0 for name in self.mesh_buffers}
         self._reproject_sequence = -1
         return self.world_seed
 
@@ -456,19 +464,22 @@ class ProxyRenderer:
         image[:, :, 2] = 31 + glow * 62 + (x + 1.0) * 5
         return np.clip(image, 0, 255).astype(np.uint8)
 
-    def render_scene(self, camera: Camera):
+    def render_scene(self, camera: Camera, *, manage_chunks: bool = True):
+        if manage_chunks:
+            self._update_city(camera.position)
         snapshot = camera.snapshot(aspect=self.render_width / self.render_height)
         self.proxy_fbo.use()
         self.ctx.viewport = (0, 0, self.render_width, self.render_height)
         self.ctx.enable(moderngl.DEPTH_TEST)
         self.ctx.disable(moderngl.CULL_FACE)
-        self.proxy_fbo.clear(0.34, 0.50, 0.66, 1.0, depth=1.0)
+        self.proxy_fbo.clear(*self.sky_color, 1.0, depth=1.0)
         self.proxy_program["view"].write(snapshot.view_matrix.T.astype("f4").tobytes())
         self.proxy_program["projection"].write(snapshot.projection_matrix.T.astype("f4").tobytes())
-        for item in self.scene:
-            self.proxy_program["model"].write(item.model.T.astype("f4").tobytes())
-            self.proxy_program["material_color"].value = item.color
-            self.mesh_vaos[item.mesh].render()
+        self.proxy_program["camera_position"].value = tuple(float(value) for value in camera.position)
+        self.proxy_program["fog_color"].value = self.sky_color
+        for mesh, count in self._instance_counts.items():
+            if count:
+                self.mesh_vaos[mesh].render(instances=count)
         return snapshot
 
     def capture_conditioning(self, snapshot, timestamp: float) -> ConditioningFrame:
@@ -586,14 +597,20 @@ class ProxyRenderer:
         yaw_delta *= effective_strength
         pitch_delta *= effective_strength
         warped_camera = Camera(
-            position=(frame.camera_position + delta).astype(np.float32),
+            position=(frame.camera_position + delta).astype(np.float64),
             yaw=source_yaw_degrees + yaw_delta,
             pitch=source_pitch + pitch_delta,
             fov=camera.fov,
             near=camera.near,
             far=camera.far,
         )
-        current = self.render_scene(warped_camera)
+        if not self._city_contains(warped_camera.position):
+            self.reproject_ms += 0.15 * ((perf_counter() - started) * 1000.0 - self.reproject_ms)
+            self._present_texture(
+                self.display_texture, overlay_lines, sharpen, prompt_caption
+            )
+            return
+        current = self.render_scene(warped_camera, manage_chunks=False)
         source_yaw = radians(float(frame.camera_rotation[1]))
         source_forward = np.array([sin(source_yaw), 0.0, -cos(source_yaw)], dtype=np.float32)
         source_right = np.array([cos(source_yaw), 0.0, sin(source_yaw)], dtype=np.float32)
@@ -756,6 +773,32 @@ class ProxyRenderer:
         return pygame.event.get()
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         pygame.event.set_grab(False)
         pygame.mouse.set_visible(True)
+        resources = (
+            *self.mesh_vaos.values(),
+            *self.instance_buffers.values(),
+            *self.mesh_buffers.values(),
+            self.quad_vao,
+            self.reproject_vao,
+            self.quad_buffer,
+            self.proxy_fbo,
+            self.reproject_fbo,
+            self.color_texture,
+            self.depth_texture,
+            self.display_texture,
+            self.reproject_source_depth,
+            self.reproject_texture,
+            self.reproject_depth,
+            self.overlay_texture,
+            self.proxy_program,
+            self.screen_program,
+            self.reproject_program,
+        )
+        for resource in resources:
+            resource.release()
+        self.ctx.release()
         pygame.quit()

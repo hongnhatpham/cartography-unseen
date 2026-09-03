@@ -71,6 +71,9 @@ class ProxyPassthroughBackend(DiffusionBackend):
     def set_steps(self, steps: int) -> None:
         return
 
+    def set_guidance_scale(self, guidance_scale: float) -> None:
+        return
+
     def set_one_step_timestep(self, timestep: int) -> None:
         return
 
@@ -81,4 +84,7 @@ class ProxyPassthroughBackend(DiffusionBackend):
         return
 
     def set_edge_strength(self, strength: float) -> None:
+        return
+
+    def set_noise_persistence(self, persistence: float) -> None:
         return

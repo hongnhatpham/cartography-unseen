@@ -10,6 +10,7 @@ from typing import Any
 
 VALID_RESOLUTIONS = (384, 448, 512)
 RESOLUTION_MODES = (
+    (384, 216),
     (640, 384),
     (384, 256),
     (512, 512),
@@ -20,14 +21,15 @@ RESOLUTION_MODES = (
 
 @dataclass(slots=True)
 class AppConfig:
-    prompt: str = "dreamlike surreal painted architectural city, monumental arches, endless colonnades, floating domes, expressive oil brushwork, atmospheric perspective, luminous color"
-    default_prompt: str = "dreamlike surreal painted architectural city, monumental arches, endless colonnades, floating domes, expressive oil brushwork, atmospheric perspective, luminous color"
-    negative_prompt: str = "simple 3d primitives, greybox, blockout, low-poly render, UI, text"
+    prompt: str = "uncanny rendering, AI hallucination, biophilic cityscape"
+    default_prompt: str = "uncanny rendering, AI hallucination, biophilic cityscape"
+    negative_prompt: str = "photorealism, cinematic realism, natural materials, text, watermark, interface"
     backend: str = "sd_turbo_stream"
-    diffusion_resolution: int | str = "640x384"
+    diffusion_resolution: int | str = "384x216"
     steps: int = 1
+    guidance_scale: float = 1.25
     seed: int = 12345
-    seed_mode: str = "fixed"
+    seed_mode: str = "drift"
     random_seed_on_launch: bool = False
     movement_speed: float = 9.0
     sprint_multiplier: float = 3.0
@@ -35,8 +37,8 @@ class AppConfig:
     img2img_strength: float = 1.0
     one_step_timestep: int = 750
     fixed_noise: bool = True
-    previous_frame_weight: float = 0.0
-    noise_persistence: float = 0.95
+    previous_frame_weight: float = 0.15
+    noise_persistence: float = 0.975
     edge_strength: float = 0.7
     edge_softness: float = 1.5
     depth_strength: float = 0.0
@@ -47,8 +49,9 @@ class AppConfig:
     display_sharpen: float = 0.3
     target_display_fps: int = 60
     conditioning_fps: int = 15
-    debug_overlay: bool = True
-    fullscreen: bool = False
+    debug_overlay: bool = False
+    prompt_caption: bool = False
+    fullscreen: bool = True
     display_monitor: int = 0
     world_seed: int = 12345
     auto_resolution_fallback: bool = True
@@ -80,19 +83,23 @@ class AppConfig:
             width == height and width in VALID_RESOLUTIONS
         ):
             raise RuntimeError(
-                "diffusion_resolution must be 640x384, 384x256, 512x512, "
-                "768x512, or 1024x768"
+                "diffusion_resolution must be 384x216, 640x384, 384x256, "
+                "512x512, 768x512, or 1024x768"
             )
         if not 1 <= self.steps <= 4:
             raise RuntimeError("steps must be between 1 and 4")
-        if self.seed_mode not in ("fixed", "random_each_frame"):
-            raise RuntimeError("seed_mode must be fixed or random_each_frame")
+        if self.seed_mode not in ("fixed", "drift", "random_each_frame"):
+            raise RuntimeError("seed_mode must be fixed, drift, or random_each_frame")
+        if not 0.0 <= self.guidance_scale <= 4.0:
+            raise RuntimeError("guidance_scale must be in [0, 4]")
         if not 0.0 < self.img2img_strength <= 1.0:
             raise RuntimeError("img2img_strength must be in (0, 1]")
         if not 1 <= self.one_step_timestep <= 999:
             raise RuntimeError("one_step_timestep must be between 1 and 999")
         if not 0.0 <= self.previous_frame_weight <= 1.0:
             raise RuntimeError("previous_frame_weight must be in [0, 1]")
+        if not 0.0 <= self.noise_persistence <= 1.0:
+            raise RuntimeError("noise_persistence must be in [0, 1]")
         if not 0.0 <= self.edge_softness <= 4.0:
             raise RuntimeError("edge_softness must be in [0, 4]")
         if not 0.0 <= self.edge_strength <= 1.0:

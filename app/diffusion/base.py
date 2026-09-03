@@ -50,6 +50,9 @@ class DiffusionBackend(ABC):
     def set_steps(self, steps: int) -> None:
         raise NotImplementedError("This backend does not support changing steps")
 
+    def set_guidance_scale(self, guidance_scale: float) -> None:
+        raise NotImplementedError("This backend does not support changing guidance scale")
+
     def set_one_step_timestep(self, timestep: int) -> None:
         raise NotImplementedError("This backend does not support changing the timestep")
 
@@ -61,3 +64,6 @@ class DiffusionBackend(ABC):
 
     def set_edge_strength(self, strength: float) -> None:
         raise NotImplementedError("This backend does not support changing edge strength")
+
+    def set_noise_persistence(self, persistence: float) -> None:
+        raise NotImplementedError("This backend does not support temporal noise")

@@ -25,10 +25,9 @@ The NVIDIA display driver must already be installed. A separate CUDA Toolkit is 
 
 | Key | Action |
 |---|---|
-| W / A / S / D | Move |
+| W / A / S / D | Walk along the roads |
 | Mouse | Look |
 | Shift | Move faster |
-| Q / E | Move down / up |
 | Escape | Exit |
 | Space | New randomized world and prompt |
 | Shift + R | New diffusion seed |
@@ -48,13 +47,16 @@ The NVIDIA display driver must already be installed. A separate CUDA Toolkit is 
 | K / L | Proxy structure lock |
 | B | Geometry-edge softness |
 | G | Geometry-guide strength |
-| N | Fixed / random-each-frame seed mode |
+| C | Cycle CFG: 0, 1.25, 1.5, 2, 3 |
+| N | Fixed / drift / random-each-frame seed mode |
 
 While editing a prompt, Enter applies it, Escape cancels, and Ctrl+D restores the default text. Space preserves the current F1 overlay visibility.
 
+The app saves prompt, world and diffusion seeds, resolution, CFG, seed mode, structure and edge controls, sharpening, reprojection, fullscreen, diagnostics visibility, and the F7 prompt caption as soon as they change. The next normal launch restores them. Freeze and diagnostic views remain session-only so the app does not reopen paused or in a troubleshooting view.
+
 ## Resolution modes
 
-F10 cycles through `640×384` (default), `384×256`, `512×512`, `768×512`, and `1024×768`. In windowed mode the application window follows the generation resolution. Use `384×256` or `640×384` on a 6 GB exhibition GPU.
+F10 cycles through `384×216` (default), `640×384`, `384×256`, `512×512`, `768×512`, and `1024×768`. The default renders only 82,944 pixels, then the GPU scales the result to fullscreen. In windowed mode the application window follows the generation resolution.
 
 ## Prompts
 
@@ -62,9 +64,13 @@ Edit `prompts.json` to change the randomized prompt library. The top-level `mast
 
 ## How it works
 
-The procedural road-and-city proxy supplies RGB composition and softened geometry edges to SD-Turbo img2img. This is not a ControlNet build. Proxy depth and camera matrices are stored with each generated frame and used for GPU reprojection between diffusion updates.
+The procedural road-and-city proxy supplies RGB composition and softened geometry edges to SD-Turbo img2img. This is not a ControlNet build. Proxy depth and camera matrices align the prior generated image with the next camera view before feedback, then GPU reprojection keeps movement responsive between diffusion updates.
 
-One diffusion step gives maximum speed. Additional steps improve detail at lower generation FPS. Fixed seed mode is more temporally coherent; random-each-frame mode intentionally creates more variation and flicker.
+The proxy city streams deterministic 64-unit chunks around the camera. Curving roads follow the terrain, climb through dense terraces, and occasionally cross ravines on raised decks. Buildings rotate into irregular leftover parcels, vary in height, and carry cable runs across selected roofs. Every proxy element receives an independent seeded color, and each world randomizes the sky and matching fog. The camera stays at walking height and cannot leave the road surface. Only the nearest 49 chunks remain in RAM and one bounded GPU instance buffer; walking back regenerates the same geometry from the world seed.
+
+One diffusion step gives maximum speed. Drift mode correlates each frame's diffusion noise with the last, producing gradual latent motion instead of unrelated redraws. Fixed mode reuses one noise field; random-each-frame intentionally flickers.
+
+CFG values at or below `1.0` use SD-Turbo's fastest no-CFG path and produce the same guidance behavior. Values above `1.0` enable classifier-free guidance and make the negative prompt active. The default `1.25` is deliberately low. Press C to compare it with `0.0` while the app is running. The display preserves SD-Turbo's native output, so prompts and CFG determine the rendering style.
 
 ## Packaging
 

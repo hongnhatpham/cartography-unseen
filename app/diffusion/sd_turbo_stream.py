@@ -14,6 +14,20 @@ from app.types import ConditioningFrame
 from app.utils.timing import ExponentialAverage
 
 
+def classifier_free_guidance_enabled(guidance_scale: float) -> bool:
+    """Diffusers enables CFG only when guidance is greater than one."""
+    return guidance_scale > 1.0
+
+
+def blend_correlated_noise(previous: Any, fresh: Any, persistence: float) -> Any:
+    """Blend fresh noise into a persistent field without changing its variance."""
+    if previous is None or previous.shape != fresh.shape:
+        return fresh
+    persistence = min(max(float(persistence), 0.0), 1.0)
+    fresh_weight = math.sqrt(max(0.0, 1.0 - persistence * persistence))
+    return previous * persistence + fresh * fresh_weight
+
+
 class SDTurboStreamBackend(DiffusionBackend):
     """Resident SD-Turbo img2img backend for a latest-frame streaming worker.
 
@@ -29,11 +43,16 @@ class SDTurboStreamBackend(DiffusionBackend):
         self.width = 512
         self.height = 512
         self.steps = 1
+        self.guidance_scale = 0.0
         self.schedule_steps = 1
         self.strength = 0.45
         self.one_step_timestep = 0
         self.fixed_noise = True
         self.previous_frame_weight = 0.0
+        self.noise_persistence = 0.975
+        self.temporal_noise: Any = None
+        self.noise_generator: Any = None
+        self._default_prepare_latents: Any = None
         self.edge_strength = 0.0
         self.edge_softness = 1.5
         self.seed = 12345
@@ -77,10 +96,12 @@ class SDTurboStreamBackend(DiffusionBackend):
         self.width = int(config.get("diffusion_width", config["diffusion_resolution"]))
         self.height = int(config.get("diffusion_height", self.width))
         self.steps = int(config.get("steps", 1))
+        self.guidance_scale = float(config.get("guidance_scale", 0.0))
         self.strength = float(config.get("img2img_strength", 0.45))
         self.one_step_timestep = int(config.get("one_step_timestep", 0))
         self.fixed_noise = bool(config.get("fixed_noise", True))
         self.previous_frame_weight = float(config.get("previous_frame_weight", 0.0))
+        self.noise_persistence = float(config.get("noise_persistence", 0.975))
         self.edge_strength = float(config.get("edge_strength", 0.0))
         self.edge_softness = float(config.get("edge_softness", 1.5))
         self.seed = int(config.get("seed", 12345))
@@ -114,6 +135,9 @@ class SDTurboStreamBackend(DiffusionBackend):
                 self.pipe.unet, mode="reduce-overhead", fullgraph=True
             )
         self.generator = torch.Generator(device=self.device).manual_seed(self.seed)
+        self.noise_generator = torch.Generator(device=self.device).manual_seed(self.seed + 1)
+        self._default_prepare_latents = self.pipe.prepare_latents
+        self.pipe.prepare_latents = self._prepare_latents
         self.set_prompt(str(config["prompt"]), str(config.get("negative_prompt", "")))
         self.load_ms = (perf_counter() - started) * 1000.0
 
@@ -126,9 +150,14 @@ class SDTurboStreamBackend(DiffusionBackend):
             prompt == self.prompt
             and negative_prompt == self.negative_prompt
             and self.prompt_embeds is not None
+            and self.negative_prompt_embeds is not None
         ):
             return
-        do_cfg = False
+        self.temporal_noise = None
+        # Cache both embeddings so C can cross the CFG threshold without a
+        # visible text-encoder pause. Diffusers ignores the negative embedding
+        # on its guidance <= 1 fast path.
+        do_cfg = True
         with self.torch.inference_mode():
             encoded = self.pipe.encode_prompt(
                 prompt=prompt,
@@ -139,12 +168,67 @@ class SDTurboStreamBackend(DiffusionBackend):
             )
         if isinstance(encoded, tuple):
             self.prompt_embeds = encoded[0]
-            self.negative_prompt_embeds = encoded[1] if do_cfg and len(encoded) > 1 else None
+            self.negative_prompt_embeds = encoded[1] if len(encoded) > 1 else None
         else:
             self.prompt_embeds = encoded
             self.negative_prompt_embeds = None
         self.prompt = prompt
         self.negative_prompt = negative_prompt
+
+    def _prepare_latents(
+        self,
+        image: Any,
+        timestep: Any,
+        batch_size: int,
+        num_images_per_prompt: int,
+        dtype: Any,
+        device: Any,
+        generator: Any = None,
+    ) -> Any:
+        """Use slowly changing diffusion noise for the latent-walk mode."""
+        if self.seed_mode != "drift":
+            return self._default_prepare_latents(
+                image,
+                timestep,
+                batch_size,
+                num_images_per_prompt,
+                dtype,
+                device,
+                generator,
+            )
+
+        from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import (
+            retrieve_latents,
+        )
+        from diffusers.utils.torch_utils import randn_tensor
+
+        image = image.to(device=device, dtype=dtype)
+        effective_batch = batch_size * num_images_per_prompt
+        if image.shape[1] == 4:
+            init_latents = image
+        else:
+            # The posterior mode avoids unrelated VAE sampling noise. Variation
+            # comes only from the correlated diffusion-noise walk below.
+            init_latents = retrieve_latents(self.pipe.vae.encode(image), sample_mode="argmax")
+            init_latents = self.pipe.vae.config.scaling_factor * init_latents
+        if effective_batch > init_latents.shape[0]:
+            if effective_batch % init_latents.shape[0] != 0:
+                raise ValueError("Image batch cannot be expanded to the requested prompt batch")
+            init_latents = self.torch.cat(
+                [init_latents] * (effective_batch // init_latents.shape[0]), dim=0
+            )
+
+        fresh_noise = randn_tensor(
+            init_latents.shape,
+            generator=self.noise_generator,
+            device=device,
+            dtype=dtype,
+        )
+        noise = blend_correlated_noise(
+            self.temporal_noise, fresh_noise, self.noise_persistence
+        )
+        self.temporal_noise = noise.detach()
+        return self.pipe.scheduler.add_noise(init_latents, noise, timestep)
 
     def warmup(self) -> None:
         from app.renderer.camera import Camera
@@ -187,7 +271,16 @@ class SDTurboStreamBackend(DiffusionBackend):
             previous = Image.fromarray(previous_frame, mode="RGB")
             if previous.size != image.size:
                 previous = previous.resize(image.size, Image.Resampling.BILINEAR)
-            image = Image.blend(image, previous, self.previous_frame_weight)
+            current_array = np.asarray(image, dtype=np.float32)
+            previous_array = np.asarray(previous, dtype=np.float32)
+            confidence = None if temporal_state is None else temporal_state.get("confidence")
+            if confidence is None:
+                alpha: float | np.ndarray = self.previous_frame_weight
+            else:
+                alpha = np.asarray(confidence, dtype=np.float32)[:, :, None]
+                alpha = np.clip(alpha * self.previous_frame_weight, 0.0, 1.0)
+            blended = current_array * (1.0 - alpha) + previous_array * alpha
+            image = Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8), mode="RGB")
         self.copy_in_average.update((perf_counter() - copy_started) * 1000.0)
 
         started = perf_counter()
@@ -199,10 +292,12 @@ class SDTurboStreamBackend(DiffusionBackend):
             # truncates its only timestep. Multi-step mode uses the adjustable
             # img2img strength to preserve the proxy composition.
             "strength": 1.0 if custom_one_step else self.strength,
-            "guidance_scale": 0.0,
+            "guidance_scale": self.guidance_scale,
             "generator": self.generator,
             "output_type": "pil",
         }
+        if classifier_free_guidance_enabled(self.guidance_scale):
+            kwargs["negative_prompt_embeds"] = self.negative_prompt_embeds
         if custom_one_step:
             kwargs["timesteps"] = [self.one_step_timestep]
         else:
@@ -247,10 +342,12 @@ class SDTurboStreamBackend(DiffusionBackend):
             "resolution_width": self.width,
             "resolution_height": self.height,
             "steps": self.steps,
+            "guidance_scale": self.guidance_scale,
             "schedule_steps": self.schedule_steps,
             "one_step_timestep": self.one_step_timestep,
             "img2img_strength": self.strength,
             "fixed_noise": str(self.fixed_noise),
+            "noise_persistence": self.noise_persistence,
             "seed_mode": self.seed_mode,
             "active_seed": self.active_seed,
             "load_ms": self.load_ms,
@@ -260,15 +357,20 @@ class SDTurboStreamBackend(DiffusionBackend):
     def set_resolution(self, width: int, height: int | None = None) -> None:
         self.width = int(width)
         self.height = int(height if height is not None else width)
+        self.temporal_noise = None
 
     def reseed(self, seed: int) -> None:
         self.seed = seed
         if self.torch is not None:
             self.generator = self.torch.Generator(device=self.device).manual_seed(seed)
+            self.noise_generator = self.torch.Generator(device=self.device).manual_seed(seed + 1)
+        self.temporal_noise = None
 
     def set_seed_mode(self, mode: str) -> None:
-        if mode not in ("fixed", "random_each_frame"):
+        if mode not in ("fixed", "drift", "random_each_frame"):
             raise RuntimeError(f"Unsupported seed mode: {mode}")
+        if mode != self.seed_mode:
+            self.temporal_noise = None
         self.seed_mode = mode
 
     def set_steps(self, steps: int) -> None:
@@ -278,6 +380,9 @@ class SDTurboStreamBackend(DiffusionBackend):
             if self.steps == 1 and self.one_step_timestep > 0
             else max(self.steps, math.ceil(self.steps / self.strength))
         )
+
+    def set_guidance_scale(self, guidance_scale: float) -> None:
+        self.guidance_scale = min(max(float(guidance_scale), 0.0), 4.0)
 
     def set_one_step_timestep(self, timestep: int) -> None:
         self.one_step_timestep = max(250, min(900, int(timestep)))
@@ -295,6 +400,9 @@ class SDTurboStreamBackend(DiffusionBackend):
 
     def set_edge_strength(self, strength: float) -> None:
         self.edge_strength = max(0.0, min(1.0, float(strength)))
+
+    def set_noise_persistence(self, persistence: float) -> None:
+        self.noise_persistence = max(0.0, min(1.0, float(persistence)))
 
     def unload(self) -> None:
         if self.pipe is not None:

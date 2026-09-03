@@ -1,1 +1,1 @@
-"""Temporal processing hooks (reprojection is implemented in a later phase)."""
+"""Camera-aware temporal processing for generated frames."""

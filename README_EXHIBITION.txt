@@ -38,7 +38,7 @@ LAUNCH FILES
 ------------
 run.bat
   Normal one-click launch. It performs first-run setup when necessary, then
-  starts the artwork. The default is a 640x384 window.
+  starts the artwork fullscreen at a 384x216 generation resolution.
 
 run_debug.bat
   Windowed launch with a visible console and diagnostics. Use this when
@@ -51,10 +51,9 @@ setup_first_run.bat
 
 CONTROLS
 --------
-W / A / S / D    Move through the world
+W / A / S / D    Walk along the roads
 Mouse            Look around
 Shift            Move faster while held
-Q / E            Move down / up
 Escape           Exit
 
 Space            Generate a new randomized world and prompt
@@ -80,19 +79,27 @@ F11              Toggle fullscreen / windowed mode
 K / L            Reduce / increase proxy structure lock
 B                Cycle geometry-edge softness
 G                Cycle geometry-guide strength
-N                Toggle fixed seed / new seed for every AI frame
+C                Cycle CFG: 0, 1.25, 1.5, 2, 3
+N                Cycle fixed / drift / new seed for every AI frame
 
 Space preserves the current F1 state. If the F1 overlay is visible, it remains
 visible during a world change. If it is hidden, it remains hidden. Space never
 flashes the proxy geometry while the replacement generation is pending.
+
+The app saves prompt, world and diffusion seeds, resolution, CFG, seed mode,
+structure and edge controls, sharpening, reprojection, fullscreen, F1 overlay
+visibility, and the F7 prompt caption immediately. The next normal launch
+restores them. Freeze and diagnostic views remain session-only so the artwork
+does not reopen paused or in a troubleshooting view.
 
 
 RESOLUTION MODES
 ----------------
 F10 cycles through:
 
-  640x384    default; recommended balance for exhibition use
-  384x256    fastest and safest for a 6 GB GPU
+  384x216    default; fastest 16:9 fullscreen mode
+  640x384    more detail at lower generation FPS
+  384x256    low-resolution 3:2 composition
   512x512    square composition
   768x512    wider and more detailed, but slower
   1024x768   highest detail and heaviest GPU load
@@ -106,9 +113,8 @@ mode is saved in config.json.
 PROMPTS
 -------
 prompts.json is editable in Notepad. Its top-level master_prefix is prepended to
-every library prompt, including randomized prompts:
-
-  Photoreal abstract rendering, highly detailed
+every library prompt, including randomized prompts. It is blank by default so
+the startup prompt stays exactly as written in config.json.
 
 Edit that one value to change the common visual language. Individual entries
 under prompts can be added, removed, or rewritten. Changes are read on the next
@@ -119,10 +125,12 @@ F7 provides a subtle prompt caption without enabling the full F1 diagnostics.
 
 HOW THE IMAGE IS MADE
 ---------------------
-The application renders a fast procedural 3D proxy: a long road, buildings,
-lane markings, sidewalks, and randomized architectural details. That proxy RGB
-image and softened geometry edges become the img2img input to resident
-SD-Turbo. The prompt controls its visual interpretation.
+The application renders a fast procedural 3D proxy: terrain-following roads,
+steep terraces, irregular buildings, raised crossings, and rooftop cables.
+Every element receives its own seeded random color, while each world also
+randomizes the sky and matching fog. WASD keeps the camera on the road at
+standing eye height. The proxy RGB image and softened geometry edges become
+the img2img input to resident SD-Turbo. The prompt controls its interpretation.
 
 This build does not load ControlNet. Depth does not directly condition the
 diffusion model. Instead, every generated frame stores the matching proxy depth
@@ -130,15 +138,20 @@ and camera matrices. Between slower diffusion updates, the GPU reprojects the
 latest AI frame through the live camera so WASD and mouse movement remain
 responsive at display speed.
 
-One diffusion step is fastest but can vary in detail. Two or more steps usually
-produce cleaner images at lower generation FPS. The K/L structure control
-changes how closely results retain the proxy composition. The fixed seed mode
-is more temporally consistent; random-each-frame mode intentionally flickers.
+One diffusion step is fastest. Drift mode correlates diffusion noise over time,
+and camera-aware feedback aligns the prior image before blending it into the
+next input. This makes forms morph instead of being replaced on each AI frame.
+Fixed mode reuses one noise field; random-each-frame intentionally flickers.
+
+CFG values at or below 1 use SD-Turbo's no-CFG path. Values above 1 enable
+classifier-free guidance and activate the negative prompt. The default is 1.25.
+Press C to compare it with CFG 0. The display preserves SD-Turbo's native
+output, so prompts and CFG determine the rendering style.
 
 
 DISPLAY AND MONITORS
 --------------------
-The default launch is windowed. Press F11 for fullscreen.
+The default launch is fullscreen. Press F11 for a window.
 
 Set display_monitor in config.json to a zero-based monitor index, or launch from
 a Command Prompt with:

@@ -11,6 +11,7 @@ import numpy as np
 
 from app.diffusion.factory import create_backend
 from app.types import ConditioningFrame, GeneratedFrame
+from app.temporal.reprojection import reproject_previous_image
 from app.utils.latest_value import LatestValue
 from app.utils.timing import RateMeter
 
@@ -45,10 +46,12 @@ class DiffusionWorker:
         self._requested_seed = int(config.get("seed", 12345))
         self._requested_seed_mode = str(config.get("seed_mode", "fixed"))
         self._requested_steps = int(config.get("steps", 1))
+        self._requested_guidance_scale = float(config.get("guidance_scale", 0.0))
         self._requested_one_step_timestep = int(config.get("one_step_timestep", 750))
         self._requested_edge_softness = float(config.get("edge_softness", 1.5))
         self._requested_img2img_strength = float(config.get("img2img_strength", 0.4))
         self._requested_edge_strength = float(config.get("edge_strength", 0.15))
+        self._requested_noise_persistence = float(config.get("noise_persistence", 0.975))
         self._requested_resolution = initial_size
         self._freeze = False
         self._backend_stats: dict[str, float | int | str] = {}
@@ -91,6 +94,10 @@ class DiffusionWorker:
         with self._request_lock:
             self._requested_steps = max(1, min(4, int(steps)))
 
+    def request_guidance_scale(self, guidance_scale: float) -> None:
+        with self._request_lock:
+            self._requested_guidance_scale = max(0.0, min(4.0, float(guidance_scale)))
+
     def request_one_step_timestep(self, timestep: int) -> None:
         with self._request_lock:
             self._requested_one_step_timestep = max(250, min(900, int(timestep)))
@@ -106,6 +113,10 @@ class DiffusionWorker:
     def request_edge_strength(self, strength: float) -> None:
         with self._request_lock:
             self._requested_edge_strength = max(0.0, min(1.0, float(strength)))
+
+    def request_noise_persistence(self, persistence: float) -> None:
+        with self._request_lock:
+            self._requested_noise_persistence = max(0.0, min(1.0, float(persistence)))
 
     def request_resolution(self, resolution: tuple[int, int]) -> None:
         with self._request_lock:
@@ -126,6 +137,7 @@ class DiffusionWorker:
     def _run(self) -> None:
         backend = create_backend(self.backend_name)
         previous: np.ndarray | None = None
+        previous_conditioning: ConditioningFrame | None = None
         try:
             self._set_status(state="loading", message=f"Loading {self.backend_name}")
             backend.load(self.config)
@@ -139,10 +151,12 @@ class DiffusionWorker:
             applied_seed: int | None = None
             applied_seed_mode: str | None = None
             applied_steps: int | None = None
+            applied_guidance_scale: float | None = None
             applied_one_step_timestep: int | None = None
             applied_edge_softness: float | None = None
             applied_img2img_strength: float | None = None
             applied_edge_strength: float | None = None
+            applied_noise_persistence: float | None = None
             applied_resolution: tuple[int, int] | None = None
             logged_first_frame = False
             while not self._stop.is_set():
@@ -158,24 +172,33 @@ class DiffusionWorker:
                     requested_seed = self._requested_seed
                     requested_seed_mode = self._requested_seed_mode
                     requested_steps = self._requested_steps
+                    requested_guidance_scale = self._requested_guidance_scale
                     requested_one_step_timestep = self._requested_one_step_timestep
                     requested_edge_softness = self._requested_edge_softness
                     requested_img2img_strength = self._requested_img2img_strength
                     requested_edge_strength = self._requested_edge_strength
+                    requested_noise_persistence = self._requested_noise_persistence
                     requested_resolution = self._requested_resolution
                 if requested_prompt != applied_prompt:
                     backend.set_prompt(*requested_prompt)
                     applied_prompt = requested_prompt
+                    previous = None
+                    previous_conditioning = None
                 applied_prompt_revision = requested_prompt_revision
                 if requested_seed != applied_seed:
                     backend.reseed(requested_seed)
                     applied_seed = requested_seed
+                    previous = None
+                    previous_conditioning = None
                 if requested_seed_mode != applied_seed_mode:
                     backend.set_seed_mode(requested_seed_mode)
                     applied_seed_mode = requested_seed_mode
                 if requested_steps != applied_steps:
                     backend.set_steps(requested_steps)
                     applied_steps = requested_steps
+                if requested_guidance_scale != applied_guidance_scale:
+                    backend.set_guidance_scale(requested_guidance_scale)
+                    applied_guidance_scale = requested_guidance_scale
                 if requested_one_step_timestep != applied_one_step_timestep:
                     backend.set_one_step_timestep(requested_one_step_timestep)
                     applied_one_step_timestep = requested_one_step_timestep
@@ -188,24 +211,48 @@ class DiffusionWorker:
                 if requested_edge_strength != applied_edge_strength:
                     backend.set_edge_strength(requested_edge_strength)
                     applied_edge_strength = requested_edge_strength
+                if requested_noise_persistence != applied_noise_persistence:
+                    backend.set_noise_persistence(requested_noise_persistence)
+                    applied_noise_persistence = requested_noise_persistence
                 if requested_resolution != applied_resolution:
                     backend.set_resolution(*requested_resolution)
                     applied_resolution = requested_resolution
+                    previous = None
+                    previous_conditioning = None
                     self._set_status(
                         active_resolution=(
                             f"{requested_resolution[0]}x{requested_resolution[1]}"
                         )
                     )
+                temporal_state: dict[str, Any] | None = None
+                aligned_previous = previous
+                temporal_ms = 0.0
+                if previous is not None and previous_conditioning is not None:
+                    temporal_started = perf_counter()
+                    try:
+                        aligned_previous, confidence = reproject_previous_image(
+                            previous, previous_conditioning, conditioning
+                        )
+                        temporal_state = {"confidence": confidence}
+                    except ValueError:
+                        aligned_previous = None
+                    temporal_ms = (perf_counter() - temporal_started) * 1000.0
                 try:
-                    output = backend.generate(conditioning, previous_frame=previous)
+                    output = backend.generate(
+                        conditioning,
+                        previous_frame=aligned_previous,
+                        temporal_state=temporal_state,
+                    )
                 except RuntimeError as exc:
                     if self._is_oom(exc) and self._try_lower_resolution(backend):
-                        output = backend.generate(conditioning, previous_frame=previous)
+                        output = backend.generate(conditioning)
                     else:
                         raise
                 previous = output
+                previous_conditioning = conditioning
                 now = perf_counter()
                 stats = backend.stats()
+                stats["temporal_ms"] = temporal_ms
                 stats["prompt_revision"] = applied_prompt_revision
                 generated = GeneratedFrame(
                     image=output,

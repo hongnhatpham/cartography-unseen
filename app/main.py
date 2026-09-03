@@ -150,7 +150,7 @@ def run() -> int:
         import pygame
 
         from app.diffusion.worker import DiffusionWorker
-        from app.renderer.camera import Camera
+        from app.renderer.camera import EYE_HEIGHT, Camera
         from app.renderer.proxy_renderer import ProxyRenderer
     except Exception as exc:
         logging.exception("Startup dependency failure")
@@ -180,6 +180,13 @@ def run() -> int:
         )
         renderer.loading_screen("INITIALIZING", "Starting renderer and diffusion worker")
         camera = Camera.create_default()
+        road_contact = renderer.spawn_road_contact()
+        camera.yaw = road_contact.heading
+        camera.position[:] = (
+            road_contact.x,
+            road_contact.surface_y + EYE_HEIGHT,
+            road_contact.z,
+        )
         worker = DiffusionWorker(config.backend, config.backend_dict(root))
         worker.start()
 
@@ -202,7 +209,7 @@ def run() -> int:
         conditioning = None
         last_conditioning_capture = 0.0
         prompt_editing = False
-        prompt_caption_enabled = False
+        prompt_caption_enabled = config.prompt_caption
         prompt_buffer = ""
         required_prompt_revision = 0
         minimum_ai_sequence = 0
@@ -270,6 +277,10 @@ def run() -> int:
                     elif event.key == pygame.K_F11:
                         try:
                             is_fullscreen = renderer.toggle_fullscreen()
+                            config.fullscreen = is_fullscreen
+                            config_mtime = persist_config_value(
+                                config_path, "fullscreen", config.fullscreen
+                            )
                             notice = (
                                 "FULLSCREEN — F11 returns to windowed mode"
                                 if is_fullscreen
@@ -305,8 +316,16 @@ def run() -> int:
                         notice_until = frame_started + 4.0
                     elif event.key == pygame.K_F7:
                         prompt_caption_enabled = not prompt_caption_enabled
+                        config.prompt_caption = prompt_caption_enabled
+                        config_mtime = persist_config_value(
+                            config_path, "prompt_caption", config.prompt_caption
+                        )
                     elif event.key == pygame.K_F1:
                         overlay_enabled = not overlay_enabled
+                        config.debug_overlay = overlay_enabled
+                        config_mtime = persist_config_value(
+                            config_path, "debug_overlay", config.debug_overlay
+                        )
                     elif event.key == pygame.K_F2:
                         # From a diagnostic view, F2 is a one-press return to AI.
                         # From AI/proxy it retains the familiar toggle behavior.
@@ -333,6 +352,9 @@ def run() -> int:
                         worker.set_frozen(frozen)
                     elif event.key == pygame.K_F5:
                         config.reprojection = not config.reprojection
+                        config_mtime = persist_config_value(
+                            config_path, "reprojection", config.reprojection
+                        )
                         notice = "DEPTH REPROJECTION ON" if config.reprojection else "DEPTH REPROJECTION OFF"
                         notice_until = frame_started + 3.0
                     elif event.key in (pygame.K_LEFTBRACKET, pygame.K_RIGHTBRACKET):
@@ -406,10 +428,22 @@ def run() -> int:
                         )
                         notice = f"GEOMETRY GUIDE: {config.edge_strength:.0%}"
                         notice_until = frame_started + 3.0
-                    elif event.key == pygame.K_n:
-                        config.seed_mode = (
-                            "random_each_frame" if config.seed_mode == "fixed" else "fixed"
+                    elif event.key == pygame.K_c:
+                        levels = (0.0, 1.25, 1.5, 2.0, 3.0)
+                        nearest = min(
+                            range(len(levels)),
+                            key=lambda index: abs(levels[index] - config.guidance_scale),
                         )
+                        config.guidance_scale = levels[(nearest + 1) % len(levels)]
+                        worker.request_guidance_scale(config.guidance_scale)
+                        config_mtime = persist_config_value(
+                            config_path, "guidance_scale", config.guidance_scale
+                        )
+                        notice = f"CFG: {config.guidance_scale:.2g}"
+                        notice_until = frame_started + 3.0
+                    elif event.key == pygame.K_n:
+                        modes = ("fixed", "drift", "random_each_frame")
+                        config.seed_mode = modes[(modes.index(config.seed_mode) + 1) % len(modes)]
                         worker.request_seed_mode(config.seed_mode)
                         config_mtime = persist_config_value(
                             config_path, "seed_mode", config.seed_mode
@@ -417,18 +451,28 @@ def run() -> int:
                         notice = (
                             "SEED MODE: RANDOM EVERY AI FRAME"
                             if config.seed_mode == "random_each_frame"
-                            else "SEED MODE: FIXED"
+                            else f"SEED MODE: {config.seed_mode.upper()}"
                         )
                         notice_until = frame_started + 4.0
                     elif event.key == pygame.K_r and event.mod & pygame.KMOD_SHIFT:
                         new_seed = worker.request_reseed()
                         config.seed = new_seed
+                        config_mtime = persist_config_value(
+                            config_path, "seed", config.seed
+                        )
                         notice = f"DIFFUSION RESEEDED: {new_seed}"
                         notice_until = frame_started + 3.0
                         logging.info("Manual reseed: %s", new_seed)
                     elif event.key == pygame.K_SPACE:
                         camera.reset()
                         config.world_seed = renderer.randomize_world()
+                        road_contact = renderer.spawn_road_contact()
+                        camera.yaw = road_contact.heading
+                        camera.position[:] = (
+                            road_contact.x,
+                            road_contact.surface_y + EYE_HEIGHT,
+                            road_contact.z,
+                        )
                         selected_prompt_name = "current prompt"
                         try:
                             selected_prompt = choose_different_prompt(
@@ -443,6 +487,9 @@ def run() -> int:
                         except RuntimeError as exc:
                             logging.error("Prompt library ignored: %s", exc)
                             selected_prompt_name = f"library error: {exc}"
+                        config_mtime = persist_config_value(
+                            config_path, "world_seed", config.world_seed
+                        )
                         # Preserve the last finished artwork while the new
                         # world and prompt generate. Reprojecting that old
                         # image with the new world's depth would expose the
@@ -484,8 +531,17 @@ def run() -> int:
                 camera.move(
                     float(keys[pygame.K_d]) - float(keys[pygame.K_a]),
                     float(keys[pygame.K_w]) - float(keys[pygame.K_s]),
-                    float(keys[pygame.K_e]) - float(keys[pygame.K_q]),
                     speed * dt,
+                )
+                road_contact = renderer.move_road_contact(
+                    road_contact,
+                    float(camera.position[0]),
+                    float(camera.position[2]),
+                )
+                camera.position[:] = (
+                    road_contact.x,
+                    road_contact.surface_y + EYE_HEIGHT,
+                    road_contact.z,
                 )
 
             proxy_started = perf_counter()
@@ -621,6 +677,10 @@ def run() -> int:
                         config.sprint_multiplier = updated.sprint_multiplier
                         config.mouse_sensitivity = updated.mouse_sensitivity
                         config.reprojection = updated.reprojection
+                        config.debug_overlay = updated.debug_overlay
+                        overlay_enabled = bool(config.debug_overlay or debug_requested)
+                        config.prompt_caption = updated.prompt_caption
+                        prompt_caption_enabled = config.prompt_caption
                         config.reprojection_strength = updated.reprojection_strength
                         config.reprojection_max_translation = updated.reprojection_max_translation
                         config.reprojection_max_rotation = updated.reprojection_max_rotation
@@ -640,9 +700,15 @@ def run() -> int:
                         if config.steps != updated.steps:
                             config.steps = updated.steps
                             worker.request_steps(config.steps)
+                        if config.guidance_scale != updated.guidance_scale:
+                            config.guidance_scale = updated.guidance_scale
+                            worker.request_guidance_scale(config.guidance_scale)
                         if config.seed_mode != updated.seed_mode:
                             config.seed_mode = updated.seed_mode
                             worker.request_seed_mode(config.seed_mode)
+                        if config.noise_persistence != updated.noise_persistence:
+                            config.noise_persistence = updated.noise_persistence
+                            worker.request_noise_persistence(config.noise_persistence)
                         config_mtime = current_mtime
                         logging.info("Hot-reloaded prompt and navigation settings")
                 except Exception:
@@ -703,12 +769,13 @@ def build_overlay(
         f"WARP AMOUNT   [{'#' * round(config.reprojection_strength * 10)}{'-' * (10 - round(config.reprojection_strength * 10))}] {config.reprojection_strength:4.0%}    [ / ] adjust",
         f"AI AGE        {ai_age_ms:6.1f} ms      VRAM   {float(stats.get('vram_allocated_gb', 0.0)):5.2f} GB",
         f"RES           {active_resolution}       F10 cycle       STEPS  {stats.get('steps', config.steps)}    - / = adjust",
+        f"CFG           {float(stats.get('guidance_scale', config.guidance_scale)):4.2g}                  C cycle",
         f"SHARPNESS     {config.display_sharpen:4.1f}                  , / . adjust",
         f"STRUCTURE     {structure_lock_percent(config):4.0f}%                  K less / L more",
         f"EDGE SOFT     {config.edge_softness:4.2g} px                B cycle",
         f"GEO GUIDE     {config.edge_strength:4.0%}                  G cycle",
         f"BACKEND       {config.backend}       STATE  {state.upper()}",
-        f"SEED          {stats.get('active_seed', config.seed)}        MODE {config.seed_mode.upper()}    N toggle mode",
+        f"SEED          {stats.get('active_seed', config.seed)}        MODE {config.seed_mode.upper()}    N cycle mode",
         f"WORLD         {config.world_seed}        SPACE new world  Shift+R reseed  P edit prompt",
         f"PROMPT        {config.prompt[:58]}",
     ]

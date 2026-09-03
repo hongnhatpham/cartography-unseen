@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.config import AppConfig, VALID_RESOLUTIONS, configure_local_environment
+from app.config import AppConfig, RESOLUTION_MODES, VALID_RESOLUTIONS, configure_local_environment
 from app.diffusion.factory import create_backend
 from app.renderer.camera import Camera
 from app.types import ConditioningFrame
@@ -37,14 +37,21 @@ def make_conditioning(
     return ConditioningFrame(rgb, depth, edges, Camera.create_default().snapshot(), perf_counter(), sequence)
 
 
-def benchmark_one(config: AppConfig, resolution: int, warmup: int, frames: int) -> dict[str, object]:
-    config.diffusion_resolution = resolution
+def benchmark_one(
+    config: AppConfig,
+    resolution: int | tuple[int, int],
+    warmup: int,
+    frames: int,
+) -> dict[str, object]:
+    width, height = (resolution, resolution) if isinstance(resolution, int) else resolution
+    config.diffusion_resolution = width if width == height else f"{width}x{height}"
     config.warmup_passes = warmup
     backend = create_backend(config.backend)
     result: dict[str, object] = {
         "backend": config.backend,
-        "resolution": resolution,
+        "resolution": f"{width}x{height}",
         "steps": config.steps,
+        "guidance_scale": config.guidance_scale,
         "status": "failed",
     }
     try:
@@ -67,7 +74,7 @@ def benchmark_one(config: AppConfig, resolution: int, warmup: int, frames: int) 
         vram_samples: list[float] = []
         previous = None
         for index in range(frames):
-            conditioning = make_conditioning(resolution, index)
+            conditioning = make_conditioning((width, height), index)
             started = perf_counter()
             previous = backend.generate(conditioning, previous_frame=previous)
             if torch is not None and torch.cuda.is_available():
@@ -108,29 +115,55 @@ def write_text(results: dict[str, object], path: Path) -> None:
     for item in results["results"]:  # type: ignore[index]
         if item["status"] == "ok":
             lines.append(
-                f"{item['resolution']}x{item['resolution']}  {item['warm_inference_ms']:.2f} ms  "
+                f"{item['resolution']}  CFG {item['guidance_scale']:.2g}  "
+                f"{item['warm_inference_ms']:.2f} ms  "
                 f"{item['fps']:.2f} FPS  peak VRAM {item['peak_vram_gb']:.2f} GB"
             )
         else:
-            lines.append(f"{item['resolution']}x{item['resolution']}  FAILED  {item.get('error', '')}")
+            lines.append(
+                f"{item['resolution']}  CFG {item['guidance_scale']:.2g}  "
+                f"FAILED  {item.get('error', '')}"
+            )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=("sd_turbo_stream", "proxy_passthrough"))
-    parser.add_argument("--resolutions", nargs="+", type=int, default=list(VALID_RESOLUTIONS))
+    parser.add_argument(
+        "--resolutions",
+        nargs="+",
+        default=[str(value) for value in VALID_RESOLUTIONS],
+        help="square sizes or WIDTHxHEIGHT modes",
+    )
+    parser.add_argument("--guidance-scales", nargs="+", type=float)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--frames", type=int, default=20)
     parser.add_argument("--output-dir", type=Path, default=ROOT)
     args = parser.parse_args()
-    invalid = sorted(set(args.resolutions) - set(VALID_RESOLUTIONS))
-    if invalid:
-        parser.error(f"unsupported resolutions: {invalid}")
+    resolutions: list[int | tuple[int, int]] = []
+    for value in args.resolutions:
+        try:
+            if "x" in value.lower():
+                width_text, height_text = value.lower().split("x", 1)
+                size = (int(width_text), int(height_text))
+                if size not in RESOLUTION_MODES:
+                    raise ValueError
+                resolutions.append(size)
+            else:
+                size = int(value)
+                if size not in VALID_RESOLUTIONS:
+                    raise ValueError
+                resolutions.append(size)
+        except ValueError:
+            parser.error(f"unsupported resolution: {value}")
     configure_local_environment(ROOT, offline=True)
     config = AppConfig.load(ROOT / "config.json")
     if args.backend:
         config.backend = args.backend
+    guidance_scales = args.guidance_scales or [config.guidance_scale]
+    if any(not 0.0 <= value <= 4.0 for value in guidance_scales):
+        parser.error("guidance scales must be in [0, 4]")
     gpu = "unavailable"
     try:
         import torch
@@ -143,11 +176,14 @@ def main() -> int:
         "backend": config.backend,
         "gpu": gpu,
         "config": asdict(config),
-        "results": [
-            benchmark_one(config, resolution, args.warmup, args.frames)
-            for resolution in args.resolutions
-        ],
+        "results": [],
     }
+    for guidance_scale in guidance_scales:
+        config.guidance_scale = guidance_scale
+        for resolution in resolutions:
+            payload["results"].append(
+                benchmark_one(config, resolution, args.warmup, args.frames)
+            )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     json_path = args.output_dir / "benchmark_results.json"
     text_path = args.output_dir / "benchmark_results.txt"
