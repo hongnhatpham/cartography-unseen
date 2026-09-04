@@ -1,369 +1,61 @@
 {
-  "master_prefix": "",
+  "master_prefix": "corrupted 3D render",
   "prompts": [
     {
-      "name": "Biophiliac Filament City",
-      "prompt": "biophiliac filament futuristic wireframe city, computer glitch, fibrous growth, venation buildings, complex organic alien foliage"
+      "name": "Topology Unknown",
+      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, topology unknown, shattered strata melting and regrowing, floating fragments, hard black shadows, high contrast, foggy, haunted"
     },
     {
-      "name": "Nature / Forest",
-      "prompt": "ancient bioluminescent forest, vascular root networks, translucent fungal canopies, filament moss, dendritic branches, neural vines, wet iridescent bark, recursive botanical geometry, alien ecology, dreamlike volumetric mist"
+      "name": "Broken LOD",
+      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, broken LOD, untextured geometry popping through, z-fighting slabs, towering slabs overhead, washed out white ground, fog between the blocks, haunted"
     },
     {
-      "name": "Roads / Highways",
-      "prompt": "infinite elevated highways threading through impossible terrain, ribbon asphalt, fractal interchanges, luminous lane markings, roads dissolving into fiber-optic strands, brutalist pylons overgrown with synthetic vegetation, procedural megastructure landscape"
+      "name": "Shard Field",
+      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, tilted shards jutting from two-tone ground, floating fragments, blocky biophilia growth, deep perspective, deep shadow, high contrast"
     },
     {
-      "name": "Alien Desert",
-      "prompt": "vast mineral desert, crystalline erosion, wind-carved alien monoliths, metallic sand ripples, skeletal vegetation, glassy salt flats, electromagnetic storms, strange geological repetition, microscopic structures enlarged to architectural scale"
+      "name": "Corrupted Terrain Data",
+      "prompt": "corrupted terrain data, eye level view inside a vast outdoor voxel landscape, collapsing terraces of flat slabs, overhanging cliffs, hard black shadows, bold two-tone palette, haunted, topology unknown"
     },
     {
-      "name": "Sci-Fi City",
-      "prompt": "hyperdense post-human metropolis, translucent megastructures, vascular transportation arteries, hanging filament bridges, glowing data veins, recursive towers, architectural coral growth, synthetic fog, holographic debris, impossible perspective"
+      "name": "Datamosh Ravines",
+      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, datamoshed ravine network carved through blocky ground, hard vanishing lines, walls of blocks on every side, deep shadow, haunted"
     },
     {
-      "name": "Ocean / Underwater",
-      "prompt": "abyssal alien ocean, colossal translucent organisms, branching coral megacities, drifting membrane structures, glowing nerve filaments, underwater caustics, deep blue voids, floating particulate clouds, architecture grown rather than constructed"
+      "name": "Clipping Geometry",
+      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, clipping geometry, slabs intersecting and flickering, blocky biophilia clumped on ledges, towering slabs overhead, high contrast, hard shadows"
     },
     {
-      "name": "Mountain Landscape",
-      "prompt": "impossible procedural mountain range, folded geological ribbons, exposed strata glowing from within, fibrous rock formations, recursive cliffs, enormous root systems piercing stone, atmospheric haze, surreal scale, satellite-imagery abstraction"
+      "name": "Floating Fragments",
+      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, floating blocks suspended over an eroded plateau, tilted frame, deep perspective, thin fog bank, hard black shadows, haunted"
     },
     {
-      "name": "Ruined Future",
-      "prompt": "abandoned technological landscape reclaimed by mutant ecology, broken highways swallowed by roots, oxidized megastructures, tangled cables becoming vines, moss-covered machinery, glitching holograms, fungal architecture, beautiful technological decay"
+      "name": "Voxel Ridge",
+      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, ridges of small saturated cubes reading as vegetation, blocky biophilia, eye level view, deep shadow, high contrast, foggy"
     },
     {
-      "name": "Biomechanical World",
-      "prompt": "biomechanical valley, tendon bridges, cartilage architecture, vascular rivers, bone-like towers, translucent membranes stretched between cliffs, pulsating fiber bundles, anatomical landscapes without literal anatomy, elegant alien morphology"
+      "name": "Monolith Field",
+      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, tall thin monoliths jutting from broken terraces, hard black shadows, fog between the blocks, overexposed white sky, haunted"
     },
     {
-      "name": "Night Landscape / Neon Wilderness",
-      "prompt": "nocturnal synthetic wilderness, black glass terrain, electric-blue venation, glowing grasses, laser-thin trees, distant luminous mountains, procedural auroras, scattered geometric ruins, data corruption in the atmosphere, surreal cinematic darkness"
+      "name": "Melting Strata",
+      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, eroded layered strata as flat untextured blocks, melting and regrowing, thick fog, pale grey and white, deep shadow"
     },
     {
-      "name": "Cosmic Infrastructure",
-      "prompt": "planetary-scale infrastructure floating above clouds, orbital roads, kilometer-long filament bridges, enormous ring structures wrapped in organic growth, gravitational distortions, fractured geometry, glowing atmospheric veins, architecture merging into weather systems"
+      "name": "Overgrown Datablocks",
+      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, overgrown datablocks and collapsed slab terraces, blocky biophilia, bold two-tone palette, hard shadows, haunted, topology unknown"
     },
     {
-      "name": "Dark 01 - Mycelial Necropolis",
-      "prompt": "dead forest behaving like a subterranean nervous system, colossal mycelial cables, hollow tree cathedrals, black fungal membranes, phosphorescent decay, recursive roots, corrupted botanical geometry, oppressive mist"
+      "name": "Washed Out Canyon",
+      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, wide washed out canyon of stacked pale slabs, overhangs and cliffs, towering slabs overhead, deep vanishing lines, hard black shadows"
     },
     {
-      "name": "Dark 02 - Vascular Ruin",
-      "prompt": "abandoned megacity with streets transformed into arteries, towers splitting like calcified tissue, fibrous bridges, pulsing red signal veins, architectural scar tissue, glitch storms, beautiful post-human dread"
+      "name": "Neural Network Highway",
+      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, neural network highway dissolved into shattered floating slabs, no roads left, deep shadow, high contrast, foggy, haunted"
     },
     {
-      "name": "Dark 03 - Bone Highway",
-      "prompt": "infinite highway built across skeletal terrain, vertebral overpasses, asphalt tendons, rib-like pylons, lane markings dissolving into nerves, fog-filled voids, biomechanical desolation"
-    },
-    {
-      "name": "Dark 04 - Black Coral Abyss",
-      "prompt": "deep ocean trench grown from black coral and machine anatomy, luminous nerve reefs, membrane caverns, drifting organic debris, impossible scale, abyssal darkness, alien intelligence implied through structure"
-    },
-    {
-      "name": "Dark 05 - Signal Forest",
-      "prompt": "forest infected by broadcast interference, trees fragmenting into scanlines, roots forming antenna arrays, phosphorescent bark, spectral fog, corrupted leaves, analog noise embedded in the landscape"
-    },
-    {
-      "name": "Dark 06 - Flesh Geology",
-      "prompt": "mountain range behaving like mineralized soft tissue, folded tendon strata, vascular fissures, calcified membranes, impossible organic erosion, pale atmospheric haze, anatomical abstraction without literal anatomy"
-    },
-    {
-      "name": "Dark 07 - Ash Circuit Desert",
-      "prompt": "volcanic desert laid out like burnt circuitry, obsidian traces, glowing capillary lava channels, skeletal pylons, electrostatic dust, fractured horizon, dead technological ecology"
-    },
-    {
-      "name": "Dark 08 - Cathedral Organism",
-      "prompt": "gothic megastructure grown as a single organism, branching rib vaults, translucent membranes, vascular stained glass, root buttresses, bioluminescent chambers, sacred alien dread"
-    },
-    {
-      "name": "Dark 09 - Glitch Wetlands",
-      "prompt": "swamp composed of liquid pixels and fibrous reeds, venation waterways, mirrored black water, broken reflections, luminous fungal nodes, datamosh fog, uncanny environmental silence"
-    },
-    {
-      "name": "Dark 10 - Parasite City",
-      "prompt": "futuristic metropolis overtaken by elegant parasitic architecture, filament tendrils binding towers, translucent sacs, branching growth networks, holographic infection patterns, beautiful invasive ecology"
-    },
-    {
-      "name": "Dark 11 - Subterranean Nerve Cave",
-      "prompt": "vast cave system modeled after neural tissue, glowing synaptic chambers, threadlike stalactites, conductive mineral veins, liquid darkness, recursive tunnels, claustrophobic cosmic scale"
-    },
-    {
-      "name": "Dark 12 - Dead Satellite Garden",
-      "prompt": "orbital ruins covered in vacuum-adapted vines, solar panels becoming leaves, cable roots, frozen pollen, fractured ring habitats, black-space botanical growth, silent technological decay"
-    },
-    {
-      "name": "Dark 13 - Erosion Machine",
-      "prompt": "landscape consumed by a machine that erodes reality into fibers, cliffs unraveling into threads, roads breaking into topology lines, hovering debris, procedural corruption, dreamlike catastrophe"
-    },
-    {
-      "name": "Dark 14 - Glass Infection",
-      "prompt": "crystalline forest spreading through an abandoned city, buildings pierced by translucent branching growth, sharp mineral roots, refracted fog, geometric spores, frozen organic violence"
-    },
-    {
-      "name": "Dark 15 - Tendon Canyon",
-      "prompt": "canyon crossed by enormous tendon-like suspension bridges, fibrous cliffs, pulsing river veins, hanging membranes, organic infrastructure, dusty haze, monumental unease"
-    },
-    {
-      "name": "Dark 16 - Hollow Megafauna Landscape",
-      "prompt": "terrain resembling the interior of an extinct colossal organism, ribbed valleys, porous bone mountains, vascular rivers, fungal colonization, distant artificial lights, archeological alien horror"
-    },
-    {
-      "name": "Dark 17 - Static Storm Plains",
-      "prompt": "flat wilderness under a storm of digital static, grass becoming wire filaments, lightning tracing circuit diagrams, horizon tearing into compression artifacts, lonely pylons, cinematic dread"
-    },
-    {
-      "name": "Dark 18 - Rooted Factory",
-      "prompt": "industrial complex transformed into a root-bound ecosystem, pipes becoming vines, boilers becoming seed pods, rusted gantries wrapped in vascular growth, steam fog, toxic beauty"
-    },
-    {
-      "name": "Dark 19 - Fractal Ossuary",
-      "prompt": "endless architectural field made from repeating bone-like arches, recursive corridors, mineral dust, filament cobwebs, faint bioluminescence, impossible non-Euclidean perspective"
-    },
-    {
-      "name": "Dark 20 - Moonlit Machine Swamp",
-      "prompt": "night marsh where reeds are fiber optics and water channels resemble motherboard traces, black mirrored pools, pale moons, mechanical insects, quiet alien melancholy"
-    },
-    {
-      "name": "Cinematic 01 - Golden Vein Valley",
-      "prompt": "vast valley whose rivers branch like leaf veins, monumental cliffs, translucent vegetation, warm atmospheric light, subtle bioluminescence, elegant procedural composition, cinematic scale"
-    },
-    {
-      "name": "Cinematic 02 - Cloud Garden Megacity",
-      "prompt": "futuristic city suspended above clouds, towers grown like stems, petal-shaped platforms, filament bridges, soft volumetric sunrise, refined organic architecture, serene monumental scale"
-    },
-    {
-      "name": "Cinematic 03 - Silver Road Delta",
-      "prompt": "highway network spreading across the landscape like a river delta, smooth elevated ribbons, reflective surfaces, sparse architecture, morning fog, graceful infrastructural geometry"
-    },
-    {
-      "name": "Cinematic 04 - Aurora Forest",
-      "prompt": "ancient forest with canopy structures behaving like auroral curtains, luminous trunks, fine filament roots, soft mist, layered depth, restrained alien botany, cinematic nocturne"
-    },
-    {
-      "name": "Cinematic 05 - Crystal Coast",
-      "prompt": "coastal cliffs patterned after shell microstructures, enormous calcified folds, translucent tide pools, branching mineral veins, clean ocean haze, elegant speculative geology"
-    },
-    {
-      "name": "Cinematic 06 - Orbital Blossom",
-      "prompt": "space habitat designed from flower phyllotaxis, concentric transport rings, petal megastructures, delicate lights, planetary horizon, refined cosmic architecture"
-    },
-    {
-      "name": "Cinematic 07 - River Circuit",
-      "prompt": "broad river valley whose waterways follow circuit-board topology, luminous tributaries, clean geometric bridges, green terrain, misty sunrise, peaceful techno-natural synthesis"
-    },
-    {
-      "name": "Cinematic 08 - Filament Prairie",
-      "prompt": "open grassland composed of fine luminous fibers, distant monolithic structures, low rolling terrain, soft wind patterns, golden-hour haze, minimalist alien serenity"
-    },
-    {
-      "name": "Cinematic 09 - Canopy Infrastructure",
-      "prompt": "elevated transit system woven through giant tree crowns, branching rails, translucent platforms, suspended gardens, gentle fog, believable futuristic ecology"
-    },
-    {
-      "name": "Cinematic 10 - Glass Mountain Sanctuary",
-      "prompt": "mountains formed from layered translucent mineral membranes, internal glowing strata, sparse pathways, cloud sea, contemplative scale, pristine sci-fi landscape"
-    },
-    {
-      "name": "Cinematic 11 - Luminous Salt World",
-      "prompt": "vast salt flats with branching glowing cracks like capillaries, distant geometric towers, mirrored sky, subtle atmospheric bloom, minimal futuristic solitude"
-    },
-    {
-      "name": "Cinematic 12 - Coral Transit City",
-      "prompt": "coastal metropolis shaped by coral branching logic, elegant bridges, porous towers, turquoise water, soft haze, organic urban planning, polished cinematic realism"
-    },
-    {
-      "name": "Cinematic 13 - Neural Snowfield",
-      "prompt": "snow landscape crossed by delicate branching light paths resembling neural dendrites, smooth terrain, monolithic shelters, pale sky, restrained futuristic atmosphere"
-    },
-    {
-      "name": "Cinematic 14 - Tidal Architecture",
-      "prompt": "buildings arranged by tidal flow patterns, sweeping curved causeways, wet reflective stone, membrane roofs, ocean mist, elegant biomorphic urbanism"
-    },
-    {
-      "name": "Cinematic 15 - Forest of Antennas",
-      "prompt": "slender antenna towers growing among real trees like a second canopy, cable vines, soft rain, diffused daylight, subtle technological integration, poetic realism"
-    },
-    {
-      "name": "Cinematic 16 - Strata City",
-      "prompt": "city carved directly into layered canyon walls, terraces following geological bands, thin bridges, warm stone, cool atmospheric depth, monumental but calm"
-    },
-    {
-      "name": "Cinematic 17 - Bioluminescent Causeway",
-      "prompt": "long road crossing a dark wetland, lane edges glowing like living veins, mirrored water, low fog, sparse alien plants, cinematic night photography"
-    },
-    {
-      "name": "Cinematic 18 - Sky Root Station",
-      "prompt": "transport hub hanging beneath enormous root-like structures in the clouds, suspended platforms, elegant cables, bright overcast light, surreal but clean design"
-    },
-    {
-      "name": "Cinematic 19 - Procedural Archipelago",
-      "prompt": "islands shaped by recursive erosion and leaf geometry, delicate bridges, turquoise channels, minimal structures, high-altitude cinematic view, harmonious generative landscape"
-    },
-    {
-      "name": "Cinematic 20 - Soft Machine Horizon",
-      "prompt": "distant megastructures with smooth organic silhouettes rising from natural plains, subtle fiber textures, warm haze, long shadows, quiet optimistic science fiction"
-    },
-    {
-      "name": "Roads 01 - Mycelium Interchange",
-      "prompt": "multi-level freeway interchange generated from fungal mycelium logic, branching ramps, glowing lane veins, fibrous supports, misty terrain, organic traffic infrastructure"
-    },
-    {
-      "name": "Roads 02 - Capillary Highway",
-      "prompt": "highways splitting and reconnecting like capillaries across a dark landscape, luminous traffic streams, thin elevated decks, vascular topology, aerial cinematic view"
-    },
-    {
-      "name": "Roads 03 - Ribbon Canyon Roads",
-      "prompt": "smooth road ribbons weaving through impossible canyon folds, suspended switchbacks, filament guardrails, geological membranes, atmospheric depth, surreal infrastructure"
-    },
-    {
-      "name": "Roads 04 - Neural Ring Road",
-      "prompt": "circular city highway modeled after neural networks, synaptic junction plazas, branching exits, glowing traffic pulses, dense futuristic urban fabric"
-    },
-    {
-      "name": "Roads 05 - Root Bridge Network",
-      "prompt": "road bridges grown like tree roots across a flooded valley, branching supports, organic concrete, reflective water, fog, monumental biophilic engineering"
-    },
-    {
-      "name": "Roads 06 - Fractal Cloverleaf",
-      "prompt": "enormous fractal highway interchange repeating across scales, recursive ramps, impossible loops, sparse desert, sharp aerial geometry, procedural urbanism"
-    },
-    {
-      "name": "Roads 07 - Fiber Optic Autobahn",
-      "prompt": "night motorway dissolving into thousands of fiber-optic strands at the horizon, luminous lanes, black glass terrain, long exposure motion, futuristic dreamscape"
-    },
-    {
-      "name": "Roads 08 - Venation Boulevard",
-      "prompt": "city boulevard network derived from leaf venation, primary arterial roads splitting into delicate streets, green roofs, elegant towers, aerial masterplan aesthetic"
-    },
-    {
-      "name": "Roads 09 - Tendon Viaduct",
-      "prompt": "elevated road stretched between cliffs like a tendon, soft structural membranes, cable fibers, deep ravine, atmospheric fog, biomechanical civil engineering"
-    },
-    {
-      "name": "Roads 10 - Circuit Desert Roads",
-      "prompt": "road system etched into desert like motherboard traces, geometric intersections, sparse moving lights, mineral mesas, satellite-view abstraction"
-    },
-    {
-      "name": "Roads 11 - Coral Causeways",
-      "prompt": "coastal roads branching like coral over shallow luminous water, porous pylons, small futuristic settlements, tropical haze, speculative infrastructure"
-    },
-    {
-      "name": "Roads 12 - Glitch Freeway",
-      "prompt": "urban freeway fragmented by digital corruption, duplicated ramps, broken perspective, scanline architecture, smeared headlights, controlled surrealism"
-    },
-    {
-      "name": "Roads 13 - Cloud Spine Highway",
-      "prompt": "single monumental highway running along a mountain spine above clouds, impossible bridges, thin luminous edge lines, vast scale, clean sci-fi cinematography"
-    },
-    {
-      "name": "Roads 14 - Underground Artery",
-      "prompt": "subterranean transit tunnel system behaving like a vascular organ, branching chambers, glowing route lines, fibrous walls, sleek biomechanical infrastructure"
-    },
-    {
-      "name": "Roads 15 - Petal Roundabout",
-      "prompt": "gigantic transportation interchange arranged like flower petals, radial ramps, central garden core, layered roads, aerial futuristic city view"
-    },
-    {
-      "name": "Roads 16 - River Road Hybrid",
-      "prompt": "roadways and waterways fused into one branching system, asphalt channels turning into reflective rivers, amphibious infrastructure, soft terrain, surreal planning"
-    },
-    {
-      "name": "Roads 17 - Frozen Transit Veins",
-      "prompt": "roads embedded beneath translucent ice, luminous vehicles tracing branching pathways, frozen plains, blue atmospheric depth, alien polar infrastructure"
-    },
-    {
-      "name": "Roads 18 - Highway Forest Canopy",
-      "prompt": "elevated roads threading through enormous tree crowns, suspended stations, vine-like supports, diffused daylight, ecological megastructure"
-    },
-    {
-      "name": "Roads 19 - Infinite Exit",
-      "prompt": "endless freeway exits multiplying recursively into the horizon, sparse landscape, elegant repetition, atmospheric perspective, conceptual architectural surrealism"
-    },
-    {
-      "name": "Roads 20 - Orbital Motorway",
-      "prompt": "highway system wrapped around a planetary ring habitat, curved horizon, branching orbital lanes, light trails, monumental engineering, cosmic infrastructure"
-    },
-    {
-      "name": "Compressed 01 - Cellular Forest",
-      "prompt": "cellular forest, continent-scale microstructures, luminous roots, fungal towers, venation canopy, alien mist"
-    },
-    {
-      "name": "Compressed 02 - Mycelium Roads",
-      "prompt": "mycelium highways, branching asphalt roots, fiber-optic lanes, brutalist pylons, procedural terrain"
-    },
-    {
-      "name": "Compressed 03 - Nerve Mountains",
-      "prompt": "fiber-optic nerve mountains, glowing strata, cable cliffs, recursive geology, atmospheric haze"
-    },
-    {
-      "name": "Compressed 04 - Leaf City",
-      "prompt": "leaf-venation city, vascular streets, coral towers, translucent megastructures, synthetic fog"
-    },
-    {
-      "name": "Compressed 05 - Circuit Desert",
-      "prompt": "circuit-board desert, metallic dunes, capillary cracks, crystal monoliths, electromagnetic haze"
-    },
-    {
-      "name": "Compressed 06 - Abyss Cathedral",
-      "prompt": "abyssal nerve cathedral, coral infrastructure, glowing filaments, membrane caverns, deep blue void"
-    },
-    {
-      "name": "Compressed 07 - Motherboard Jungle",
-      "prompt": "motherboard jungle, conductive roots, circuit branches, synthetic bark, glowing spores"
-    },
-    {
-      "name": "Compressed 08 - Tendon Freeway",
-      "prompt": "tendon freeway, bone pylons, ribbon asphalt, anatomical cliffs, foggy voids"
-    },
-    {
-      "name": "Compressed 09 - Venation Swamp",
-      "prompt": "venation swamp, fibrous mangroves, black water, glitch pollen, bioluminescent wetlands"
-    },
-    {
-      "name": "Compressed 10 - Rooted Brutalism",
-      "prompt": "brutalist ruins, vascular overgrowth, fungal towers, glowing cracks, techno-ecological decay"
-    },
-    {
-      "name": "Compressed 11 - Crystal Synapse Arctic",
-      "prompt": "crystal synapse arctic, frozen nerve rivers, translucent membranes, pale bioluminescence"
-    },
-    {
-      "name": "Compressed 12 - Orbital Flower City",
-      "prompt": "orbital flower city, radial transport veins, petal megastructures, cosmic botanical engineering"
-    },
-    {
-      "name": "Compressed 13 - Lung Canyon",
-      "prompt": "lung-structure canyon, branching ravines, vascular rivers, membrane cliffs, mist chambers"
-    },
-    {
-      "name": "Compressed 14 - Wire Jungle",
-      "prompt": "wire jungle, filament trees, cable vines, pulsing sap-light, humid neon fog"
-    },
-    {
-      "name": "Compressed 15 - Glitch Suburb",
-      "prompt": "glitch suburb, roads becoming roots, houses swallowed by mycelium, quiet post-human decay"
-    },
-    {
-      "name": "Compressed 16 - Neural Planet Roads",
-      "prompt": "planetary neural roads, glowing veins, synaptic junctions, dark terrain, systems abstraction"
-    },
-    {
-      "name": "Compressed 17 - Floral Volcano",
-      "prompt": "floral volcano, capillary lava, petal rock, smoke membranes, bio-geological surrealism"
-    },
-    {
-      "name": "Compressed 18 - Coral Freeway",
-      "prompt": "underwater freeway, coral overpasses, glowing lane markers, suspended sediment, aquatic decay"
-    },
-    {
-      "name": "Compressed 19 - Bone Glass City",
-      "prompt": "bone-glass city, venation facades, translucent ribs, sacred biomechanical architecture"
-    },
-    {
-      "name": "Compressed 20 - Satellite Wilderness",
-      "prompt": "satellite-map wilderness, neon root forests, corrupted schematics, black glass terrain, cinematic night"
+      "name": "Unstable Voxels",
+      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, unstable voxels tearing apart, chunks flying loose, fog between the blocks, hard black shadows, bold two-tone palette, deep perspective"
     }
   ]
 }

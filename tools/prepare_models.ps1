@@ -1,7 +1,9 @@
 param(
-    [string]$Revision = "b261bac6fd2cf515557d5d0707481eafa0485ec2",
-    [string]$PythonExe = ""
+    [string]$PythonExe = "",
+    [string[]]$Only = @()
 )
+# Revisions are pinned inside tools\download_models.py, which is the single
+# source of truth for what an offline machine needs.
 $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 if (-not $PythonExe) {
@@ -11,5 +13,7 @@ if (-not $PythonExe) {
     elseif (Test-Path -LiteralPath $dev) { $PythonExe = $dev }
     else { $PythonExe = "python" }
 }
-& $PythonExe (Join-Path $PSScriptRoot "download_models.py") --root $Root --revision $Revision
+$arguments = @((Join-Path $PSScriptRoot "download_models.py"), "--root", $Root)
+foreach ($name in $Only) { $arguments += @("--only", $name) }
+& $PythonExe @arguments
 if ($LASTEXITCODE -ne 0) { throw "Model preparation failed with exit code $LASTEXITCODE" }

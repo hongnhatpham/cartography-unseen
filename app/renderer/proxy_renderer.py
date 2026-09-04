@@ -16,19 +16,29 @@ except ImportError as exc:  # pragma: no cover - rendered as a startup error by 
     ) from exc
 
 from app.renderer.camera import Camera
-from app.renderer.city import (
+from app.renderer.world import (
     ACTIVE_CHUNK_RADIUS,
-    CityChunk,
-    CityCube,
-    RoadContact,
+    CHUNK_SIZE,
+    WorldChunk,
+    WorldCube,
+    chunk_colliders,
+    open_heading,
+    resolve_collisions,
+    settle_height,
+    step_blocked,
     generate_chunk,
-    move_road_contact as move_city_road_contact,
     plan_chunk_cache,
     sky_color,
-    spawn_road_contact as spawn_city_road_contact,
+    spawn_pose,
+    world_label,
     world_to_chunk,
 )
 from app.types import ConditioningFrame, GeneratedFrame
+
+# Chunks generated per frame once the streaming window is warm. Eleven chunks
+# arrive per boundary crossing and a crossing takes about twenty frames at
+# cruise speed, so one per frame keeps the window warm inside the 16.7 ms budget.
+CHUNK_LOAD_BUDGET = 1
 
 
 def _cube_vertices() -> np.ndarray:
@@ -45,118 +55,6 @@ def _cube_vertices() -> np.ndarray:
         for index in (0, 1, 2, 0, 2, 3):
             rows.append((*corners[index], *normal))
     return np.asarray(rows, dtype="f4")
-
-
-def _sphere_vertices(segments: int = 20, rings: int = 12) -> np.ndarray:
-    rows: list[tuple[float, ...]] = []
-    for ring in range(rings):
-        latitude_0 = -pi * 0.5 + pi * ring / rings
-        latitude_1 = -pi * 0.5 + pi * (ring + 1) / rings
-        for segment in range(segments):
-            longitude_0 = 2.0 * pi * segment / segments
-            longitude_1 = 2.0 * pi * (segment + 1) / segments
-
-            def point(latitude: float, longitude: float) -> tuple[float, float, float]:
-                return (
-                    cos(latitude) * cos(longitude),
-                    sin(latitude),
-                    cos(latitude) * sin(longitude),
-                )
-
-            points = (
-                point(latitude_0, longitude_0),
-                point(latitude_0, longitude_1),
-                point(latitude_1, longitude_1),
-                point(latitude_1, longitude_0),
-            )
-            for index in (0, 1, 2, 0, 2, 3):
-                vertex = points[index]
-                rows.append((*vertex, *vertex))
-    return np.asarray(rows, dtype="f4")
-
-
-def _cylinder_vertices(segments: int = 24) -> np.ndarray:
-    rows: list[tuple[float, ...]] = []
-    for segment in range(segments):
-        angle_0 = 2.0 * pi * segment / segments
-        angle_1 = 2.0 * pi * (segment + 1) / segments
-        x0, z0 = cos(angle_0), sin(angle_0)
-        x1, z1 = cos(angle_1), sin(angle_1)
-        side = (
-            (x0, -1.0, z0, x0, 0.0, z0),
-            (x1, -1.0, z1, x1, 0.0, z1),
-            (x1, 1.0, z1, x1, 0.0, z1),
-            (x0, 1.0, z0, x0, 0.0, z0),
-        )
-        for index in (0, 1, 2, 0, 2, 3):
-            rows.append(side[index])
-        rows.extend(
-            [
-                (0.0, 1.0, 0.0, 0.0, 1.0, 0.0),
-                (x0, 1.0, z0, 0.0, 1.0, 0.0),
-                (x1, 1.0, z1, 0.0, 1.0, 0.0),
-                (0.0, -1.0, 0.0, 0.0, -1.0, 0.0),
-                (x1, -1.0, z1, 0.0, -1.0, 0.0),
-                (x0, -1.0, z0, 0.0, -1.0, 0.0),
-            ]
-        )
-    return np.asarray(rows, dtype="f4")
-
-
-def _reprojection_grid(subdivisions: int = 192) -> np.ndarray:
-    """Dense triangle grid used to forward-warp source depth on the GPU."""
-    coordinates = np.linspace(0.0, 1.0, subdivisions + 1, dtype=np.float32)
-    rows: list[tuple[float, float]] = []
-    for y_index in range(subdivisions):
-        y0, y1 = coordinates[y_index], coordinates[y_index + 1]
-        for x_index in range(subdivisions):
-            x0, x1 = coordinates[x_index], coordinates[x_index + 1]
-            rows.extend(((x0, y0), (x1, y0), (x1, y1), (x0, y0), (x1, y1), (x0, y1)))
-    return np.asarray(rows, dtype="f4")
-
-
-def _transform(
-    position: tuple[float, float, float],
-    scale: tuple[float, float, float],
-    rotation: tuple[float, float, float] = (0.0, 0.0, 0.0),
-) -> np.ndarray:
-    rx, ry, rz = (radians(value) for value in rotation)
-    scale_matrix = np.diag((*scale, 1.0)).astype(np.float32)
-    rotate_x = np.array(
-        [[1, 0, 0, 0], [0, cos(rx), -sin(rx), 0], [0, sin(rx), cos(rx), 0], [0, 0, 0, 1]],
-        dtype=np.float32,
-    )
-    rotate_y = np.array(
-        [[cos(ry), 0, sin(ry), 0], [0, 1, 0, 0], [-sin(ry), 0, cos(ry), 0], [0, 0, 0, 1]],
-        dtype=np.float32,
-    )
-    rotate_z = np.array(
-        [[cos(rz), -sin(rz), 0, 0], [sin(rz), cos(rz), 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
-        dtype=np.float32,
-    )
-    translation = np.identity(4, dtype=np.float32)
-    translation[:3, 3] = position
-    return translation @ rotate_z @ rotate_y @ rotate_x @ scale_matrix
-
-
-def _transform_basis(
-    position: tuple[float, float, float],
-    scale: tuple[float, float, float],
-    basis: tuple[
-        tuple[float, float, float],
-        tuple[float, float, float],
-        tuple[float, float, float],
-    ],
-) -> np.ndarray:
-    """Build a transform from explicit local axes for sloped road pieces."""
-    scale_matrix = np.diag((*scale, 1.0)).astype(np.float32)
-    basis_matrix = np.identity(4, dtype=np.float32)
-    basis_matrix[:3, 0] = basis[0]
-    basis_matrix[:3, 1] = basis[1]
-    basis_matrix[:3, 2] = basis[2]
-    translation = np.identity(4, dtype=np.float32)
-    translation[:3, 3] = position
-    return translation @ basis_matrix @ scale_matrix
 
 
 class ProxyRenderer:
@@ -196,7 +94,7 @@ class ProxyRenderer:
         pygame.mouse.get_rel()
 
         self.ctx = moderngl.create_context(require=330)
-        self.ctx.enable(moderngl.DEPTH_TEST | moderngl.CULL_FACE)
+        self.ctx.enable(moderngl.DEPTH_TEST)
         self.project_root = project_root
         if isinstance(resolution, int):
             resolution = (resolution, resolution)
@@ -219,11 +117,7 @@ class ProxyRenderer:
             fragment_shader=(shader_root / "reproject.frag").read_text(encoding="utf-8"),
         )
 
-        meshes = {
-            "cube": _cube_vertices(),
-            "sphere": _sphere_vertices(),
-            "cylinder": _cylinder_vertices(),
-        }
+        meshes = {"cube": _cube_vertices()}
         self.mesh_buffers = {name: self.ctx.buffer(vertices.tobytes()) for name, vertices in meshes.items()}
         self.instance_buffers = {
             name: self.ctx.buffer(reserve=19 * np.dtype("f4").itemsize)
@@ -248,6 +142,7 @@ class ProxyRenderer:
             for name, buffer in self.mesh_buffers.items()
         }
         self._instance_counts = {name: 0 for name in meshes}
+        # Observability counter: how many times the instance buffer was rewritten.
         self._instance_buffer_revision = 0
         quad = np.asarray(
             [
@@ -297,9 +192,10 @@ class ProxyRenderer:
 
         self.world_seed = world_seed
         self.sky_color = sky_color(world_seed)
-        self._chunks: dict[tuple[int, int], CityChunk] = {}
+        self._chunks: dict[tuple[int, int], WorldChunk] = {}
         self._chunk_instances: dict[tuple[int, int], np.ndarray] = {}
-        self._active_chunk_coords: tuple[tuple[int, int], ...] = ()
+        self._chunk_colliders: dict[tuple[int, int], np.ndarray] = {}
+        self._last_footfall: tuple[float, float] | None = None
         self._stream_center: tuple[int, int] | None = None
         self.sequence = 0
         self._closed = False
@@ -375,78 +271,181 @@ class ProxyRenderer:
         self.resize_window_to_render()
 
     @staticmethod
-    def _pack_instances(objects: tuple[CityCube, ...]) -> np.ndarray:
-        """Pack column-major transforms and colors for one instanced draw."""
-        packed = np.empty((len(objects), 19), dtype="f4")
-        for index, item in enumerate(objects):
-            model = (
-                _transform(item.position, item.half_extents, item.rotation)
-                if item.basis is None
-                else _transform_basis(item.position, item.half_extents, item.basis)
-            )
-            packed[index, :16] = model.T.reshape(16)
-            packed[index, 16:] = item.color
+    def _pack_instances(objects: tuple[WorldCube, ...]) -> np.ndarray:
+        """Pack column-major transforms and colors for one instanced draw.
+
+        Vectorised over the whole chunk: a per-cube Python loop building 4x4
+        matrices costs milliseconds per chunk and shows up as a frame spike.
+        """
+        count = len(objects)
+        packed = np.zeros((count, 19), dtype="f4")
+        if count == 0:
+            return packed
+        position = np.array([item.position for item in objects], dtype="f4")
+        extents = np.array([item.half_extents for item in objects], dtype="f4")
+        angles = np.radians(np.array([item.rotation for item in objects], dtype="f4"))
+        cos_x, cos_y, cos_z = np.cos(angles).T
+        sin_x, sin_y, sin_z = np.sin(angles).T
+        zero = np.zeros(count, dtype="f4")
+        one = np.ones(count, dtype="f4")
+        rotate_x = np.stack(
+            [one, zero, zero, zero, cos_x, -sin_x, zero, sin_x, cos_x], axis=1
+        ).reshape(count, 3, 3)
+        rotate_y = np.stack(
+            [cos_y, zero, sin_y, zero, one, zero, -sin_y, zero, cos_y], axis=1
+        ).reshape(count, 3, 3)
+        rotate_z = np.stack(
+            [cos_z, -sin_z, zero, sin_z, cos_z, zero, zero, zero, one], axis=1
+        ).reshape(count, 3, 3)
+        # Rz @ Ry @ Rx @ diag(half_extents), i.e. each column scaled by its axis.
+        linear = (rotate_z @ rotate_y @ rotate_x) * extents[:, None, :]
+        packed[:, 0:3] = linear[:, :, 0]
+        packed[:, 4:7] = linear[:, :, 1]
+        packed[:, 8:11] = linear[:, :, 2]
+        packed[:, 12:15] = position
+        packed[:, 15] = 1.0
+        packed[:, 16:] = np.array([item.color for item in objects], dtype="f4")
         return packed
 
-    def _update_city(self, position: np.ndarray) -> None:
-        """Move the fixed chunk window and rebuild GPU instances when needed."""
+    def _update_world(self, position: np.ndarray) -> None:
+        """Move the fixed chunk window, loading a bounded number of chunks.
+
+        A cold cache (startup, or a new world seed) is filled in one go because
+        a half-built landscape is worse than one hitch. Once the window is
+        populated, boundary crossings load at most CHUNK_LOAD_BUDGET chunks per
+        frame; plan.load is centre-out, so the nearest arrive first.
+        """
         plan = plan_chunk_cache(
             self._chunks,
             float(position[0]),
             float(position[2]),
             ACTIVE_CHUNK_RADIUS,
         )
+        self._stream_center = plan.center
         if not plan.load and not plan.evict:
-            self._stream_center = plan.center
             return
 
         for coord in plan.evict:
             del self._chunks[coord]
             del self._chunk_instances[coord]
-        for coord in plan.load:
+            self._chunk_colliders.pop(coord, None)
+        budget = len(plan.load) if not self._chunks else CHUNK_LOAD_BUDGET
+        for coord in plan.load[:budget]:
             chunk = generate_chunk(coord, self.world_seed)
             self._chunks[coord] = chunk
             self._chunk_instances[coord] = self._pack_instances(chunk.objects)
+            self._chunk_colliders[coord] = chunk_colliders(chunk)
 
-        self._active_chunk_coords = plan.desired
-        self._stream_center = plan.center
         cube_data = np.concatenate(
-            tuple(self._chunk_instances[coord] for coord in plan.desired),
+            tuple(
+                self._chunk_instances[coord]
+                for coord in plan.desired
+                if coord in self._chunk_instances
+            ),
             axis=0,
         )
         cube_buffer = self.instance_buffers["cube"]
         if cube_data.nbytes > cube_buffer.size:
             cube_buffer.orphan(cube_data.nbytes)
-        cube_buffer.write(cube_data.tobytes())
+        # np.concatenate is C-contiguous, so moderngl can upload it directly;
+        # tobytes() here costs a second copy of a couple of megabytes per load.
+        cube_buffer.write(cube_data)
         self._instance_counts["cube"] = len(cube_data)
-        self._instance_counts["sphere"] = 0
-        self._instance_counts["cylinder"] = 0
         self._instance_buffer_revision += 1
 
-    def _city_contains(self, position: np.ndarray) -> bool:
+    def _world_contains(self, position: np.ndarray) -> bool:
         return world_to_chunk(float(position[0]), float(position[2])) in self._chunks
 
-    def spawn_road_contact(self) -> RoadContact:
-        """Return a guaranteed walkable spawn point for the current world."""
-        return spawn_city_road_contact(self.world_seed)
+    def spawn_camera(self, camera: Camera) -> None:
+        """Stand the walker on open ground inside this seed's relief.
 
-    def move_road_contact(
-        self,
-        contact: RoadContact,
-        proposed_x: float,
-        proposed_z: float,
-    ) -> RoadContact:
-        """Clamp a proposed step to the current road and reachable junctions."""
-        return move_city_road_contact(
-            contact, proposed_x, proposed_z, self.world_seed
+        Resets the footfall memory so the riser check does not compare the new
+        spawn against wherever the walker last stood.
+
+        The landform picks the spot; the forms around it are only known once
+        the chunk exists, so the walker is then pushed out of anything it
+        spawned inside and turned to face the longest open walk.
+        """
+        position, yaw, pitch = spawn_pose(self.world_seed)
+        camera.position[:] = position
+        camera.yaw = yaw
+        camera.pitch = pitch
+        self._last_footfall = None
+        self._update_world(camera.position)
+        colliders = self._nearby_colliders(float(position[0]), float(position[2]))
+        self.constrain_camera(camera, None)
+        x, y, z = (float(value) for value in camera.position)
+        open_yaw, distance = open_heading(x, y, z, colliders, world_seed=self.world_seed)
+        if distance > 0.0:
+            camera.yaw = open_yaw
+
+    def nearby_colliders(self, camera: Camera) -> np.ndarray:
+        """Standing-form footprints around the camera, for autowalk steering."""
+        return self._nearby_colliders(float(camera.position[0]), float(camera.position[2]))
+
+    def open_heading(self, camera: Camera) -> tuple[float, float]:
+        """Yaw of the longest unobstructed walk from the camera, and its length."""
+        x, y, z = (float(value) for value in camera.position)
+        return open_heading(x, y, z, self._nearby_colliders(x, z), world_seed=self.world_seed)
+
+    def _nearby_colliders(self, x: float, z: float) -> np.ndarray:
+        """Footprints from the 3x3 chunks around (x, z), stacked for one query."""
+        home = world_to_chunk(x, z)
+        nearby = [
+            self._chunk_colliders[coord]
+            for coord in (
+                (home[0] + dx, home[1] + dz) for dx in (-1, 0, 1) for dz in (-1, 0, 1)
+            )
+            if coord in self._chunk_colliders
+        ]
+        return np.concatenate(nearby, axis=0) if nearby else np.empty((0, 8))
+
+    def constrain_camera(self, camera: Camera, dt: float | None = None) -> None:
+        """Slide the walker out of standing forms, then settle it onto the terrain.
+
+        ``dt`` rate-limits climbs; None snaps straight to the walk height.
+        """
+        x, y, z = (float(value) for value in camera.position)
+        x, z = resolve_collisions(x, y, z, self._nearby_colliders(x, z))
+        # A riser taller than a step is a wall: keep whichever axis of the
+        # move stays on walkable ground, so the walker slides along the edge.
+        # This runs after form collision so a push out of a block can never
+        # land the walker on the far side of a riser; the last footfall is
+        # always a legal spot to fall back to.
+        if self._last_footfall is not None:
+            last_x, last_z = self._last_footfall
+            if step_blocked(last_x, last_z, x, z, self.world_seed):
+                if not step_blocked(last_x, last_z, x, last_z, self.world_seed):
+                    z = last_z
+                elif not step_blocked(last_x, last_z, last_x, z, self.world_seed):
+                    x = last_x
+                else:
+                    x, z = last_x, last_z
+        self._last_footfall = (x, z)
+        camera.position[0] = x
+        camera.position[2] = z
+        camera.position[1] = settle_height(x, y, z, self.world_seed, dt)
+
+    def world_label(self) -> str:
+        """Short biome and palette label for the overlay, at the streamed center."""
+        center = self._stream_center or (0, 0)
+        return world_label(
+            self.world_seed,
+            (center[0] + 0.5) * CHUNK_SIZE,
+            (center[1] + 0.5) * CHUNK_SIZE,
         )
 
-    def randomize_world(self) -> int:
-        self.world_seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint32)[0])
+    def randomize_world(self, world_seed: int | None = None) -> int:
+        """Switch to a new (or given) world seed and drop every cached chunk."""
+        self.world_seed = (
+            int(np.random.SeedSequence().generate_state(1, dtype=np.uint32)[0])
+            if world_seed is None
+            else int(world_seed)
+        )
         self.sky_color = sky_color(self.world_seed)
         self._chunks.clear()
         self._chunk_instances.clear()
-        self._active_chunk_coords = ()
+        self._chunk_colliders.clear()
         self._stream_center = None
         self._instance_counts = {name: 0 for name in self.mesh_buffers}
         self._reproject_sequence = -1
@@ -466,11 +465,13 @@ class ProxyRenderer:
 
     def render_scene(self, camera: Camera, *, manage_chunks: bool = True):
         if manage_chunks:
-            self._update_city(camera.position)
+            self._update_world(camera.position)
         snapshot = camera.snapshot(aspect=self.render_width / self.render_height)
         self.proxy_fbo.use()
         self.ctx.viewport = (0, 0, self.render_width, self.render_height)
         self.ctx.enable(moderngl.DEPTH_TEST)
+        # Culling stays off: the walker can brush through a slab or overhang,
+        # and back faces are what makes that readable instead of empty.
         self.ctx.disable(moderngl.CULL_FACE)
         self.proxy_fbo.clear(*self.sky_color, 1.0, depth=1.0)
         self.proxy_program["view"].write(snapshot.view_matrix.T.astype("f4").tobytes())
@@ -604,7 +605,7 @@ class ProxyRenderer:
             near=camera.near,
             far=camera.far,
         )
-        if not self._city_contains(warped_camera.position):
+        if not self._world_contains(warped_camera.position):
             self.reproject_ms += 0.15 * ((perf_counter() - started) * 1000.0 - self.reproject_ms)
             self._present_texture(
                 self.display_texture, overlay_lines, sharpen, prompt_caption
@@ -643,7 +644,6 @@ class ProxyRenderer:
         )
         self.reproject_program["fallback_uv_scale"].value = (base_scale, base_scale)
         self.reproject_program["fallback_uv_offset"].value = base_offset
-        self.reproject_program["warp_strength"].value = 1.0
         self.reproject_program["occlusion_tolerance"].value = 0.0015
         self.display_texture.use(0)
         self.reproject_source_depth.use(1)

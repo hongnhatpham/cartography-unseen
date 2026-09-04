@@ -37,7 +37,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Runtime preparation failed." }
 
     $Python = Join-Path $Root "runtime\python\python.exe"
-    Write-Host "`nDownloading the pinned SD-Turbo model..." -ForegroundColor Cyan
+    Write-Host "`nDownloading the pinned SD-Turbo and TAESD models..." -ForegroundColor Cyan
     & (Join-Path $PSScriptRoot "prepare_models.ps1") -PythonExe $Python
     if ($LASTEXITCODE -ne 0) { throw "Model preparation failed." }
 

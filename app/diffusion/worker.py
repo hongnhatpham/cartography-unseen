@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 
+from app.config import BACKEND_SETTING_KEYS
 from app.diffusion.factory import create_backend
 from app.types import ConditioningFrame, GeneratedFrame
 from app.temporal.reprojection import reproject_previous_image
@@ -22,9 +23,18 @@ class WorkerStatus:
     message: str = ""
     error: str = ""
     active_resolution: str = "512x512"
+    # Bumped on every CUDA-OOM downgrade so the render loop can follow it.
+    resolution_fallbacks: int = 0
 
 
 class DiffusionWorker:
+    """Runs a diffusion backend on its own thread against the latest proxy frame.
+
+    Interactive changes arrive as a single generic settings dict
+    (``request_settings``) plus the four requests that need side effects here:
+    prompt, seed, resolution and freeze.
+    """
+
     def __init__(self, backend_name: str, config: dict[str, Any]) -> None:
         self.backend_name = backend_name
         self.config = dict(config)
@@ -41,18 +51,17 @@ class DiffusionWorker:
             active_resolution=f"{initial_size[0]}x{initial_size[1]}"
         )
         self._request_lock = threading.Lock()
-        self._requested_prompt = (str(config["prompt"]), str(config.get("negative_prompt", "")))
+        self._requested_prompt = (
+            str(config.get("prompt", "")),
+            str(config.get("negative_prompt", "")),
+        )
         self._prompt_revision = 0
         self._requested_seed = int(config.get("seed", 12345))
-        self._requested_seed_mode = str(config.get("seed_mode", "fixed"))
-        self._requested_steps = int(config.get("steps", 1))
-        self._requested_guidance_scale = float(config.get("guidance_scale", 0.0))
-        self._requested_one_step_timestep = int(config.get("one_step_timestep", 750))
-        self._requested_edge_softness = float(config.get("edge_softness", 1.5))
-        self._requested_img2img_strength = float(config.get("img2img_strength", 0.4))
-        self._requested_edge_strength = float(config.get("edge_strength", 0.15))
-        self._requested_noise_persistence = float(config.get("noise_persistence", 0.975))
         self._requested_resolution = initial_size
+        self._pending_settings: dict[str, Any] = {
+            key: config[key] for key in BACKEND_SETTING_KEYS if key in config
+        }
+        self._feedback_reprojection = bool(config.get("feedback_reprojection", False))
         self._freeze = False
         self._backend_stats: dict[str, float | int | str] = {}
         self._rate = RateMeter(window=60)
@@ -74,6 +83,14 @@ class DiffusionWorker:
     def set_frozen(self, frozen: bool) -> None:
         self._freeze = frozen
 
+    def request_settings(self, **kwargs: Any) -> None:
+        """Queue live backend settings; the backend ignores keys it has no use for."""
+        with self._request_lock:
+            self._pending_settings.update(kwargs)
+        if "feedback_reprojection" in kwargs:
+            # The reprojection itself runs here, not in the backend.
+            self._feedback_reprojection = bool(kwargs["feedback_reprojection"])
+
     def request_prompt(self, prompt: str, negative_prompt: str = "") -> int:
         with self._request_lock:
             self._requested_prompt = (prompt, negative_prompt)
@@ -85,38 +102,6 @@ class DiffusionWorker:
         with self._request_lock:
             self._requested_seed = value
         return value
-
-    def request_seed_mode(self, mode: str) -> None:
-        with self._request_lock:
-            self._requested_seed_mode = mode
-
-    def request_steps(self, steps: int) -> None:
-        with self._request_lock:
-            self._requested_steps = max(1, min(4, int(steps)))
-
-    def request_guidance_scale(self, guidance_scale: float) -> None:
-        with self._request_lock:
-            self._requested_guidance_scale = max(0.0, min(4.0, float(guidance_scale)))
-
-    def request_one_step_timestep(self, timestep: int) -> None:
-        with self._request_lock:
-            self._requested_one_step_timestep = max(250, min(900, int(timestep)))
-
-    def request_edge_softness(self, softness: float) -> None:
-        with self._request_lock:
-            self._requested_edge_softness = max(0.0, min(4.0, float(softness)))
-
-    def request_img2img_strength(self, strength: float) -> None:
-        with self._request_lock:
-            self._requested_img2img_strength = max(0.25, min(1.0, float(strength)))
-
-    def request_edge_strength(self, strength: float) -> None:
-        with self._request_lock:
-            self._requested_edge_strength = max(0.0, min(1.0, float(strength)))
-
-    def request_noise_persistence(self, persistence: float) -> None:
-        with self._request_lock:
-            self._requested_noise_persistence = max(0.0, min(1.0, float(persistence)))
 
     def request_resolution(self, resolution: tuple[int, int]) -> None:
         with self._request_lock:
@@ -141,22 +126,18 @@ class DiffusionWorker:
         try:
             self._set_status(state="loading", message=f"Loading {self.backend_name}")
             backend.load(self.config)
+            if self._stop.is_set():
+                return
             self._set_status(state="warming", message="Warming GPU pipeline")
             backend.warmup()
+            if self._stop.is_set():
+                return
             self._set_status(state="ready", message="Ready")
             logging.info("Diffusion backend ready: %s", self.backend_name)
             last_version = 0
             applied_prompt: tuple[str, str] | None = None
             applied_prompt_revision = -1
             applied_seed: int | None = None
-            applied_seed_mode: str | None = None
-            applied_steps: int | None = None
-            applied_guidance_scale: float | None = None
-            applied_one_step_timestep: int | None = None
-            applied_edge_softness: float | None = None
-            applied_img2img_strength: float | None = None
-            applied_edge_strength: float | None = None
-            applied_noise_persistence: float | None = None
             applied_resolution: tuple[int, int] | None = None
             logged_first_frame = False
             while not self._stop.is_set():
@@ -167,53 +148,25 @@ class DiffusionWorker:
                 # Read interactive changes after waking so a prompt entered
                 # while idle applies to this conditioning frame, not the next.
                 with self._request_lock:
+                    pending_settings = self._pending_settings
+                    self._pending_settings = {}
                     requested_prompt = self._requested_prompt
                     requested_prompt_revision = self._prompt_revision
                     requested_seed = self._requested_seed
-                    requested_seed_mode = self._requested_seed_mode
-                    requested_steps = self._requested_steps
-                    requested_guidance_scale = self._requested_guidance_scale
-                    requested_one_step_timestep = self._requested_one_step_timestep
-                    requested_edge_softness = self._requested_edge_softness
-                    requested_img2img_strength = self._requested_img2img_strength
-                    requested_edge_strength = self._requested_edge_strength
-                    requested_noise_persistence = self._requested_noise_persistence
                     requested_resolution = self._requested_resolution
+                # Settings reach the backend before the prompt they apply to, so
+                # a new walk duration governs the prompt sent with it.
+                if pending_settings:
+                    backend.apply_settings(pending_settings)
                 if requested_prompt != applied_prompt:
                     backend.set_prompt(*requested_prompt)
                     applied_prompt = requested_prompt
-                    previous = None
-                    previous_conditioning = None
                 applied_prompt_revision = requested_prompt_revision
                 if requested_seed != applied_seed:
                     backend.reseed(requested_seed)
                     applied_seed = requested_seed
                     previous = None
                     previous_conditioning = None
-                if requested_seed_mode != applied_seed_mode:
-                    backend.set_seed_mode(requested_seed_mode)
-                    applied_seed_mode = requested_seed_mode
-                if requested_steps != applied_steps:
-                    backend.set_steps(requested_steps)
-                    applied_steps = requested_steps
-                if requested_guidance_scale != applied_guidance_scale:
-                    backend.set_guidance_scale(requested_guidance_scale)
-                    applied_guidance_scale = requested_guidance_scale
-                if requested_one_step_timestep != applied_one_step_timestep:
-                    backend.set_one_step_timestep(requested_one_step_timestep)
-                    applied_one_step_timestep = requested_one_step_timestep
-                if requested_edge_softness != applied_edge_softness:
-                    backend.set_edge_softness(requested_edge_softness)
-                    applied_edge_softness = requested_edge_softness
-                if requested_img2img_strength != applied_img2img_strength:
-                    backend.set_img2img_strength(requested_img2img_strength)
-                    applied_img2img_strength = requested_img2img_strength
-                if requested_edge_strength != applied_edge_strength:
-                    backend.set_edge_strength(requested_edge_strength)
-                    applied_edge_strength = requested_edge_strength
-                if requested_noise_persistence != applied_noise_persistence:
-                    backend.set_noise_persistence(requested_noise_persistence)
-                    applied_noise_persistence = requested_noise_persistence
                 if requested_resolution != applied_resolution:
                     backend.set_resolution(*requested_resolution)
                     applied_resolution = requested_resolution
@@ -224,30 +177,35 @@ class DiffusionWorker:
                             f"{requested_resolution[0]}x{requested_resolution[1]}"
                         )
                     )
-                temporal_state: dict[str, Any] | None = None
-                aligned_previous = previous
+                aligned_previous: np.ndarray | None = None
                 temporal_ms = 0.0
-                if previous is not None and previous_conditioning is not None:
+                # Reprojection is CPU work in the frame budget, so it only runs
+                # when a backend actually consumes the aligned previous frame.
+                if (
+                    self._feedback_reprojection
+                    and previous is not None
+                    and previous_conditioning is not None
+                ):
                     temporal_started = perf_counter()
                     try:
-                        aligned_previous, confidence = reproject_previous_image(
+                        aligned_previous, _ = reproject_previous_image(
                             previous, previous_conditioning, conditioning
                         )
-                        temporal_state = {"confidence": confidence}
                     except ValueError:
                         aligned_previous = None
                     temporal_ms = (perf_counter() - temporal_started) * 1000.0
                 try:
                     output = backend.generate(
-                        conditioning,
-                        previous_frame=aligned_previous,
-                        temporal_state=temporal_state,
+                        conditioning, previous_frame=aligned_previous
                     )
                 except RuntimeError as exc:
-                    if self._is_oom(exc) and self._try_lower_resolution(backend):
-                        output = backend.generate(conditioning)
-                    else:
+                    lowered = (
+                        self._try_lower_resolution(backend) if self._is_oom(exc) else None
+                    )
+                    if lowered is None:
                         raise
+                    applied_resolution = lowered
+                    output = backend.generate(conditioning)
                 previous = output
                 previous_conditioning = conditioning
                 now = perf_counter()
@@ -279,31 +237,40 @@ class DiffusionWorker:
         finally:
             backend.unload()
 
-    def _try_lower_resolution(self, backend: Any) -> bool:
+    def _try_lower_resolution(self, backend: Any) -> tuple[int, int] | None:
+        """Drop to the next smaller mode after a CUDA OOM; return it, or None."""
         if not bool(self.config.get("auto_resolution_fallback", True)):
-            return False
-        active_label = self.status().active_resolution
+            return None
+        status = self.status()
+        active_label = status.active_resolution
         active = tuple(int(value) for value in active_label.split("x", 1))
         lower = {
             (1024, 768): (768, 512),
             (768, 512): (640, 384),
-            (512, 512): (640, 384),
-            (448, 448): (384, 384),
+            (640, 384): (512, 384),
+            (512, 512): (512, 384),
+            (512, 384): (384, 256),
         }.get(active)
         if lower is None:
-            return False
+            return None
         logging.warning(
             "CUDA OOM at %s; retrying at %sx%s", active_label, lower[0], lower[1]
         )
-        if backend.torch is not None:
-            backend.torch.cuda.empty_cache()
+        torch = getattr(backend, "torch", None)
+        if torch is not None:
+            torch.cuda.empty_cache()
         backend.set_resolution(*lower)
+        # Keep the request in step so a later resolution change is a real change,
+        # and signal the render loop so the proxy follows the backend down.
+        with self._request_lock:
+            self._requested_resolution = lower
         self._set_status(
             state="ready",
             message=f"CUDA OOM: reduced resolution to {lower[0]}x{lower[1]}",
             active_resolution=f"{lower[0]}x{lower[1]}",
+            resolution_fallbacks=status.resolution_fallbacks + 1,
         )
-        return True
+        return lower
 
     @staticmethod
     def _is_oom(exc: RuntimeError) -> bool:

@@ -7,7 +7,6 @@ uniform mat4 current_inverse_view_projection;
 uniform mat4 source_view_projection;
 uniform vec2 fallback_uv_scale;
 uniform vec2 fallback_uv_offset;
-uniform float warp_strength;
 uniform float occlusion_tolerance;
 
 in vec2 uv;
@@ -51,10 +50,10 @@ void main() {
         return;
     }
 
-    // A partial warp keeps movement responsive without pulling the old frame
-    // all the way to the new camera pose. Occluded/disoccluded pixels are
+    // The partial-warp strength is baked into the interpolated source camera,
+    // so this samples the full geometric warp. Occluded/disoccluded pixels are
     // rejected against the source depth and fade to the smooth fallback.
-    vec2 sample_uv = mix(uv, geometric_uv, warp_strength);
+    vec2 sample_uv = geometric_uv;
     float expected_depth = source_ndc.z * 0.5 + 0.5;
     float observed_depth = texture(source_depth, geometric_uv).r;
     float behind_source = max(expected_depth - observed_depth, 0.0);

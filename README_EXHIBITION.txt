@@ -1,5 +1,5 @@
-REALTIME DIFFUSION ART — INSTALLATION AND OPERATOR GUIDE
-========================================================
+LATENT SPACE — INSTALLATION AND OPERATOR GUIDE
+==============================================
 
 QUICK START
 -----------
@@ -10,9 +10,9 @@ QUICK START
 5. The artwork starts automatically after setup.
 
 The first run downloads and installs a private, portable Python environment,
-CUDA-enabled PyTorch, the application libraries, and the pinned SD-Turbo model.
-Nothing is installed into the system Python. Later launches are offline and do
-not reinstall or redownload anything.
+CUDA-enabled PyTorch, the application libraries, the pinned SD-Turbo model and
+the pinned TAESD tiny autoencoder. Nothing is installed into the system Python.
+Later launches are offline and do not reinstall or redownload anything.
 
 Allow several gigabytes of download traffic and at least 12 GB of free disk
 space. Downloads can resume after interruption. Installation time depends on
@@ -23,7 +23,7 @@ SYSTEM REQUIREMENTS
 -------------------
 - Windows 10 or Windows 11, 64-bit
 - NVIDIA GPU with a current NVIDIA display driver
-- 6 GB VRAM minimum for the recommended lower-resolution exhibition modes
+- 6 GB VRAM minimum; 2.5 GB is used at the default 512x512 mode
 - Internet connection for the first run only
 - At least 12 GB free disk space during setup
 
@@ -38,7 +38,7 @@ LAUNCH FILES
 ------------
 run.bat
   Normal one-click launch. It performs first-run setup when necessary, then
-  starts the artwork fullscreen at a 384x216 generation resolution.
+  starts the artwork fullscreen at the 512x512 generation resolution.
 
 run_debug.bat
   Windowed launch with a visible console and diagnostics. Use this when
@@ -51,12 +51,12 @@ setup_first_run.bat
 
 CONTROLS
 --------
-W / A / S / D    Walk along the roads
+W / A / S / D    Walk and strafe
 Mouse            Look around
-Shift            Move faster while held
+Shift            Run while held
 Escape           Exit
 
-Space            Generate a new randomized world and prompt
+Space            New world, new spawn viewpoint and a new prompt
 Shift + R        Choose a new diffusion seed
 P                Edit the prompt
 Enter            Apply a prompt while editing
@@ -70,83 +70,122 @@ F4               Freeze / unfreeze diffusion
 F5               Toggle depth reprojection
 F6               Return directly to generated AI view
 F7               Toggle the current prompt at the bottom at 30% opacity
+F8               Toggle feedback reprojection: the previous frame, aligned
+                 to the camera, becomes the walk memory (slower, stickier)
+F9               Cycle prompt auto-advance: off, 20, 40, 80, 160 s
+F12              Toggle autowalk. With no input for a minute the walker
+                 strolls on its own; any key or mouse movement takes over
 F10              Cycle generation resolution/aspect modes
 F11              Toggle fullscreen / windowed mode
 
 [ / ]            Reduce / increase reprojection strength
 - / =            Reduce / increase diffusion steps (1-4)
 , / .            Reduce / increase display sharpening
-K / L            Reduce / increase proxy structure lock
-B                Cycle geometry-edge softness
-G                Cycle geometry-guide strength
-C                Cycle CFG: 0, 1.25, 1.5, 2, 3
-N                Cycle fixed / drift / new seed for every AI frame
+I / O            Reduce / increase instability
+K / L            Reduce / increase guide strength (how much proxy shows through)
+T / Y            Shift the timestep window down / up by 25
+N                Cycle noise-walk seconds: off, 2.5, 5, 10, 20, 40
+M                Cycle prompt-walk seconds: off, 3, 6, 12, 25, 50
+C                Cycle CFG: 1, 1.25, 1.5, 2, 3
+
+The walker stands at eye height on the terrain. Terrace risers are walls; the
+smooth pass corridors between levels are how you climb or descend. Standing
+forms are solid and you slide along them; overhangs hang above head height.
 
 Space preserves the current F1 state. If the F1 overlay is visible, it remains
 visible during a world change. If it is hidden, it remains hidden. Space never
 flashes the proxy geometry while the replacement generation is pending.
 
-The app saves prompt, world and diffusion seeds, resolution, CFG, seed mode,
-structure and edge controls, sharpening, reprojection, fullscreen, F1 overlay
-visibility, and the F7 prompt caption immediately. The next normal launch
-restores them. Freeze and diagnostic views remain session-only so the artwork
-does not reopen paused or in a troubleshooting view.
+Every accepted setting is written to config.json immediately and restored on the
+next launch. Freeze and diagnostic views remain session-only so the artwork does
+not reopen paused or in a troubleshooting view.
 
 
 RESOLUTION MODES
 ----------------
-F10 cycles through:
+F10 cycles through, with measured one-step speed on an RTX 4070 Laptop
+(CFG 1, 6 warmup frames, 20 timed frames, idle GPU):
 
-  384x216    default; fastest 16:9 fullscreen mode
-  640x384    more detail at lower generation FPS
-  384x256    low-resolution 3:2 composition
-  512x512    square composition
-  768x512    wider and more detailed, but slower
-  1024x768   highest detail and heaviest GPU load
+  512x512    default; 99 ms/frame, 10.1 diffusion FPS
+  640x384    98 ms/frame, 10.3 FPS
+  512x384    96 ms/frame, 10.4 FPS
+  384x256    88 ms/frame, 11.3 FPS
+  768x512    129 ms/frame, 7.8 FPS
+  1024x768   286 ms/frame, 3.5 FPS
 
-In windowed mode, F10 changes both the AI generation size and the actual window
-size. In fullscreen, F10 changes the generation size while the display remains
-fullscreen; F11 then returns to a window matching the selected mode. The chosen
-mode is saved in config.json.
+At one step the frame is bound by kernel launches and TAESD rather than by
+pixel count, so the four smaller modes are within about 10% of each other.
+Dropping resolution to recover frame rate buys almost nothing; use F10 for
+VRAM headroom and for framing. To go faster, lower CFG (C) toward 1: the
+shipped guidance_scale of 2.2 costs about 1.4x, so 512x512 runs at 133 ms /
+7.5 FPS as configured.
+
+Peak VRAM ranges from 2.33 GB to 2.75 GB across those modes. In windowed mode,
+F10 changes both the AI generation size and the window size. In fullscreen, F10
+changes the generation size while the display stays fullscreen; F11 then returns
+to a window matching the selected mode. The chosen mode is saved in config.json.
 
 
 PROMPTS
 -------
 prompts.json is editable in Notepad. Its top-level master_prefix is prepended to
-every library prompt, including randomized prompts. It is blank by default so
-the startup prompt stays exactly as written in config.json.
+every library prompt, including randomized prompts and the startup prompt in
+config.json. It is set to "screenshot of a video game" so every prompt shares
+one visual language.
 
-Edit that one value to change the common visual language. Individual entries
-under prompts can be added, removed, or rewritten. Changes are read on the next
-Space press. The app avoids selecting the exact prompt already in use.
+Individual entries under prompts can be added, removed, or rewritten. Changes are
+read on the next Space press or automatic prompt change. The app avoids selecting
+the exact prompt already in use.
 
-F7 provides a subtle prompt caption without enabling the full F1 diagnostics.
+
+WALKING THE LATENT SPACE
+------------------------
+Four keys control how unstable the picture is. All of them are live and saved.
+
+  guide_strength (K / L)    How far each frame is pulled back toward the 3D
+                            render. Low means the model ignores your geometry
+                            and hallucinates freely; high means it traces it.
+
+  timestep window (T / Y)   How much noise is added before each denoise step.
+                            High (780-900) melts the geometry into terraces,
+                            ravines and floating fragments. Low simply redraws
+                            the render.
+
+  instability (I / O)       Scales the slow breathing of the timestep and the
+                            guide strength. At 0 both are pinned.
+
+  noise walk (N)            Seconds to travel between noise keyframes. This is
+                            what makes shapes melt and regrow instead of
+                            flickering. Off means unrelated noise every frame.
+
+prompt_walk_seconds (M) is how long the picture takes to morph from the current
+prompt to a new one; F9 sets how often a new library prompt is chosen. Set either
+to 0 to turn it off. F7 provides a subtle prompt caption without the full F1
+diagnostics.
 
 
 HOW THE IMAGE IS MADE
 ---------------------
-The application renders a fast procedural 3D proxy: terrain-following roads,
-steep terraces, irregular buildings, raised crossings, and rooftop cables.
-Every element receives its own seeded random color, while each world also
-randomizes the sky and matching fog. WASD keeps the camera on the road at
-standing eye height. The proxy RGB image and softened geometry edges become
-the img2img input to resident SD-Turbo. The prompt controls its interpretation.
+The application renders a fast procedural landscape of instanced cubes: stacked
+terraces, shard fields, ravine networks, voxel ridges and monolith bridges,
+blended across space so walking far enough reaches a different landscape. Each
+world derives its palette and sky from a seed.
 
-This build does not load ControlNet. Depth does not directly condition the
-diffusion model. Instead, every generated frame stores the matching proxy depth
-and camera matrices. Between slower diffusion updates, the GPU reprojects the
-latest AI frame through the live camera so WASD and mouse movement remain
-responsive at display speed.
+That render is never shown. It is uploaded to the GPU and encoded by TAESD into
+a latent, and then used only as a steering signal for a continuous walk: the
+previous clean latent is re-anchored to it (so colour and contrast cannot
+drift away), blended toward it, noised at a breathing timestep,
+pushed through one SD-Turbo UNet step, and decoded by TAESD. The noise itself
+travels between seeded keyframes instead of being redrawn each frame, and prompt
+changes interpolate rather than cut. The full VAE is never loaded.
 
-One diffusion step is fastest. Drift mode correlates diffusion noise over time,
-and camera-aware feedback aligns the prior image before blending it into the
-next input. This makes forms morph instead of being replaced on each AI frame.
-Fixed mode reuses one noise field; random-each-frame intentionally flickers.
+Between diffusion frames the GPU reprojects the latest generated image through
+the live camera, using the depth of the render that produced it, so movement
+stays smooth at display rate while diffusion runs at about 10 frames per second.
 
-CFG values at or below 1 use SD-Turbo's no-CFG path. Values above 1 enable
-classifier-free guidance and activate the negative prompt. The default is 1.25.
-Press C to compare it with CFG 0. The display preserves SD-Turbo's native
-output, so prompts and CFG determine the rendering style.
+CFG at or below 1 uses the fastest no-CFG path. Above 1 the negative prompt
+becomes active and each frame costs roughly 1.4x. The default is 2, which is
+what keeps text, gamepads and interiors out of the picture.
 
 
 DISPLAY AND MONITORS
@@ -187,6 +226,10 @@ If CUDA is unavailable:
 If 1024x768 runs out of VRAM, use F10 to select 640x384 or 384x256. The worker
 also attempts an automatic lower-resolution fallback after a CUDA OOM.
 
+To confirm an offline install without launching the artwork:
+
+  runtime\python\python.exe tools\verify_offline.py
+
 
 OFFLINE USE AFTER INSTALLATION
 ------------------------------
@@ -202,6 +245,8 @@ Python:    3.11.9 portable runtime
 PyTorch:   2.6.0 + CUDA 12.4
 SD-Turbo:  stabilityai/sd-turbo revision
            b261bac6fd2cf515557d5d0707481eafa0485ec2
+TAESD:     madebyollin/taesd revision
+           614f76814bbe30edbe2e627ace1c2234c81a2c0e
 
 The pinned versions make installations repeatable instead of silently changing
 when upstream packages or models are updated.

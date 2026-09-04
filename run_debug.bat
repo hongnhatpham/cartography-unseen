@@ -18,7 +18,8 @@ set "PYTHONNOUSERSITE=1"
 set "PYGAME_HIDE_SUPPORT_PROMPT=1"
 if not exist "%PROJECT_ROOT%\logs" mkdir "%PROJECT_ROOT%\logs"
 if not exist "%PROJECT_ROOT%\runtime\python\python.exe" goto :install_missing
-if not exist "%PROJECT_ROOT%\models\sd_turbo\model_index.json" goto :install_missing
+if not exist "%PROJECT_ROOT%\models\sd_turbo\unet\config.json" goto :install_missing
+if not exist "%PROJECT_ROOT%\models\taesd\diffusion_pytorch_model.safetensors" goto :install_missing
 "%PROJECT_ROOT%\runtime\python\python.exe" -m app.main --debug %*
 if errorlevel 1 pause
 endlocal

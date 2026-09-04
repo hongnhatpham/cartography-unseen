@@ -57,8 +57,10 @@ foreach ($toolFile in $toolFiles) {
     Copy-Item -LiteralPath (Join-Path $Root "tools\$toolFile") -Destination (Join-Path $Target "tools")
 }
 Get-ChildItem -LiteralPath $Target -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
-$modelMetadata = Join-Path $Target "models\sd_turbo\.cache"
-if (Test-Path -LiteralPath $modelMetadata) { Remove-Item -LiteralPath $modelMetadata -Recurse -Force }
+foreach ($model in @("sd_turbo", "taesd")) {
+    $modelMetadata = Join-Path $Target "models\$model\.cache"
+    if (Test-Path -LiteralPath $modelMetadata) { Remove-Item -LiteralPath $modelMetadata -Recurse -Force }
+}
 
 if (-not $SkipVerify) {
     $sourcePython = Join-Path $Root "runtime\python\python.exe"

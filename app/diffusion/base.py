@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
@@ -9,6 +10,13 @@ from app.types import ConditioningFrame
 
 
 class DiffusionBackend(ABC):
+    """Contract between the diffusion worker and one image generator.
+
+    Live tuning travels through a single generic channel, ``apply_settings``, so
+    a new knob costs one config key and one overlay binding rather than a
+    request/applied/set trio on every layer.
+    """
+
     @abstractmethod
     def load(self, config: dict[str, Any]) -> None:
         raise NotImplementedError
@@ -26,7 +34,6 @@ class DiffusionBackend(ABC):
         self,
         conditioning: ConditioningFrame,
         previous_frame: np.ndarray | None = None,
-        temporal_state: dict[str, Any] | None = None,
     ) -> np.ndarray:
         raise NotImplementedError
 
@@ -38,32 +45,12 @@ class DiffusionBackend(ABC):
     def unload(self) -> None:
         raise NotImplementedError
 
+    def apply_settings(self, settings: Mapping[str, Any]) -> None:
+        """Apply a batch of live settings. Keys the backend has no use for are ignored."""
+        return
+
     def set_resolution(self, width: int, height: int | None = None) -> None:
         raise NotImplementedError("This backend does not support changing resolution")
 
     def reseed(self, seed: int) -> None:
         raise NotImplementedError("This backend does not support reseeding")
-
-    def set_seed_mode(self, mode: str) -> None:
-        raise NotImplementedError("This backend does not support seed modes")
-
-    def set_steps(self, steps: int) -> None:
-        raise NotImplementedError("This backend does not support changing steps")
-
-    def set_guidance_scale(self, guidance_scale: float) -> None:
-        raise NotImplementedError("This backend does not support changing guidance scale")
-
-    def set_one_step_timestep(self, timestep: int) -> None:
-        raise NotImplementedError("This backend does not support changing the timestep")
-
-    def set_edge_softness(self, softness: float) -> None:
-        raise NotImplementedError("This backend does not support edge softening")
-
-    def set_img2img_strength(self, strength: float) -> None:
-        raise NotImplementedError("This backend does not support changing img2img strength")
-
-    def set_edge_strength(self, strength: float) -> None:
-        raise NotImplementedError("This backend does not support changing edge strength")
-
-    def set_noise_persistence(self, persistence: float) -> None:
-        raise NotImplementedError("This backend does not support temporal noise")

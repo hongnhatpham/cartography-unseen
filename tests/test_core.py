@@ -5,17 +5,21 @@ import threading
 from pathlib import Path
 
 import numpy as np
+import pytest
 
-from app.config import AppConfig, structure_lock_percent
-from app.diffusion.sd_turbo_stream import classifier_free_guidance_enabled
+from app.config import RESOLUTION_MODES, AppConfig
+from app.diffusion.latent_walk import classifier_free_guidance_enabled
 from app.main import (
     apply_master_prefix,
     choose_different_prompt,
+    compose_prompt,
+    hue_words,
     load_prompt_library,
+    next_level,
     persist_config_value,
     persist_prompt,
 )
-from app.renderer.camera import EYE_HEIGHT, Camera
+from app.renderer.camera import Camera
 from app.renderer.proxy_renderer import ProxyRenderer
 from app.temporal.reprojection import reproject_previous_image
 from app.types import CameraSnapshot, ConditioningFrame
@@ -24,38 +28,64 @@ from app.utils.latest_value import LatestValue
 
 def test_config_round_trip(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
-    path.write_text(json.dumps({"diffusion_resolution": 448}), encoding="utf-8")
+    path.write_text(json.dumps({"diffusion_resolution": "512x384"}), encoding="utf-8")
     config = AppConfig.load(path)
-    assert config.diffusion_resolution == 448
+    assert config.diffusion_size == (512, 384)
+    assert config.backend == "latent_walk"
 
 
-def test_rectangular_resolution_modes() -> None:
-    assert AppConfig(diffusion_resolution="384x216").diffusion_size == (384, 216)
-    assert AppConfig(diffusion_resolution="640x384").diffusion_size == (640, 384)
-    assert AppConfig(diffusion_resolution="384x256").diffusion_size == (384, 256)
-    assert AppConfig(diffusion_resolution="512x512").diffusion_size == (512, 512)
-    assert AppConfig(diffusion_resolution="768x512").diffusion_size == (768, 512)
-    assert AppConfig(diffusion_resolution="1024x768").diffusion_size == (1024, 768)
+def test_every_resolution_mode_is_selectable_and_latent_aligned() -> None:
+    assert len(RESOLUTION_MODES) == 6
+    for width, height in RESOLUTION_MODES:
+        assert width % 8 == 0 and height % 8 == 0
+        AppConfig(diffusion_resolution=f"{width}x{height}").validate()
 
 
-def test_structure_lock_applies_to_one_and_multi_step_modes() -> None:
-    one_step = AppConfig(steps=1, one_step_timestep=400)
-    multi_step = AppConfig(steps=2, img2img_strength=0.4)
-    assert structure_lock_percent(one_step) == 60.0
-    assert structure_lock_percent(multi_step) == 60.0
-
-
-def test_low_cfg_and_temporal_drift_config() -> None:
-    config = AppConfig(
-        guidance_scale=1.25,
-        seed_mode="drift",
-        noise_persistence=0.975,
-        prompt_caption=True,
-    )
+def test_latent_walk_keys_are_validated_and_forwarded() -> None:
+    config = AppConfig(timestep_min=780, timestep_max=900, instability=0.5, guide_strength=0.6)
     config.validate()
-    assert config.prompt_caption is True
+    assert config.backend_settings() == {
+        "steps": 1,
+        "guidance_scale": 2.0,
+        "timestep_min": 780,
+        "timestep_max": 900,
+        "instability": 0.5,
+        "guide_strength": 0.6,
+        "memory_match": 1.0,
+        "memory_match_std": 0.5,
+        "memory_leash": 1.1,
+        "depth_guide": 0.5,
+        "noise_walk_seconds": 5.0,
+        "noise_jitter": 0.06,
+        "prompt_walk_seconds": 6.0,
+        "feedback_reprojection": False,
+    }
     assert classifier_free_guidance_enabled(1.0) is False
     assert classifier_free_guidance_enabled(1.25) is True
+
+    with pytest.raises(RuntimeError, match="timestep_min"):
+        AppConfig(timestep_min=900, timestep_max=800).validate()
+    with pytest.raises(RuntimeError, match="instability"):
+        AppConfig(instability=1.4).validate()
+    with pytest.raises(RuntimeError, match="memory_match"):
+        AppConfig(memory_match=1.4).validate()
+    with pytest.raises(RuntimeError, match="memory_leash"):
+        AppConfig(memory_leash=9.0).validate()
+    with pytest.raises(RuntimeError, match="noise_walk_seconds"):
+        AppConfig(noise_walk_seconds=-1.0).validate()
+
+
+def test_backend_dict_resolves_both_model_folders(tmp_path: Path) -> None:
+    resolved = AppConfig().backend_dict(tmp_path)
+    assert resolved["model_path"] == (tmp_path / "models/sd_turbo").resolve()
+    assert resolved["taesd_path"] == (tmp_path / "models/taesd").resolve()
+    assert (resolved["diffusion_width"], resolved["diffusion_height"]) == (512, 512)
+
+
+def test_next_level_wraps_from_the_nearest_step() -> None:
+    levels = (0.0, 0.25, 0.5, 1.0)
+    assert next_level(levels, 0.26) == 0.5
+    assert next_level(levels, 1.0) == 0.0
 
 
 def test_latest_value_discards_stale_values() -> None:
@@ -74,32 +104,40 @@ def test_camera_snapshot_is_finite() -> None:
     assert np.isfinite(snapshot.view_matrix).all()
 
 
-def test_camera_far_plane_stays_inside_streamed_city() -> None:
-    from app.renderer.city import ACTIVE_CHUNK_RADIUS, CHUNK_SIZE
+def test_camera_far_plane_stays_inside_the_streamed_window() -> None:
+    from app.renderer.world import ACTIVE_CHUNK_RADIUS, CHUNK_SIZE
 
     assert Camera.create_default().far < ACTIVE_CHUNK_RADIUS * CHUNK_SIZE
 
 
 def test_camera_reset_restores_start() -> None:
     camera = Camera.create_default()
-    camera.move(1.0, 1.0, 8.0)
+    start = camera.position.copy()
+    camera.walk(1.0, 1.0, 8.0)
     camera.rotate(100.0, -40.0, 0.15)
     camera.reset()
-    assert np.allclose(camera.position, [0.0, EYE_HEIGHT, 5.5])
+    assert np.allclose(camera.position, start)
     assert camera.yaw == 0.0
     assert camera.pitch == 0.0
 
 
-def test_camera_follows_road_at_fixed_eye_height() -> None:
-    camera = Camera.create_default()
-    camera.follow_ground(12.75)
-    assert np.isclose(camera.position[1], 12.75 + EYE_HEIGHT)
+def test_walking_never_changes_height_whatever_the_pitch() -> None:
+    """Looking down into a ravine or up at a monolith must not move the eye."""
+
+    for pitch in (-85.0, -40.0, 0.0, 60.0):
+        camera = Camera.create_default()
+        camera.pitch = pitch
+        start = camera.position.copy()
+        for _ in range(60):
+            camera.walk(0.0, 1.0, 3.0)
+        assert np.isclose(camera.position[1], start[1])
+        assert np.isclose(np.linalg.norm(camera.position - start), 180.0)
 
 
 def test_camera_keeps_sub_unit_movement_at_large_world_coordinates() -> None:
     camera = Camera.create_default()
     camera.position[0] = 16_777_216.0
-    camera.move(1.0, 0.0, 0.25)
+    camera.walk(1.0, 0.0, 0.25)
     assert camera.position[0] == 16_777_216.25
 
 
@@ -185,18 +223,18 @@ def test_reprojection_resizes_fallback_output_to_the_depth_grid() -> None:
 
 def test_persist_prompt_preserves_other_config(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
-    path.write_text(json.dumps({"prompt": "old", "backend": "sd_turbo_stream"}), encoding="utf-8")
+    path.write_text(json.dumps({"prompt": "old", "backend": "latent_walk"}), encoding="utf-8")
     persist_prompt(path, "new painted city")
     updated = json.loads(path.read_text(encoding="utf-8"))
-    assert updated == {"prompt": "new painted city", "backend": "sd_turbo_stream"}
+    assert updated == {"prompt": "new painted city", "backend": "latent_walk"}
 
 
 def test_persist_runtime_setting(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
-    path.write_text(json.dumps({"reprojection_strength": 0.5, "seed_mode": "fixed"}), encoding="utf-8")
+    path.write_text(json.dumps({"reprojection_strength": 0.5, "steps": 1}), encoding="utf-8")
     persist_config_value(path, "reprojection_strength", 0.3)
     updated = json.loads(path.read_text(encoding="utf-8"))
-    assert updated == {"reprojection_strength": 0.3, "seed_mode": "fixed"}
+    assert updated == {"reprojection_strength": 0.3, "steps": 1}
 
 
 def test_prompt_library_is_editable_and_avoids_current_prompt(tmp_path: Path) -> None:
@@ -227,11 +265,27 @@ def test_master_prefix_is_applied_once() -> None:
     assert apply_master_prefix(prefix, combined) == combined
 
 
-def test_city_instance_packing_preserves_transform_columns_and_color() -> None:
-    from app.renderer.city import CityCube
+def test_hue_words_come_from_the_world_label() -> None:
+    assert hue_words("shards+voxels / violet-lime-cyan") == "violet and lime"
+    assert hue_words("dunes / amber") == "amber"
+    assert hue_words("") == ""
 
-    item = CityCube(
-        role="building",
+
+def test_compose_prompt_appends_the_world_hue_once() -> None:
+    """Without this the proxy's chroma is discarded and every seed renders icy blue."""
+    prompt = "corrupted 3D render, aerial view of a voxel landscape"
+    composed = compose_prompt(prompt, "shards+voxels / violet-lime-cyan")
+    assert composed == f"{prompt}, violet and lime"
+    # Idempotent, so auto-advance and Space cannot stack hues onto one prompt.
+    assert compose_prompt(composed, "shards+voxels / violet-lime-cyan") == composed
+    assert compose_prompt(prompt, "shards+voxels") == prompt
+
+
+def test_world_instance_packing_preserves_transform_columns_and_color() -> None:
+    from app.renderer.world import WorldCube
+
+    item = WorldCube(
+        role="form",
         position=(11.0, 13.0, -17.0),
         half_extents=(2.0, 3.0, 5.0),
         rotation=(0.0, 0.0, 0.0),
@@ -246,7 +300,7 @@ def test_city_instance_packing_preserves_transform_columns_and_color() -> None:
 
 
 def test_renderer_chunk_cache_stays_bounded_and_regenerates_evicted_chunks() -> None:
-    from app.renderer.city import (
+    from app.renderer.world import (
         CHUNK_SIZE,
         MAX_ACTIVE_CHUNKS,
         MAX_OBJECTS_PER_CHUNK,
@@ -258,36 +312,36 @@ def test_renderer_chunk_cache_stays_bounded_and_regenerates_evicted_chunks() -> 
         def orphan(self, size: int) -> None:
             self.size = size
 
-        def write(self, data: bytes) -> None:
-            assert len(data) <= self.size
+        def write(self, data) -> None:
+            assert data.nbytes <= self.size
 
     renderer = ProxyRenderer.__new__(ProxyRenderer)
     renderer.world_seed = 12345
     renderer._chunks = {}
     renderer._chunk_instances = {}
-    renderer._active_chunk_coords = ()
+    renderer._chunk_colliders = {}
     renderer._stream_center = None
     renderer.instance_buffers = {"cube": FakeBuffer()}
-    renderer._instance_counts = {"cube": 0, "sphere": 0, "cylinder": 0}
+    renderer._instance_counts = {"cube": 0}
     renderer._instance_buffer_revision = 0
 
     origin = np.array([0.0, 1.65, 0.0], dtype=np.float32)
-    renderer._update_city(origin)
+    renderer._update_world(origin)
     original_chunk = renderer._chunks[(0, 0)]
     initial_revision = renderer._instance_buffer_revision
-    renderer._update_city(origin)
+    renderer._update_world(origin)
     assert renderer._instance_buffer_revision == initial_revision
 
     for step in range(1, 12):
-        renderer._update_city(
+        renderer._update_world(
             np.array([CHUNK_SIZE * step, 1.65, 0.0], dtype=np.float32)
         )
-        assert len(renderer._chunks) == MAX_ACTIVE_CHUNKS
+        assert len(renderer._chunks) <= MAX_ACTIVE_CHUNKS
         assert renderer._chunks.keys() == renderer._chunk_instances.keys()
         assert renderer._instance_counts["cube"] <= (
             MAX_ACTIVE_CHUNKS * MAX_OBJECTS_PER_CHUNK
         )
 
     assert (0, 0) not in renderer._chunks
-    renderer._update_city(origin)
+    renderer._update_world(origin)
     assert renderer._chunks[(0, 0)] == original_chunk

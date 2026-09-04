@@ -8,7 +8,7 @@ echo  REALTIME DIFFUSION ART - FIRST RUN SETUP
 echo ============================================================
 echo.
 echo This one-time setup downloads Python, CUDA-enabled PyTorch,
-echo application libraries, and the pinned SD-Turbo model.
+echo application libraries, and the pinned models (SD-Turbo + TAESD).
 echo A compatible NVIDIA display driver and Internet are required.
 echo The download can take a while, but interrupted downloads resume.
 echo.

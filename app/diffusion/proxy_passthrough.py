@@ -19,7 +19,7 @@ class ProxyPassthroughBackend(DiffusionBackend):
         self.prompt = ""
 
     def load(self, config: dict[str, Any]) -> None:
-        self.width = int(config.get("diffusion_width", config["diffusion_resolution"]))
+        self.width = int(config.get("diffusion_width", 512))
         self.height = int(config.get("diffusion_height", self.width))
 
     def warmup(self) -> None:
@@ -32,7 +32,6 @@ class ProxyPassthroughBackend(DiffusionBackend):
         self,
         conditioning: ConditioningFrame,
         previous_frame: np.ndarray | None = None,
-        temporal_state: dict[str, Any] | None = None,
     ) -> np.ndarray:
         started = perf_counter()
         source = conditioning.rgb.astype(np.float32)
@@ -63,28 +62,4 @@ class ProxyPassthroughBackend(DiffusionBackend):
         self.height = int(height if height is not None else width)
 
     def reseed(self, seed: int) -> None:
-        return
-
-    def set_seed_mode(self, mode: str) -> None:
-        return
-
-    def set_steps(self, steps: int) -> None:
-        return
-
-    def set_guidance_scale(self, guidance_scale: float) -> None:
-        return
-
-    def set_one_step_timestep(self, timestep: int) -> None:
-        return
-
-    def set_edge_softness(self, softness: float) -> None:
-        return
-
-    def set_img2img_strength(self, strength: float) -> None:
-        return
-
-    def set_edge_strength(self, strength: float) -> None:
-        return
-
-    def set_noise_persistence(self, persistence: float) -> None:
         return

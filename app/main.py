@@ -9,13 +9,24 @@ import textwrap
 from pathlib import Path
 from time import perf_counter, strftime
 
+import numpy as np
+
 from app.config import (
+    BACKEND_SETTING_KEYS,
     RESOLUTION_MODES,
     AppConfig,
     configure_local_environment,
-    structure_lock_percent,
 )
 from app.utils.timing import ExponentialAverage, RateMeter
+
+# Smoke mode also waits for the first generated frame; the model load alone is
+# longer than the display-frame budget. This caps that extra wait.
+SMOKE_AI_TIMEOUT_S = 150.0
+
+CFG_LEVELS = (1.0, 1.25, 1.5, 2.0, 3.0)
+NOISE_WALK_LEVELS = (0.0, 2.5, 5.0, 10.0, 20.0, 40.0)
+PROMPT_WALK_LEVELS = (0.0, 3.0, 6.0, 12.0, 25.0, 50.0)
+AUTO_ADVANCE_LEVELS = (0.0, 20.0, 40.0, 80.0, 160.0)
 
 
 def project_root() -> Path:
@@ -39,13 +50,13 @@ def configure_logging(root: Path, debug: bool) -> Path:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Realtime Diffusion WASD Art Renderer")
+    parser = argparse.ArgumentParser(description="Latent Space realtime diffusion renderer")
     parser.add_argument("--debug", action="store_true", help="windowed mode with diagnostics")
     parser.add_argument("--windowed", action="store_true", help="disable fullscreen")
     parser.add_argument("--monitor", type=int, help="zero-based fullscreen monitor index")
     parser.add_argument("--list-monitors", action="store_true", help="print detected monitors and exit")
     parser.add_argument("--config", type=Path, help="alternate project-relative config file")
-    parser.add_argument("--backend", choices=("sd_turbo_stream", "proxy_passthrough"))
+    parser.add_argument("--backend", choices=("latent_walk", "proxy_passthrough"))
     parser.add_argument(
         "--resolution",
         choices=tuple(f"{width}x{height}" for width, height in RESOLUTION_MODES),
@@ -55,14 +66,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def persist_config_value(config_path: Path, key: str, value: object) -> float:
-    """Persist one accepted runtime setting without disturbing other config."""
+def persist_config_values(config_path: Path, values: dict[str, object]) -> float:
+    """Persist accepted runtime settings in one atomic replace."""
     raw = json.loads(config_path.read_text(encoding="utf-8"))
-    raw[key] = value
+    raw.update(values)
     temporary = config_path.with_suffix(config_path.suffix + ".tmp")
     temporary.write_text(json.dumps(raw, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     temporary.replace(config_path)
     return config_path.stat().st_mtime
+
+
+def persist_config_value(config_path: Path, key: str, value: object) -> float:
+    """Persist one accepted runtime setting without disturbing other config."""
+    return persist_config_values(config_path, {key: value})
 
 
 def persist_prompt(config_path: Path, prompt: str) -> float:
@@ -70,6 +86,7 @@ def persist_prompt(config_path: Path, prompt: str) -> float:
 
 
 def load_prompt_library(path: Path) -> list[dict[str, str]]:
+    """Read prompts.json into name/prompt entries with the master prefix applied."""
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
@@ -88,9 +105,7 @@ def load_prompt_library(path: Path) -> list[dict[str, str]]:
         prompt = str(entry.get("prompt", "")).strip()
         if not name or not prompt:
             raise RuntimeError(f"Prompt entry {index} requires non-empty name and prompt")
-        cleaned.append(
-            {"name": name, "prompt": apply_master_prefix(master_prefix, prompt)}
-        )
+        cleaned.append({"name": name, "prompt": apply_master_prefix(master_prefix, prompt)})
     return cleaned
 
 
@@ -107,6 +122,7 @@ def load_master_prefix(path: Path) -> str:
 
 
 def apply_master_prefix(prefix: str, prompt: str) -> str:
+    """Prepend the library prefix unless the prompt already opens with it."""
     prefix = prefix.strip().rstrip(" ,")
     prompt = prompt.strip()
     if not prefix or prompt.casefold().startswith(prefix.casefold()):
@@ -114,11 +130,40 @@ def apply_master_prefix(prefix: str, prompt: str) -> str:
     return f"{prefix}, {prompt}"
 
 
+def hue_words(world_label: str) -> str:
+    """The world's two leading hues as prompt vocabulary, e.g. "violet and lime".
+
+    ``ProxyRenderer.world_label`` reads "biomes / hue-hue-hue". The proxy's own
+    chroma is largely discarded by the latent walk, so the palette only reaches
+    the screen if the prompt names it.
+    """
+    _, separator, palette = world_label.rpartition("/")
+    hues = [name.strip() for name in palette.split("-")] if separator else []
+    hues = [name for name in hues if name]
+    if not hues:
+        return ""
+    return hues[0] if len(hues) == 1 else f"{hues[0]} and {hues[1]}"
+
+
+def compose_prompt(prompt: str, world_label: str) -> str:
+    """Library prompt plus the current world's hue words."""
+    words = hue_words(world_label)
+    if not words or words in prompt.casefold():
+        return prompt
+    return f"{prompt.rstrip().rstrip(',')}, {words}"
+
+
 def choose_different_prompt(
     entries: list[dict[str, str]], current_prompt: str
 ) -> dict[str, str]:
     alternatives = [entry for entry in entries if entry["prompt"] != current_prompt]
     return secrets.choice(alternatives or entries)
+
+
+def next_level(levels: tuple[float, ...], current: float) -> float:
+    """Step to the level after the one nearest to ``current`` (wrapping)."""
+    nearest = min(range(len(levels)), key=lambda index: abs(levels[index] - current))
+    return levels[(nearest + 1) % len(levels)]
 
 
 def run() -> int:
@@ -150,8 +195,9 @@ def run() -> int:
         import pygame
 
         from app.diffusion.worker import DiffusionWorker
-        from app.renderer.camera import EYE_HEIGHT, Camera
+        from app.renderer.camera import Camera
         from app.renderer.proxy_renderer import ProxyRenderer
+        from app.renderer.world import Autowalk
     except Exception as exc:
         logging.exception("Startup dependency failure")
         print(str(exc), file=sys.stderr)
@@ -180,15 +226,13 @@ def run() -> int:
         )
         renderer.loading_screen("INITIALIZING", "Starting renderer and diffusion worker")
         camera = Camera.create_default()
-        road_contact = renderer.spawn_road_contact()
-        camera.yaw = road_contact.heading
-        camera.position[:] = (
-            road_contact.x,
-            road_contact.surface_y + EYE_HEIGHT,
-            road_contact.z,
-        )
-        worker = DiffusionWorker(config.backend, config.backend_dict(root))
+        renderer.spawn_camera(camera)
+        effective_prompt = compose_prompt(config.prompt, renderer.world_label())
+        backend_config = config.backend_dict(root)
+        backend_config["prompt"] = effective_prompt
+        worker = DiffusionWorker(config.backend, backend_config)
         worker.start()
+        logging.info("Effective prompt: %s", effective_prompt)
 
         clock = pygame.time.Clock()
         display_rate = RateMeter(120)
@@ -197,6 +241,7 @@ def run() -> int:
         conditioning_ms = ExponentialAverage(0.15)
         frame_age_ms = ExponentialAverage(0.15)
         running = True
+        session_started = perf_counter()
         overlay_enabled = bool(config.debug_overlay or debug_requested)
         force_proxy = False
         diagnostic_mode = "none"
@@ -204,6 +249,10 @@ def run() -> int:
         latest_ai = None
         latest_ai_version = 0
         last_config_check = 0.0
+        last_prompt_advance = perf_counter()
+        last_input = perf_counter()
+        autowalk = Autowalk(config.world_seed)
+        autowalking = False
         config_mtime = config_path.stat().st_mtime
         displayed_frames = 0
         conditioning = None
@@ -221,6 +270,29 @@ def run() -> int:
         notice = ""
         notice_until = 0.0
         ignore_prompt_hotkey_text = False
+        seen_resolution_fallbacks = 0
+
+        def commit_many(values: dict[str, object], live: bool = True) -> None:
+            """Set, persist and (optionally) forward settings in one atomic write."""
+            nonlocal config_mtime
+            for key, value in values.items():
+                setattr(config, key, value)
+            config_mtime = persist_config_values(config_path, values)
+            if live:
+                worker.request_settings(**values)
+
+        def commit(key: str, value: object, live: bool = True) -> None:
+            """Set, persist and (optionally) forward one runtime setting."""
+            commit_many({key: value}, live)
+
+        def send_prompt(prompt: str, negative: str | None = None) -> int:
+            """Forward a prompt with the current world's hue words appended."""
+            nonlocal effective_prompt
+            effective_prompt = compose_prompt(prompt, renderer.world_label())
+            return worker.request_prompt(
+                effective_prompt,
+                config.negative_prompt if negative is None else negative,
+            )
 
         while running:
             frame_started = perf_counter()
@@ -242,13 +314,14 @@ def run() -> int:
                                     load_master_prefix(prompt_library_path), accepted
                                 )
                                 config.prompt = accepted
-                                required_prompt_revision = worker.request_prompt(
-                                    accepted, config.negative_prompt
-                                )
+                                required_prompt_revision = send_prompt(accepted)
                                 config_mtime = persist_prompt(config_path, accepted)
+                                # Restart the auto-advance countdown so a manual
+                                # prompt is not overwritten moments after entry.
+                                last_prompt_advance = frame_started
                                 latest_ai = None
                                 latest_ai_version, _ = worker.generated.get()
-                                notice = "PROMPT APPLIED — generating a new AI frame"
+                                notice = "PROMPT APPLIED — walking to the new prompt"
                                 notice_until = frame_started + 4.0
                                 logging.info("Prompt updated from in-app editor")
                             else:
@@ -277,10 +350,7 @@ def run() -> int:
                     elif event.key == pygame.K_F11:
                         try:
                             is_fullscreen = renderer.toggle_fullscreen()
-                            config.fullscreen = is_fullscreen
-                            config_mtime = persist_config_value(
-                                config_path, "fullscreen", config.fullscreen
-                            )
+                            commit("fullscreen", is_fullscreen, live=False)
                             notice = (
                                 "FULLSCREEN — F11 returns to windowed mode"
                                 if is_fullscreen
@@ -297,11 +367,12 @@ def run() -> int:
                         except ValueError:
                             current_index = -1
                         next_size = RESOLUTION_MODES[(current_index + 1) % len(RESOLUTION_MODES)]
-                        config.diffusion_resolution = f"{next_size[0]}x{next_size[1]}"
                         renderer.set_resolution(next_size)
                         worker.request_resolution(next_size)
-                        config_mtime = persist_config_value(
-                            config_path, "diffusion_resolution", config.diffusion_resolution
+                        commit(
+                            "diffusion_resolution",
+                            f"{next_size[0]}x{next_size[1]}",
+                            live=False,
                         )
                         latest_ai = None
                         latest_ai_version, _ = worker.generated.get()
@@ -316,16 +387,10 @@ def run() -> int:
                         notice_until = frame_started + 4.0
                     elif event.key == pygame.K_F7:
                         prompt_caption_enabled = not prompt_caption_enabled
-                        config.prompt_caption = prompt_caption_enabled
-                        config_mtime = persist_config_value(
-                            config_path, "prompt_caption", config.prompt_caption
-                        )
+                        commit("prompt_caption", prompt_caption_enabled, live=False)
                     elif event.key == pygame.K_F1:
                         overlay_enabled = not overlay_enabled
-                        config.debug_overlay = overlay_enabled
-                        config_mtime = persist_config_value(
-                            config_path, "debug_overlay", config.debug_overlay
-                        )
+                        commit("debug_overlay", overlay_enabled, live=False)
                     elif event.key == pygame.K_F2:
                         # From a diagnostic view, F2 is a one-press return to AI.
                         # From AI/proxy it retains the familiar toggle behavior.
@@ -351,128 +416,126 @@ def run() -> int:
                         frozen = not frozen
                         worker.set_frozen(frozen)
                     elif event.key == pygame.K_F5:
-                        config.reprojection = not config.reprojection
-                        config_mtime = persist_config_value(
-                            config_path, "reprojection", config.reprojection
-                        )
+                        commit("reprojection", not config.reprojection, live=False)
                         notice = "DEPTH REPROJECTION ON" if config.reprojection else "DEPTH REPROJECTION OFF"
+                        notice_until = frame_started + 3.0
+                    elif event.key == pygame.K_F8:
+                        commit("feedback_reprojection", not config.feedback_reprojection)
+                        notice = (
+                            "FEEDBACK REPROJECTION ON — slower, stickier forms"
+                            if config.feedback_reprojection
+                            else "FEEDBACK REPROJECTION OFF"
+                        )
+                        notice_until = frame_started + 3.0
+                    elif event.key == pygame.K_F12:
+                        commit(
+                            "autowalk_idle_seconds",
+                            0.0 if config.autowalk_idle_seconds > 0.0 else 60.0,
+                            live=False,
+                        )
+                        autowalking = False
+                        notice = (
+                            "AUTOWALK OFF"
+                            if config.autowalk_idle_seconds == 0.0
+                            else f"AUTOWALK after {config.autowalk_idle_seconds:.0f}s idle"
+                        )
+                        notice_until = frame_started + 3.0
+                    elif event.key == pygame.K_F9:
+                        commit(
+                            "prompt_auto_advance_seconds",
+                            next_level(AUTO_ADVANCE_LEVELS, config.prompt_auto_advance_seconds),
+                            live=False,
+                        )
+                        last_prompt_advance = frame_started
+                        notice = (
+                            "PROMPT AUTO ADVANCE OFF"
+                            if config.prompt_auto_advance_seconds == 0.0
+                            else f"PROMPT AUTO ADVANCE: {config.prompt_auto_advance_seconds:.0f}s"
+                        )
                         notice_until = frame_started + 3.0
                     elif event.key in (pygame.K_LEFTBRACKET, pygame.K_RIGHTBRACKET):
                         direction = -1.0 if event.key == pygame.K_LEFTBRACKET else 1.0
-                        config.reprojection_strength = float(
-                            max(0.0, min(1.0, round(config.reprojection_strength + direction * 0.1, 2)))
-                        )
-                        config_mtime = persist_config_value(
-                            config_path, "reprojection_strength", config.reprojection_strength
+                        commit(
+                            "reprojection_strength",
+                            float(max(0.0, min(1.0, round(config.reprojection_strength + direction * 0.1, 2)))),
+                            live=False,
                         )
                         notice = f"REPROJECTION STRENGTH: {config.reprojection_strength:.0%}"
                         notice_until = frame_started + 3.0
                     elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
                         direction = -1 if event.key in (pygame.K_MINUS, pygame.K_KP_MINUS) else 1
-                        config.steps = max(1, min(4, config.steps + direction))
-                        worker.request_steps(config.steps)
-                        config_mtime = persist_config_value(config_path, "steps", config.steps)
+                        commit("steps", max(1, min(4, config.steps + direction)))
                         notice = f"DIFFUSION STEPS: {config.steps} — {'cleaner / slower' if config.steps > 1 else 'fastest'}"
                         notice_until = frame_started + 3.0
                     elif event.key in (pygame.K_COMMA, pygame.K_PERIOD):
                         direction = -1.0 if event.key == pygame.K_COMMA else 1.0
-                        config.display_sharpen = float(
-                            max(0.0, min(2.0, round(config.display_sharpen + direction * 0.1, 2)))
-                        )
-                        config_mtime = persist_config_value(
-                            config_path, "display_sharpen", config.display_sharpen
+                        commit(
+                            "display_sharpen",
+                            float(max(0.0, min(2.0, round(config.display_sharpen + direction * 0.1, 2)))),
+                            live=False,
                         )
                         notice = f"DISPLAY SHARPNESS: {config.display_sharpen:.1f}"
                         notice_until = frame_started + 3.0
+                    elif event.key in (pygame.K_i, pygame.K_o):
+                        direction = -0.1 if event.key == pygame.K_i else 0.1
+                        commit(
+                            "instability",
+                            float(max(0.0, min(1.0, round(config.instability + direction, 2)))),
+                        )
+                        notice = f"INSTABILITY: {config.instability:.0%}"
+                        notice_until = frame_started + 3.0
                     elif event.key in (pygame.K_k, pygame.K_l):
-                        if config.steps == 1:
-                            direction = 50 if event.key == pygame.K_k else -50
-                            config.one_step_timestep = max(
-                                250, min(900, config.one_step_timestep + direction)
-                            )
-                            worker.request_one_step_timestep(config.one_step_timestep)
-                            config_mtime = persist_config_value(
-                                config_path, "one_step_timestep", config.one_step_timestep
-                            )
-                        else:
-                            direction = 0.05 if event.key == pygame.K_k else -0.05
-                            config.img2img_strength = float(
-                                max(0.25, min(1.0, round(config.img2img_strength + direction, 2)))
-                            )
-                            worker.request_img2img_strength(config.img2img_strength)
-                            config_mtime = persist_config_value(
-                                config_path, "img2img_strength", config.img2img_strength
-                            )
-                        notice = f"STRUCTURE LOCK: {structure_lock_percent(config):.0f}%"
+                        direction = -0.05 if event.key == pygame.K_k else 0.05
+                        commit(
+                            "guide_strength",
+                            float(max(0.0, min(1.0, round(config.guide_strength + direction, 2)))),
+                        )
+                        notice = f"GUIDE STRENGTH: {config.guide_strength:.0%} of the proxy"
                         notice_until = frame_started + 3.0
-                    elif event.key == pygame.K_b:
-                        levels = (0.0, 0.75, 1.5, 2.5, 4.0)
-                        nearest = min(range(len(levels)), key=lambda index: abs(levels[index] - config.edge_softness))
-                        config.edge_softness = levels[(nearest + 1) % len(levels)]
-                        worker.request_edge_softness(config.edge_softness)
-                        config_mtime = persist_config_value(
-                            config_path, "edge_softness", config.edge_softness
-                        )
-                        notice = f"GEOMETRY EDGE SOFTNESS: {config.edge_softness:.2g} px"
-                        notice_until = frame_started + 3.0
-                    elif event.key == pygame.K_g:
-                        levels = (0.0, 0.15, 0.3, 0.5, 0.7)
-                        nearest = min(
-                            range(len(levels)),
-                            key=lambda index: abs(levels[index] - config.edge_strength),
-                        )
-                        config.edge_strength = levels[(nearest + 1) % len(levels)]
-                        worker.request_edge_strength(config.edge_strength)
-                        config_mtime = persist_config_value(
-                            config_path, "edge_strength", config.edge_strength
-                        )
-                        notice = f"GEOMETRY GUIDE: {config.edge_strength:.0%}"
-                        notice_until = frame_started + 3.0
-                    elif event.key == pygame.K_c:
-                        levels = (0.0, 1.25, 1.5, 2.0, 3.0)
-                        nearest = min(
-                            range(len(levels)),
-                            key=lambda index: abs(levels[index] - config.guidance_scale),
-                        )
-                        config.guidance_scale = levels[(nearest + 1) % len(levels)]
-                        worker.request_guidance_scale(config.guidance_scale)
-                        config_mtime = persist_config_value(
-                            config_path, "guidance_scale", config.guidance_scale
-                        )
-                        notice = f"CFG: {config.guidance_scale:.2g}"
+                    elif event.key in (pygame.K_t, pygame.K_y):
+                        direction = -25 if event.key == pygame.K_t else 25
+                        span = config.timestep_max - config.timestep_min
+                        low = max(1, min(999 - span, config.timestep_min + direction))
+                        # One write: a half-applied pair fails AppConfig.validate.
+                        commit_many({"timestep_min": low, "timestep_max": low + span})
+                        notice = f"TIMESTEP RANGE: {config.timestep_min}–{config.timestep_max}"
                         notice_until = frame_started + 3.0
                     elif event.key == pygame.K_n:
-                        modes = ("fixed", "drift", "random_each_frame")
-                        config.seed_mode = modes[(modes.index(config.seed_mode) + 1) % len(modes)]
-                        worker.request_seed_mode(config.seed_mode)
-                        config_mtime = persist_config_value(
-                            config_path, "seed_mode", config.seed_mode
+                        commit(
+                            "noise_walk_seconds",
+                            next_level(NOISE_WALK_LEVELS, config.noise_walk_seconds),
                         )
                         notice = (
-                            "SEED MODE: RANDOM EVERY AI FRAME"
-                            if config.seed_mode == "random_each_frame"
-                            else f"SEED MODE: {config.seed_mode.upper()}"
+                            "NOISE WALK OFF — fresh noise every frame"
+                            if config.noise_walk_seconds == 0.0
+                            else f"NOISE WALK: {config.noise_walk_seconds:.0f}s per keyframe"
                         )
-                        notice_until = frame_started + 4.0
+                        notice_until = frame_started + 3.0
+                    elif event.key == pygame.K_m:
+                        commit(
+                            "prompt_walk_seconds",
+                            next_level(PROMPT_WALK_LEVELS, config.prompt_walk_seconds),
+                        )
+                        notice = (
+                            "PROMPT WALK OFF — prompts cut instantly"
+                            if config.prompt_walk_seconds == 0.0
+                            else f"PROMPT WALK: {config.prompt_walk_seconds:.0f}s"
+                        )
+                        notice_until = frame_started + 3.0
+                    elif event.key == pygame.K_c:
+                        commit("guidance_scale", next_level(CFG_LEVELS, config.guidance_scale))
+                        notice = f"CFG: {config.guidance_scale:.2g}"
+                        notice_until = frame_started + 3.0
                     elif event.key == pygame.K_r and event.mod & pygame.KMOD_SHIFT:
                         new_seed = worker.request_reseed()
-                        config.seed = new_seed
-                        config_mtime = persist_config_value(
-                            config_path, "seed", config.seed
-                        )
+                        commit("seed", new_seed, live=False)
                         notice = f"DIFFUSION RESEEDED: {new_seed}"
                         notice_until = frame_started + 3.0
                         logging.info("Manual reseed: %s", new_seed)
                     elif event.key == pygame.K_SPACE:
-                        camera.reset()
-                        config.world_seed = renderer.randomize_world()
-                        road_contact = renderer.spawn_road_contact()
-                        camera.yaw = road_contact.heading
-                        camera.position[:] = (
-                            road_contact.x,
-                            road_contact.surface_y + EYE_HEIGHT,
-                            road_contact.z,
-                        )
+                        commit("world_seed", renderer.randomize_world(), live=False)
+                        renderer.spawn_camera(camera)
+                        autowalk = Autowalk(config.world_seed)
                         selected_prompt_name = "current prompt"
                         try:
                             selected_prompt = choose_different_prompt(
@@ -480,16 +543,12 @@ def run() -> int:
                             )
                             selected_prompt_name = selected_prompt["name"]
                             config.prompt = selected_prompt["prompt"]
-                            required_prompt_revision = worker.request_prompt(
-                                config.prompt, config.negative_prompt
-                            )
+                            required_prompt_revision = send_prompt(config.prompt)
                             config_mtime = persist_prompt(config_path, config.prompt)
+                            last_prompt_advance = frame_started
                         except RuntimeError as exc:
                             logging.error("Prompt library ignored: %s", exc)
                             selected_prompt_name = f"library error: {exc}"
-                        config_mtime = persist_config_value(
-                            config_path, "world_seed", config.world_seed
-                        )
                         # Preserve the last finished artwork while the new
                         # world and prompt generate. Reprojecting that old
                         # image with the new world's depth would expose the
@@ -506,8 +565,9 @@ def run() -> int:
                         notice = ""
                         notice_until = 0.0
                         logging.info(
-                            "World randomized: %s; prompt: %s",
+                            "World randomized: %s (%s); prompt: %s",
                             config.world_seed,
+                            renderer.world_label(),
                             selected_prompt_name,
                         )
                     elif event.key == pygame.K_p:
@@ -527,22 +587,38 @@ def run() -> int:
             if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]:
                 speed *= config.sprint_multiplier
             dt = min(clock.get_time() / 1000.0, 0.1)
-            if not prompt_editing:
-                camera.move(
-                    float(keys[pygame.K_d]) - float(keys[pygame.K_a]),
-                    float(keys[pygame.K_w]) - float(keys[pygame.K_s]),
-                    speed * dt,
+            strafe = float(keys[pygame.K_d]) - float(keys[pygame.K_a])
+            ahead = float(keys[pygame.K_w]) - float(keys[pygame.K_s])
+            if mouse_x or mouse_y or strafe or ahead or any(keys):
+                last_input = frame_started
+                if autowalking:
+                    autowalking = False
+                    logging.info("Autowalk stopped by input")
+            idle_limit = config.autowalk_idle_seconds
+            if not autowalking and idle_limit > 0.0 and frame_started - last_input >= idle_limit:
+                autowalking = True
+                autowalk.reset()
+                logging.info("Autowalk started after %.0f s idle", idle_limit)
+            if autowalking and not prompt_editing:
+                step_length = 0.0 if autowalk.turning(frame_started) else config.movement_speed * dt
+                before = camera.position.copy()
+                camera.walk(0.0, 1.0, step_length)
+                renderer.constrain_camera(camera, dt)
+                gained = float(np.linalg.norm((camera.position - before)[[0, 2]]))
+                camera.yaw, camera.pitch = autowalk.step(
+                    camera.yaw,
+                    camera.pitch,
+                    tuple(float(value) for value in camera.position),
+                    frame_started,
+                    dt,
+                    gained,
+                    step_length,
+                    renderer.nearby_colliders(camera),
                 )
-                road_contact = renderer.move_road_contact(
-                    road_contact,
-                    float(camera.position[0]),
-                    float(camera.position[2]),
-                )
-                camera.position[:] = (
-                    road_contact.x,
-                    road_contact.surface_y + EYE_HEIGHT,
-                    road_contact.z,
-                )
+            else:
+                if not prompt_editing:
+                    camera.walk(strafe, ahead, speed * dt)
+                renderer.constrain_camera(camera, dt)
 
             proxy_started = perf_counter()
             snapshot = renderer.render_scene(camera)
@@ -607,9 +683,25 @@ def run() -> int:
             if latest_ai is not None:
                 frame_age_ms.update((now - latest_ai.generation_timestamp) * 1000.0)
             status = worker.status()
+            if status.resolution_fallbacks != seen_resolution_fallbacks:
+                # The backend dropped a mode after a CUDA OOM; follow it so the
+                # proxy, the display and the next launch all agree.
+                seen_resolution_fallbacks = status.resolution_fallbacks
+                width_text, height_text = status.active_resolution.split("x", 1)
+                renderer.set_resolution((int(width_text), int(height_text)))
+                commit("diffusion_resolution", status.active_resolution, live=False)
+                latest_ai = None
+                latest_ai_version, _ = worker.generated.get()
+                minimum_ai_sequence = renderer.sequence + 1
+                conditioning = None
+                last_conditioning_capture = 0.0
+                hold_previous_ai = False
+                hide_proxy_until_ai = True
+                notice = f"CUDA OOM: RESOLUTION {status.active_resolution}"
+                notice_until = now + 4.0
             stats = worker.stats()
             overlay: list[str] | None = None
-            if overlay_enabled or prompt_editing or now < notice_until or status.state == "error" or status.state != "ready":
+            if overlay_enabled or prompt_editing or now < notice_until or status.state != "ready":
                 overlay = build_overlay(
                     display_rate.fps,
                     proxy_rate.fps,
@@ -622,10 +714,12 @@ def run() -> int:
                     config,
                     status,
                     stats,
+                    renderer.world_label(),
                     log_path,
                     prompt_editing,
                     prompt_buffer,
                     notice if now < notice_until else "",
+                    effective_prompt=effective_prompt,
                 )
             if reproject_frame is not None:
                 renderer.display_reprojected(
@@ -648,6 +742,27 @@ def run() -> int:
             display_rate.tick()
             displayed_frames += 1
 
+            # Automatic prompt walking keeps the world it is walking through
+            # intact; only the prompt target moves.
+            if (
+                config.prompt_auto_advance_seconds > 0.0
+                and not prompt_editing
+                and now - last_prompt_advance >= config.prompt_auto_advance_seconds
+            ):
+                last_prompt_advance = now
+                try:
+                    selected_prompt = choose_different_prompt(
+                        load_prompt_library(prompt_library_path), config.prompt
+                    )
+                    config.prompt = selected_prompt["prompt"]
+                    required_prompt_revision = send_prompt(config.prompt)
+                    # Auto-advance state is ephemeral: persisting it would move
+                    # config_mtime past an external edit and overwrite the
+                    # configured startup prompt.
+                    logging.info("Prompt auto-advanced to: %s", selected_prompt["name"])
+                except RuntimeError as exc:
+                    logging.error("Prompt auto-advance skipped: %s", exc)
+
             if now - last_config_check > 0.5:
                 last_config_check = now
                 try:
@@ -668,54 +783,54 @@ def run() -> int:
                         updated.prompt = apply_master_prefix(
                             load_master_prefix(prompt_library_path), updated.prompt
                         )
-                        required_prompt_revision = worker.request_prompt(
-                            updated.prompt, updated.negative_prompt
-                        )
-                        config.prompt = updated.prompt
-                        config.negative_prompt = updated.negative_prompt
-                        config.movement_speed = updated.movement_speed
-                        config.sprint_multiplier = updated.sprint_multiplier
-                        config.mouse_sensitivity = updated.mouse_sensitivity
-                        config.reprojection = updated.reprojection
-                        config.debug_overlay = updated.debug_overlay
+                        if (updated.prompt, updated.negative_prompt) != (
+                            config.prompt,
+                            config.negative_prompt,
+                        ):
+                            required_prompt_revision = send_prompt(
+                                updated.prompt, updated.negative_prompt
+                            )
+                            last_prompt_advance = frame_started
+                        changed = {
+                            key: getattr(updated, key)
+                            for key in BACKEND_SETTING_KEYS
+                            if getattr(config, key) != getattr(updated, key)
+                        }
+                        if changed:
+                            worker.request_settings(**changed)
+                        for key in (
+                            *BACKEND_SETTING_KEYS,
+                            "prompt",
+                            "negative_prompt",
+                            "movement_speed",
+                            "sprint_multiplier",
+                            "mouse_sensitivity",
+                            "reprojection",
+                            "reprojection_strength",
+                            "reprojection_max_translation",
+                            "reprojection_max_rotation",
+                            "display_sharpen",
+                            "debug_overlay",
+                            "prompt_caption",
+                            "prompt_auto_advance_seconds",
+                        ):
+                            setattr(config, key, getattr(updated, key))
                         overlay_enabled = bool(config.debug_overlay or debug_requested)
-                        config.prompt_caption = updated.prompt_caption
                         prompt_caption_enabled = config.prompt_caption
-                        config.reprojection_strength = updated.reprojection_strength
-                        config.reprojection_max_translation = updated.reprojection_max_translation
-                        config.reprojection_max_rotation = updated.reprojection_max_rotation
-                        config.display_sharpen = updated.display_sharpen
-                        if config.one_step_timestep != updated.one_step_timestep:
-                            config.one_step_timestep = updated.one_step_timestep
-                            worker.request_one_step_timestep(config.one_step_timestep)
-                        if config.edge_softness != updated.edge_softness:
-                            config.edge_softness = updated.edge_softness
-                            worker.request_edge_softness(config.edge_softness)
-                        if config.img2img_strength != updated.img2img_strength:
-                            config.img2img_strength = updated.img2img_strength
-                            worker.request_img2img_strength(config.img2img_strength)
-                        if config.edge_strength != updated.edge_strength:
-                            config.edge_strength = updated.edge_strength
-                            worker.request_edge_strength(config.edge_strength)
-                        if config.steps != updated.steps:
-                            config.steps = updated.steps
-                            worker.request_steps(config.steps)
-                        if config.guidance_scale != updated.guidance_scale:
-                            config.guidance_scale = updated.guidance_scale
-                            worker.request_guidance_scale(config.guidance_scale)
-                        if config.seed_mode != updated.seed_mode:
-                            config.seed_mode = updated.seed_mode
-                            worker.request_seed_mode(config.seed_mode)
-                        if config.noise_persistence != updated.noise_persistence:
-                            config.noise_persistence = updated.noise_persistence
-                            worker.request_noise_persistence(config.noise_persistence)
                         config_mtime = current_mtime
-                        logging.info("Hot-reloaded prompt and navigation settings")
+                        logging.info("Hot-reloaded config: %s", ", ".join(sorted(changed)) or "prompt/navigation")
                 except Exception:
                     logging.exception("Config hot reload failed; retaining last valid values")
 
             if args.smoke_frames and displayed_frames >= args.smoke_frames:
-                running = False
+                # Wait for proof that the backend produced a frame, but never
+                # hang a headless smoke run on a stuck or failed worker.
+                if (
+                    latest_ai is not None
+                    or status.state == "error"
+                    or now - session_started > SMOKE_AI_TIMEOUT_S
+                ):
+                    running = False
             clock.tick(config.target_display_fps)
         logging.info(
             "Session ended: %s displayed frames, %.1f display FPS, %.1f proxy FPS",
@@ -747,37 +862,45 @@ def build_overlay(
     config: AppConfig,
     status: object,
     stats: dict[str, float | int | str],
+    world_label: str,
     log_path: Path,
     prompt_editing: bool = False,
     prompt_buffer: str = "",
     notice: str = "",
+    effective_prompt: str = "",
 ) -> list[str]:
+    """Diagnostic lines for the F1 overlay: rates, walk state and hotkeys."""
     state = getattr(status, "state", "unknown")
     error = getattr(status, "error", "")
     active_resolution = getattr(status, "active_resolution", config.resolution_label)
-    inference_ms = float(stats.get("inference_ms", 0.0))
     lines = [
-        "FUNCTION KEYS  F1 overlay  F2 proxy/AI  F3 diagnostics",
-        "               F4 freeze  F5 reprojection  F6 AI",
-        "               F7 prompt  F10 resolution  F11 fullscreen",
+        "FUNCTION KEYS  F1 overlay  F2 proxy/AI  F3 diagnostics  F4 freeze",
+        "               F5 reprojection  F6 AI  F7 caption  F8 feedback",
+        "               F9 auto advance  F10 resolution  F11 fullscreen  F12 autowalk",
         "",
         f"DISPLAY       {display_fps:6.1f} FPS     VIEW  {view_name}{' (FROZEN)' if frozen else ''}",
         f"PROXY         {proxy_fps:6.1f} FPS     RENDER {proxy_ms:6.2f} ms",
         f"CONDITIONING  {config.conditioning_fps:6d} FPS     CAPTURE {conditioning_ms:5.2f} ms",
-        f"DIFFUSION     {float(stats.get('diffusion_fps', 0.0)):6.1f} FPS     INFER  {inference_ms:6.2f} ms",
+        f"DIFFUSION     {float(stats.get('diffusion_fps', 0.0)):6.1f} FPS     INFER  {float(stats.get('inference_ms', 0.0)):6.2f} ms",
         f"REPROJECT     {reproject_ms:6.2f} ms      MODE    {'ON' if config.reprojection else 'OFF'}",
         f"WARP AMOUNT   [{'#' * round(config.reprojection_strength * 10)}{'-' * (10 - round(config.reprojection_strength * 10))}] {config.reprojection_strength:4.0%}    [ / ] adjust",
         f"AI AGE        {ai_age_ms:6.1f} ms      VRAM   {float(stats.get('vram_allocated_gb', 0.0)):5.2f} GB",
         f"RES           {active_resolution}       F10 cycle       STEPS  {stats.get('steps', config.steps)}    - / = adjust",
         f"CFG           {float(stats.get('guidance_scale', config.guidance_scale)):4.2g}                  C cycle",
         f"SHARPNESS     {config.display_sharpen:4.1f}                  , / . adjust",
-        f"STRUCTURE     {structure_lock_percent(config):4.0f}%                  K less / L more",
-        f"EDGE SOFT     {config.edge_softness:4.2g} px                B cycle",
-        f"GEO GUIDE     {config.edge_strength:4.0%}                  G cycle",
+        f"TIMESTEP      {config.timestep_min}-{config.timestep_max} now {float(stats.get('timestep_now', 0.0)):5.0f}    T / Y shift",
+        f"INSTABILITY   {config.instability:4.0%}                  I less / O more",
+        f"GUIDE         {config.guide_strength:4.0%} now {float(stats.get('guide_strength_now', 0.0)):4.0%}         K less / L more",
+        f"NOISE WALK    {float(stats.get('noise_walk_t', 0.0)):4.0%} of {config.noise_walk_seconds:5.1f}s    N cycle",
+        f"PROMPT WALK   {float(stats.get('prompt_walk_t', 1.0)):4.0%} of {config.prompt_walk_seconds:5.1f}s    M cycle",
+        f"FEEDBACK      {'ON' if config.feedback_reprojection else 'OFF'}                   F8 toggle",
         f"BACKEND       {config.backend}       STATE  {state.upper()}",
-        f"SEED          {stats.get('active_seed', config.seed)}        MODE {config.seed_mode.upper()}    N cycle mode",
-        f"WORLD         {config.world_seed}        SPACE new world  Shift+R reseed  P edit prompt",
-        f"PROMPT        {config.prompt[:58]}",
+        f"SEED          {stats.get('active_seed', config.seed)}        Shift+R reseed",
+        f"WORLD         {config.world_seed}  {world_label}",
+        "              SPACE new world + prompt   P edit prompt",
+        f"HUE           {hue_words(world_label) or 'none'}  (appended to the prompt)",
+        f"PROMPT        {(effective_prompt or config.prompt)[:58]}",
+        f"AUTO ADVANCE  {config.prompt_auto_advance_seconds:5.1f}s               F9 cycle",
     ]
     if notice:
         lines.extend(["", notice])
