@@ -56,8 +56,10 @@ def test_latent_walk_keys_are_validated_and_forwarded() -> None:
         "guide_strength": 0.6,
         "memory_match": 1.0,
         "memory_match_std": 0.5,
-        "memory_leash": 1.1,
+        "memory_leash": 0.7,
         "depth_guide": 0.5,
+        "depth_shade": -0.6,
+        "guide_wobble": 0.0,
         "noise_walk_seconds": 5.0,
         "noise_jitter": 0.12,
         "prompt_walk_seconds": 6.0,
@@ -76,6 +78,13 @@ def test_latent_walk_keys_are_validated_and_forwarded() -> None:
         AppConfig(memory_leash=9.0).validate()
     with pytest.raises(RuntimeError, match="noise_walk_seconds"):
         AppConfig(noise_walk_seconds=-1.0).validate()
+    with pytest.raises(RuntimeError, match="guide_wobble"):
+        AppConfig(guide_wobble=1.2).validate()
+    # depth_guide and depth_shade are signed: the sign is the direction of the
+    # ramp, so only the magnitude is bounded.
+    with pytest.raises(RuntimeError, match="depth_shade"):
+        AppConfig(depth_shade=-1.4).validate()
+    AppConfig(depth_guide=-1.0, depth_shade=1.0).validate()
 
 
 def test_backend_dict_resolves_both_model_folders(tmp_path: Path) -> None:
@@ -116,7 +125,7 @@ def test_camera_far_plane_stays_inside_the_streamed_window() -> None:
 def test_camera_reset_restores_start() -> None:
     camera = Camera.create_default()
     start = camera.position.copy()
-    camera.walk(1.0, 1.0, 8.0)
+    camera.fly(1.0, 0.0, 1.0, 8.0)
     camera.rotate(100.0, -40.0, 0.15)
     camera.reset()
     assert np.allclose(camera.position, start)
@@ -124,23 +133,34 @@ def test_camera_reset_restores_start() -> None:
     assert camera.pitch == 0.0
 
 
-def test_walking_never_changes_height_whatever_the_pitch() -> None:
-    """Looking down into a ravine or up at a monolith must not move the eye."""
+def test_flying_forward_follows_the_full_look_direction() -> None:
+    """Holding forward while looking up climbs: there is no ground to walk on."""
 
     for pitch in (-85.0, -40.0, 0.0, 60.0):
         camera = Camera.create_default()
         camera.pitch = pitch
-        start = camera.position.copy()
         for _ in range(60):
-            camera.walk(0.0, 1.0, 3.0)
-        assert np.isclose(camera.position[1], start[1])
-        assert np.isclose(np.linalg.norm(camera.position - start), 180.0)
+            camera.fly(0.0, 0.0, 1.0, 3.0)
+        assert np.allclose(camera.position, camera.forward * 180.0)
+        assert np.isclose(np.linalg.norm(camera.position), 180.0)
+
+
+def test_world_up_and_strafe_stay_level_whatever_the_pitch() -> None:
+    """Q/E is a deliberate climb, so it must not depend on where the gaze points."""
+
+    camera = Camera.create_default()
+    camera.pitch = -70.0
+    camera.yaw = 33.0
+    camera.fly(0.0, 1.0, 0.0, 5.0)
+    assert np.allclose(camera.position, (0.0, 5.0, 0.0))
+    camera.fly(1.0, 0.0, 0.0, 4.0)
+    assert np.isclose(camera.position[1], 5.0)
 
 
 def test_camera_keeps_sub_unit_movement_at_large_world_coordinates() -> None:
     camera = Camera.create_default()
     camera.position[0] = 16_777_216.0
-    camera.walk(1.0, 0.0, 0.25)
+    camera.fly(1.0, 0.0, 0.0, 0.25)
     assert camera.position[0] == 16_777_216.25
 
 
@@ -370,7 +390,7 @@ def test_world_instance_packing_preserves_transform_columns_and_color() -> None:
     from app.renderer.world import WorldCube
 
     item = WorldCube(
-        role="form",
+        role="panel",
         position=(11.0, 13.0, -17.0),
         half_extents=(2.0, 3.0, 5.0),
         rotation=(0.0, 0.0, 0.0),
@@ -397,8 +417,8 @@ def test_renderer_chunk_cache_stays_bounded_and_regenerates_evicted_chunks() -> 
         def orphan(self, size: int) -> None:
             self.size = size
 
-        def write(self, data) -> None:
-            assert data.nbytes <= self.size
+        def write(self, data, offset=0) -> None:
+            assert offset + data.nbytes <= self.size
 
     renderer = ProxyRenderer.__new__(ProxyRenderer)
     renderer.world_seed = 12345
@@ -412,14 +432,14 @@ def test_renderer_chunk_cache_stays_bounded_and_regenerates_evicted_chunks() -> 
 
     origin = np.array([0.0, 1.65, 0.0], dtype=np.float32)
     renderer._update_world(origin)
-    original_chunk = renderer._chunks[(0, 0)]
+    original_chunk = renderer._chunks[(0, 0, 0)]
     initial_revision = renderer._instance_buffer_revision
     renderer._update_world(origin)
     assert renderer._instance_buffer_revision == initial_revision
 
     for step in range(1, 12):
         renderer._update_world(
-            np.array([CHUNK_SIZE * step, 1.65, 0.0], dtype=np.float32)
+            np.array([0.0, CHUNK_SIZE * step, 0.0], dtype=np.float64)
         )
         assert len(renderer._chunks) <= MAX_ACTIVE_CHUNKS
         assert renderer._chunks.keys() == renderer._chunk_instances.keys()
@@ -427,6 +447,6 @@ def test_renderer_chunk_cache_stays_bounded_and_regenerates_evicted_chunks() -> 
             MAX_ACTIVE_CHUNKS * MAX_OBJECTS_PER_CHUNK
         )
 
-    assert (0, 0) not in renderer._chunks
+    assert (0, 0, 0) not in renderer._chunks
     renderer._update_world(origin)
-    assert renderer._chunks[(0, 0)] == original_chunk
+    assert renderer._chunks[(0, 0, 0)] == original_chunk

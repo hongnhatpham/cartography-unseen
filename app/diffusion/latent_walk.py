@@ -31,8 +31,15 @@ from app.utils.timing import ExponentialAverage
 _BREATH_SECONDS = 13.0
 _SLOW_BREATH_SECONDS = 47.0
 _WOBBLE_SECONDS = 29.0
-# Peak one-sided guide-strength excursion at instability 1.0.
-_GUIDE_WOBBLE = 0.28
+# Nearness remap bounds, in world units. Raw depth-buffer values are useless
+# for this: with a 0.05 near plane every surface past half a unit sits inside
+# the top 1% of the buffer, so a remap on the buffer is flat over the whole
+# frame. Linear eye distance on a log scale spreads the range a walker reads.
+NEAR_REFERENCE = 2.0
+FAR_REFERENCE = 160.0
+# Peak luminance gain applied to the nearest geometry at depth_shade 1.0; the
+# farthest is scaled by the reciprocal excursion.
+_DEPTH_SHADE_RANGE = 0.6
 # Extra breathing amplitude at instability 1.0, as a fraction of the half-range.
 # The result is still clamped into [timestep_min, timestep_max]; the overshoot
 # only makes the walk dwell at the hot and cool ends rather than sweep past them.
@@ -307,22 +314,57 @@ def breathing_timestep(
 
 
 def wobbled_guide_strength(
-    elapsed: float, guide_strength: float, instability: float
+    elapsed: float, guide_strength: float, instability: float, amplitude: float = 0.0
 ) -> float:
     """Wobble how hard the proxy pulls the walk back toward itself.
 
     The excursion is one-sided: ``guide_strength`` is the weakest anchoring that
-    ever happens and the wobble can only tighten it. A two-sided wobble spent
-    part of every cycle below the configured anchor, and those troughs were
-    where the walk let go of the proxy and drifted into interiors and glyphs.
-    Instability still buys chaos through the breathing timestep.
+    ever happens and the wobble can only tighten it. ``amplitude`` 0 (the
+    default) removes the wobble entirely, which is what a player needs when the
+    output has to stay readable as the proxy's layout: a breathing anchor makes
+    the same wall alternately solid and vague. Instability still buys chaos
+    through the breathing timestep.
 
     The period is long (29 s) on purpose: each anchoring level has to hold long
     enough for a look to settle, so a several-hundred-frame loop drifts through
     distinct states instead of shimmering between them.
     """
+    if amplitude <= 0.0:
+        return clamp01(guide_strength)
     phase = 0.5 + 0.5 * math.sin(2.0 * math.pi * elapsed / _WOBBLE_SECONDS)
-    return clamp01(guide_strength + _GUIDE_WOBBLE * clamp01(instability) * phase)
+    return clamp01(
+        guide_strength + clamp01(amplitude) * clamp01(instability) * phase
+    )
+
+
+def near_far_from_projection(projection: np.ndarray) -> tuple[float, float]:
+    """Recover the near and far planes from an OpenGL perspective matrix.
+
+    Returns ``(0.0, 0.0)`` for anything that is not one, so a caller holding a
+    placeholder snapshot falls back to a depth-free frame instead of raising.
+    """
+    depth_scale = float(projection[2, 2])
+    depth_bias = float(projection[2, 3])
+    if abs(depth_scale) <= 1.0 or depth_bias == 0.0:
+        return 0.0, 0.0
+    return depth_bias / (depth_scale - 1.0), depth_bias / (depth_scale + 1.0)
+
+
+def depth_nearness(depth: np.ndarray, near: float, far: float) -> np.ndarray:
+    """Remap a depth buffer to nearness in 0..1, 1 at the camera, on a log scale.
+
+    Linearises to eye distance first, then compresses logarithmically between
+    ``NEAR_REFERENCE`` and ``FAR_REFERENCE``, which is roughly how a walker
+    reads distance and keeps the useful contrast in the first few tens of units
+    instead of in the last percent of the depth buffer.
+    """
+    ndc = np.clip(depth.astype(np.float32), 0.0, 1.0) * 2.0 - 1.0
+    distance = (2.0 * near * far) / np.maximum(
+        (far + near) - ndc * (far - near), 1e-6
+    )
+    distance = np.clip(distance, NEAR_REFERENCE, FAR_REFERENCE)
+    span = math.log(FAR_REFERENCE / NEAR_REFERENCE)
+    return (np.log(FAR_REFERENCE / distance) / span).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +517,9 @@ _FLOAT_SETTINGS: dict[str, tuple[float, float]] = {
     "memory_match": (0.0, 1.0),
     "memory_match_std": (0.0, 1.0),
     "memory_leash": (0.0, 8.0),
-    "depth_guide": (0.0, 1.0),
+    "depth_guide": (-1.0, 1.0),
+    "depth_shade": (-1.0, 1.0),
+    "guide_wobble": (0.0, 1.0),
 }
 _INT_SETTINGS: dict[str, tuple[int, int]] = {
     "steps": (1, 4),
@@ -507,6 +551,18 @@ def _resolve_path(config: Mapping[str, Any], key: str, default: str) -> Path:
     if value.is_absolute():
         return value
     return (Path(config.get("project_root", ".")) / value).resolve()
+
+
+def frame_nearness(conditioning: ConditioningFrame) -> np.ndarray | None:
+    """Nearness map for a conditioning frame, or None when it carries no camera."""
+    camera = getattr(conditioning, "camera", None)
+    projection = getattr(camera, "projection_matrix", None)
+    if conditioning.depth is None or projection is None:
+        return None
+    near, far = near_far_from_projection(np.asarray(projection, dtype=np.float64))
+    if not 0.0 < near < far:
+        return None
+    return depth_nearness(conditioning.depth, near, far)
 
 
 class LatentWalkBackend(DiffusionBackend):
@@ -541,6 +597,8 @@ class LatentWalkBackend(DiffusionBackend):
         self.memory_match_std = 0.5
         self.memory_leash = 1.5
         self.depth_guide = 0.5
+        self.depth_shade = 0.0
+        self.guide_wobble = 0.0
         self.feedback_reprojection = False
         self.seed = 12345
         self.warmup_passes = 2
@@ -611,7 +669,9 @@ class LatentWalkBackend(DiffusionBackend):
         self.memory_match = clamp01(float(config.get("memory_match", 1.0)))
         self.memory_match_std = clamp01(float(config.get("memory_match_std", 0.5)))
         self.memory_leash = max(0.0, float(config.get("memory_leash", 1.5)))
-        self.depth_guide = clamp01(float(config.get("depth_guide", 0.5)))
+        self.depth_guide = min(max(float(config.get("depth_guide", 0.5)), -1.0), 1.0)
+        self.depth_shade = min(max(float(config.get("depth_shade", 0.0)), -1.0), 1.0)
+        self.guide_wobble = clamp01(float(config.get("guide_wobble", 0.0)))
         self.feedback_reprojection = bool(config.get("feedback_reprojection", False))
         self.seed = int(config.get("seed", 12345))
         self.warmup_passes = int(config.get("warmup_passes", 2))
@@ -759,32 +819,42 @@ class LatentWalkBackend(DiffusionBackend):
         # Reprojected feedback replaces the memory latent when it is enabled; it
         # is aligned to this camera, so it re-anchors the walk to the proxy.
         aligned = previous_frame if self.feedback_reprojection else None
-        return self._render(conditioning.rgb, aligned, conditioning.depth)
+        return self._render(conditioning.rgb, aligned, frame_nearness(conditioning))
 
-    def _guide_weight_map(self, depth: np.ndarray | None, guide: Any) -> Any | None:
-        """Per-latent-pixel guide strength from proxy depth, or None if unused.
-
-        Near geometry keeps the configured strength; distant geometry and sky
-        drop toward ``guide * (1 - depth_guide)``, so the horizon is where the
-        walk hallucinates and the foreground stays anchored. That gradient is
-        what gives a frame depth at eye level, where every form otherwise
-        competes equally for the sampler.
-        """
-        if depth is None or self.depth_guide <= 0.0:
+    def _upload_nearness(self, nearness: np.ndarray | None) -> Any | None:
+        """Upload the nearness map once per frame as a 1x1xHxW fp16 tensor."""
+        if nearness is None:
             return None
         torch = self.torch
-        tensor = torch.from_numpy(np.ascontiguousarray(depth)).to(self.device, self.dtype)
+        tensor = torch.from_numpy(np.ascontiguousarray(nearness)).to(self.device, self.dtype)
         tensor = tensor[None, None]
-        tensor = torch.nn.functional.interpolate(
-            tensor, size=guide.shape[-2:], mode="bilinear", align_corners=False
+        if tensor.shape[-2:] != (self.height, self.width):
+            tensor = torch.nn.functional.interpolate(
+                tensor, size=(self.height, self.width), mode="bilinear", align_corners=False
+            )
+        return tensor
+
+    def _guide_weight_map(self, nearness: Any | None, guide: Any) -> Any | None:
+        """Per-latent-pixel guide strength from proxy nearness, or None if unused.
+
+        A positive ``depth_guide`` keeps the configured strength up close and
+        drops distant geometry toward ``guide * (1 - depth_guide)``, so the
+        horizon hallucinates while the foreground holds. A negative value
+        inverts that and anchors the far field hardest, which is what makes a
+        wall thirty units away readable as a wall. Zero weights the frame flat.
+        """
+        if nearness is None or self.depth_guide == 0.0:
+            return None
+        resized = self.torch.nn.functional.interpolate(
+            nearness, size=guide.shape[-2:], mode="bilinear", align_corners=False
         )
-        # Depth-buffer values are non-linear; the far half of the frame sits in
-        # the top few percent, so remap so the fade is visible over the walk.
-        near = torch.clamp((tensor - 0.90) / 0.10, 0.0, 1.0)
-        return 1.0 - self.depth_guide * near
+        return 1.0 - self.depth_guide * (1.0 - resized)
 
     def _render(
-        self, rgb: np.ndarray, aligned: np.ndarray | None = None, depth: np.ndarray | None = None
+        self,
+        rgb: np.ndarray,
+        aligned: np.ndarray | None = None,
+        nearness: np.ndarray | None = None,
     ) -> np.ndarray:
         """Run one walk step; ``aligned`` replaces the memory latent when given."""
         torch = self.torch
@@ -795,10 +865,11 @@ class LatentWalkBackend(DiffusionBackend):
                 elapsed, self.timestep_min, self.timestep_max, self.instability
             )
             self._guide_now = wobbled_guide_strength(
-                elapsed, self.guide_strength, self.instability
+                elapsed, self.guide_strength, self.instability, self.guide_wobble
             )
             positive, negative = self.prompt_walk.advance()
-            guide = self._encode_image(rgb)
+            near_map = self._upload_nearness(nearness)
+            guide = self._encode_image(rgb, near_map)
             if aligned is None and self.x0_prev is None and self._warm_frames > 0:
                 self._seed_memory(guide, positive, negative)
             memory = self._encode_image(aligned) if aligned is not None else self.x0_prev
@@ -809,8 +880,12 @@ class LatentWalkBackend(DiffusionBackend):
                     memory, guide, self.memory_match, self.memory_match_std
                 )
                 memory = leash_to_guide(memory, guide, self.memory_leash)
-                weight_map = self._guide_weight_map(depth, guide)
-                weight = self._guide_now if weight_map is None else self._guide_now * weight_map
+                weight_map = self._guide_weight_map(near_map, guide)
+                weight = (
+                    self._guide_now
+                    if weight_map is None
+                    else (self._guide_now * weight_map).clamp_(0.0, 1.0)
+                )
                 base = torch.lerp(memory, guide, weight)
             noise = self.noise_walk.value()
             x0 = self._denoise(base, noise, self._timestep_now, positive, negative)
@@ -870,8 +945,15 @@ class LatentWalkBackend(DiffusionBackend):
             sample = x0
         return sample
 
-    def _encode_image(self, rgb: np.ndarray) -> Any:
-        """Upload the proxy once and TAESD-encode it to a guide latent."""
+    def _encode_image(self, rgb: np.ndarray, nearness: Any | None = None) -> Any:
+        """Upload the proxy once and TAESD-encode it to a guide latent.
+
+        With ``depth_shade`` non-zero the proxy's value is modulated by distance
+        before the encode, so the latent carries an explicit depth ramp on top
+        of whatever the shader painted: positive makes near geometry bright and
+        the far field dark, negative the reverse. Hue survives because all three
+        channels take the same gain.
+        """
         torch = self.torch
         tensor = torch.from_numpy(np.ascontiguousarray(rgb)).to(self.device)
         tensor = tensor.permute(2, 0, 1).unsqueeze(0).to(self.dtype).div_(127.5).sub_(1.0)
@@ -879,6 +961,9 @@ class LatentWalkBackend(DiffusionBackend):
             tensor = torch.nn.functional.interpolate(
                 tensor, size=(self.height, self.width), mode="bilinear", align_corners=False
             )
+        if nearness is not None and self.depth_shade != 0.0:
+            gain = 1.0 + self.depth_shade * _DEPTH_SHADE_RANGE * (2.0 * nearness - 1.0)
+            tensor = tensor.add(1.0).mul_(0.5).mul_(gain).clamp_(0.0, 1.0).mul_(2.0).sub_(1.0)
         return self.taesd.encode(tensor).latents
 
     def _decode_image(self, latents: Any) -> np.ndarray:
@@ -947,6 +1032,8 @@ class LatentWalkBackend(DiffusionBackend):
             "memory_match_std": self.memory_match_std,
             "memory_leash": self.memory_leash,
             "depth_guide": self.depth_guide,
+            "depth_shade": self.depth_shade,
+            "guide_wobble": self.guide_wobble,
             "noise_walk_seconds": self.noise_walk.seconds,
             "noise_jitter": self.noise_walk.jitter,
             "noise_walk_t": self.noise_walk.t,

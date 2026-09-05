@@ -1,0 +1,10 @@
+{
+  "projectId": "cartography-unseen",
+  "reportId": "fable-free-flight-directions",
+  "publicId": "3b76771a3acf3dd7c2a9",
+  "url": "https://reports.bynhat.com/r/3b76771a3acf3dd7c2a9/",
+  "revision": 3,
+  "fileCount": 1,
+  "localFile": "fable-free-flight.html",
+  "verification": "Authenticated GET returned HTTP 200, text/html and expected report content; local HTML, SVG and JavaScript syntax checks passed."
+}

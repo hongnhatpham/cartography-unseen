@@ -17,7 +17,8 @@ class CameraSnapshot:
 class ConditioningFrame:
     rgb: np.ndarray
     depth: np.ndarray
-    edges: np.ndarray
+    # Omitted when neither the backend nor the selected diagnostic needs edges.
+    edges: np.ndarray | None
     camera: CameraSnapshot
     timestamp: float
     sequence: int

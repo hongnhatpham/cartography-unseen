@@ -89,11 +89,10 @@ def persist_prompt(config_path: Path, prompt: str) -> float:
 
 @dataclass(frozen=True, slots=True)
 class PromptEntry:
-    """One variant of a style family, carrying that family's live settings.
+    """One variant of a style family with optional tuning metadata.
 
-    ``settings`` holds the family's overrides for the tunable backend keys
-    (timestep range, guide strength, CFG, depth guide, instability), so a
-    "Chrome Lattice" family can run hot while "Corrupted Render" runs cool.
+    Live prompt selection preserves the operator's current settings. Family
+    settings remain available to offline comparison tools.
     """
 
     family: str
@@ -371,9 +370,7 @@ def run() -> int:
         latest_ai_version = 0
         last_config_check = 0.0
         last_prompt_advance = perf_counter()
-        # Which pair of the world's accent hues currently leads the prompt; it
-        # rotates on every auto-advance so a long walk changes colour, and
-        # resets with the world.
+        # Keep the world's accent pair stable when selecting another prompt.
         hue_offset = 0
         recent_families: list[str] = [current_entry.family]
         last_input = perf_counter()
@@ -388,7 +385,6 @@ def run() -> int:
         prompt_buffer = ""
         required_prompt_revision = 0
         minimum_ai_sequence = 0
-        hold_previous_ai = False
         # Never expose the proxy as the startup fallback. The worker already
         # receives conditioning frames automatically, so hold the neutral
         # loading artwork until its first generated frame arrives.
@@ -524,7 +520,6 @@ def run() -> int:
                         minimum_ai_sequence = renderer.sequence + 1
                         conditioning = None
                         last_conditioning_capture = 0.0
-                        hold_previous_ai = False
                         hide_proxy_until_ai = True
                         force_proxy = False
                         diagnostic_mode = "none"
@@ -544,7 +539,7 @@ def run() -> int:
                             diagnostic_mode = "none"
                         else:
                             force_proxy = not force_proxy
-                        notice = "PROXY VIEW — WASD + MOUSE" if force_proxy else "AI VIEW"
+                        notice = "PROXY VIEW: WASD + MOUSE, Q/E DOWN/UP" if force_proxy else "AI VIEW"
                         notice_until = frame_started + 3.0
                     elif event.key == pygame.K_F3:
                         modes = ("none", "depth", "edges")
@@ -678,63 +673,26 @@ def run() -> int:
                         notice_until = frame_started + 3.0
                         logging.info("Manual reseed: %s", new_seed)
                     elif event.key == pygame.K_SPACE:
-                        # A reset changes the whole look: new world, new style
-                        # family with its own timestep/guide/CFG regime, and a
-                        # new noise seed so the walk does not resume the old one.
-                        # One redraw when the palette repeats: with a handful of
-                        # hue triads a back-to-back repeat is expected rather
-                        # than unlucky, and it is the one collision the viewer
-                        # actually notices.
-                        previous_hues = world_hues(renderer.world_label())
-                        world_seed = renderer.randomize_world()
-                        if world_hues(renderer.world_label()) == previous_hues:
-                            world_seed = renderer.randomize_world()
-                        reset: dict[str, object] = {
-                            "world_seed": world_seed,
-                            "seed": worker.request_reseed(),
-                        }
-                        hue_offset = 0
-                        renderer.spawn_camera(camera)
-                        autowalk = Autowalk(reset["world_seed"])
+                        # Keep the current world and live tuning while the
+                        # backend walks toward another library prompt.
                         try:
-                            current_entry = choose_family_prompt(
-                                load_prompt_library(prompt_library_path),
-                                recent_families,
-                            )
+                            entries = [
+                                entry for entry in load_prompt_library(prompt_library_path)
+                                if entry.prompt != config.prompt
+                            ]
+                            if not entries:
+                                raise RuntimeError("Prompt library has no different prompt")
+                            current_entry = choose_family_prompt(entries, recent_families)
                             recent_families.append(current_entry.family)
                             del recent_families[:-RECENT_FAMILY_MEMORY]
-                            reset.update(current_entry.settings)
-                            reset["prompt"] = current_entry.prompt
-                            commit_many(reset)
+                            commit("prompt", current_entry.prompt)
                             required_prompt_revision = send_prompt(current_entry.prompt)
                             last_prompt_advance = frame_started
+                            notice = f"NEW PROMPT: {current_entry.family}"
+                            notice_until = frame_started + 4.0
+                            logging.info("Prompt selected: %s", current_entry.family)
                         except RuntimeError as exc:
-                            logging.error("Prompt library ignored: %s", exc)
-                            commit_many(reset, live=False)
-                        # Preserve the last finished artwork while the new
-                        # world and prompt generate. Reprojecting that old
-                        # image with the new world's depth would expose the
-                        # proxy and break the transition, so it is displayed
-                        # raw until its replacement arrives.
-                        hold_previous_ai = latest_ai is not None
-                        hide_proxy_until_ai = latest_ai is None
-                        force_proxy = False
-                        diagnostic_mode = "none"
-                        latest_ai_version, _ = worker.generated.get()
-                        minimum_ai_sequence = renderer.sequence + 1
-                        conditioning = None
-                        last_conditioning_capture = 0.0
-                        notice = ""
-                        notice_until = 0.0
-                        notice = f"NEW WORLD — {current_entry.family}"
-                        notice_until = frame_started + 4.0
-                        logging.info(
-                            "World randomized: %s (%s); family: %s; seed: %s",
-                            config.world_seed,
-                            renderer.world_label(),
-                            current_entry.family,
-                            config.seed,
-                        )
+                            logging.error("Prompt selection skipped: %s", exc)
                     elif event.key == pygame.K_p:
                         prompt_editing = True
                         prompt_buffer = config.prompt
@@ -754,6 +712,7 @@ def run() -> int:
             dt = min(clock.get_time() / 1000.0, 0.1)
             strafe = float(keys[pygame.K_d]) - float(keys[pygame.K_a])
             ahead = float(keys[pygame.K_w]) - float(keys[pygame.K_s])
+            rise = float(keys[pygame.K_e]) - float(keys[pygame.K_q])
             if mouse_x or mouse_y or strafe or ahead or any(keys):
                 last_input = frame_started
                 if autowalking:
@@ -767,9 +726,9 @@ def run() -> int:
             if autowalking and not prompt_editing:
                 step_length = 0.0 if autowalk.turning(frame_started) else config.movement_speed * dt
                 before = camera.position.copy()
-                camera.walk(0.0, 1.0, step_length)
+                camera.fly(0.0, 0.0, 1.0, step_length)
                 renderer.constrain_camera(camera, dt)
-                gained = float(np.linalg.norm((camera.position - before)[[0, 2]]))
+                gained = float(np.linalg.norm(camera.position - before))
                 camera.yaw, camera.pitch = autowalk.step(
                     camera.yaw,
                     camera.pitch,
@@ -782,22 +741,32 @@ def run() -> int:
                 )
             else:
                 if not prompt_editing:
-                    camera.walk(strafe, ahead, speed * dt)
+                    camera.fly(strafe, rise, ahead, speed * dt)
                 renderer.constrain_camera(camera, dt)
 
-            proxy_started = perf_counter()
-            snapshot = renderer.render_scene(camera)
-            proxy_ms.update((perf_counter() - proxy_started) * 1000.0)
-            proxy_rate.tick()
             capture_due = (
                 conditioning is None
                 or force_proxy
                 or diagnostic_mode != "none"
                 or frame_started - last_conditioning_capture >= 1.0 / config.conditioning_fps
             )
+            if capture_due or config.reprojection:
+                proxy_started = perf_counter()
+                snapshot = renderer.render_scene(camera)
+                proxy_ms.update((perf_counter() - proxy_started) * 1000.0)
+                proxy_rate.tick()
+            else:
+                # Raw AI holds its last image between conditioning captures.
+                # Keep streaming and the location palette current without
+                # drawing a proxy frame that neither AI nor display will use.
+                renderer.update_world(camera.position)
             if capture_due:
                 capture_started = perf_counter()
-                conditioning = renderer.capture_conditioning(snapshot, frame_started)
+                conditioning = renderer.capture_conditioning(
+                    snapshot,
+                    frame_started,
+                    include_edges=config.backend != "latent_walk" or diagnostic_mode == "edges",
+                )
                 conditioning_ms.update((perf_counter() - capture_started) * 1000.0)
                 last_conditioning_capture = frame_started
                 worker.publish(conditioning)
@@ -814,7 +783,6 @@ def run() -> int:
                 silent_ai_arrival = hide_proxy_until_ai
                 latest_ai_version = ai_version
                 latest_ai = published_ai
-                hold_previous_ai = False
                 hide_proxy_until_ai = False
                 if first_ai_arrival:
                     # Diagnostics selected while the model was loading must not
@@ -838,11 +806,11 @@ def run() -> int:
                 view_name = "AI LOADING" if hide_proxy_until_ai else "LIVE PROXY — AI LOADING"
             else:
                 display_image = latest_ai.image
-                if config.reprojection and not hold_previous_ai:
+                if config.reprojection:
                     reproject_frame = latest_ai
                     view_name = "AI REPROJECTED"
                 else:
-                    view_name = "AI HOLD" if hold_previous_ai else "AI RAW"
+                    view_name = "AI RAW"
 
             now = perf_counter()
             if latest_ai is not None:
@@ -860,7 +828,6 @@ def run() -> int:
                 minimum_ai_sequence = renderer.sequence + 1
                 conditioning = None
                 last_conditioning_capture = 0.0
-                hold_previous_ai = False
                 hide_proxy_until_ai = True
                 notice = f"CUDA OOM: RESOLUTION {status.active_resolution}"
                 notice_until = now + 4.0
@@ -917,14 +884,13 @@ def run() -> int:
                 and now - last_prompt_advance >= config.prompt_auto_advance_seconds
             ):
                 last_prompt_advance = now
-                hue_offset += 1
                 try:
                     current_entry = advance_prompt(
                         load_prompt_library(prompt_library_path), current_entry
                     )
                     # Ephemeral: persisting would move config_mtime past an
                     # external edit and overwrite the configured startup prompt.
-                    apply_live({**current_entry.settings, "prompt": current_entry.prompt})
+                    apply_live({"prompt": current_entry.prompt})
                     required_prompt_revision = send_prompt(current_entry.prompt)
                     logging.info("Prompt auto-advanced to: %s", current_entry.family)
                 except RuntimeError as exc:
@@ -945,7 +911,6 @@ def run() -> int:
                             minimum_ai_sequence = renderer.sequence + 1
                             conditioning = None
                             last_conditioning_capture = 0.0
-                            hold_previous_ai = False
                             hide_proxy_until_ai = True
                         updated.prompt = apply_master_prefix(
                             load_master_prefix(prompt_library_path), updated.prompt
@@ -1050,6 +1015,7 @@ def build_overlay(
     error = getattr(status, "error", "")
     active_resolution = getattr(status, "active_resolution", config.resolution_label)
     lines = [
+        "FLIGHT        WASD move  Mouse look  Q/E down/up  Shift faster",
         "FUNCTION KEYS  F1 overlay  F2 proxy/AI  F3 diagnostics  F4 freeze",
         "               F5 reprojection  F6 AI  F7 caption  F8 feedback",
         "               F9 auto advance  F10 resolution  F11 fullscreen  F12 autowalk",
@@ -1074,7 +1040,7 @@ def build_overlay(
         f"SEED          {stats.get('active_seed', config.seed)}        Shift+R reseed",
         f"WORLD         {config.world_seed}  {world_label}",
         f"FAMILY        {family}",
-        "              SPACE new world + style family   P edit prompt",
+        "              SPACE new prompt   P edit prompt",
         f"HUE           {hue_words(world_label, hue_offset) or 'none'}  (leads the prompt)",
         f"PROMPT        {(effective_prompt or config.prompt)[:58]}",
         f"AUTO ADVANCE  {config.prompt_auto_advance_seconds:5.1f}s               F9 cycle",

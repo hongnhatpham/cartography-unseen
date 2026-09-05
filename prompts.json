@@ -4,7 +4,14 @@
     {
       "name": "Topology Unknown",
       "base": "eye level view inside a vast outdoor voxel landscape, hard black shadows, high contrast, foggy, haunted",
-      "settings": {"timestep_min": 640, "timestep_max": 720, "guide_strength": 0.7, "guidance_scale": 2.0, "depth_guide": 0.5, "instability": 0.7},
+      "settings": {
+        "timestep_min": 480,
+        "timestep_max": 580,
+        "guide_strength": 0.86,
+        "guidance_scale": 2.0,
+        "depth_guide": 0.5,
+        "instability": 0.7
+      },
       "variants": [
         "corrupted, topology unknown, shattered strata melting and regrowing, floating fragments",
         "corrupted, warped space and time, terraces folding through themselves, fragments drifting loose",
@@ -15,7 +22,14 @@
     {
       "name": "Biophilic City",
       "base": "eye level view inside a vast outdoor blocky biophilic cityscape, neural network highway, foggy, haunted, hard black shadows, high contrast",
-      "settings": {"timestep_min": 640, "timestep_max": 720, "guide_strength": 0.7, "guidance_scale": 2.0, "depth_guide": 0.5, "instability": 0.7},
+      "settings": {
+        "timestep_min": 490,
+        "timestep_max": 590,
+        "guide_strength": 0.85,
+        "guidance_scale": 2.0,
+        "depth_guide": 0.5,
+        "instability": 0.7
+      },
       "variants": [
         "corrupted, overgrown datablocks and collapsed slab terraces, blocky biophilia growth",
         "corrupted, ridges of small saturated cubes reading as vegetation, blocky biophilia",
@@ -26,7 +40,14 @@
     {
       "name": "Mangled Data",
       "base": "eye level view inside a vast outdoor voxel landscape, corrupted data, deep shadow, high contrast, foggy, haunted",
-      "settings": {"timestep_min": 660, "timestep_max": 740, "guide_strength": 0.68, "guidance_scale": 2.0, "depth_guide": 0.55, "instability": 0.7},
+      "settings": {
+        "timestep_min": 500,
+        "timestep_max": 600,
+        "guide_strength": 0.84,
+        "guidance_scale": 2.0,
+        "depth_guide": 0.55,
+        "instability": 0.7
+      },
       "variants": [
         "mangled data lattice, datamoshed ground tearing into long stretched smears, warped through space and time",
         "broken level of detail, untextured geometry popping through, z-fighting slabs, time smeared into fog",
@@ -37,7 +58,14 @@
     {
       "name": "Wire Field",
       "base": "eye level view inside a vast outdoor voxel landscape, hard black shadows, high contrast, foggy, haunted",
-      "settings": {"timestep_min": 640, "timestep_max": 740, "guide_strength": 0.68, "guidance_scale": 2.0, "depth_guide": 0.55, "instability": 0.7},
+      "settings": {
+        "timestep_min": 480,
+        "timestep_max": 600,
+        "guide_strength": 0.84,
+        "guidance_scale": 2.0,
+        "depth_guide": 0.55,
+        "instability": 0.7
+      },
       "variants": [
         "corrupted, mangled wires strung between the blocks, taut cables warped through space",
         "corrupted, a lattice of thin wires dissolving into abstraction over the slabs",
@@ -48,7 +76,14 @@
     {
       "name": "Washed Strata",
       "base": "eye level view inside a vast outdoor voxel landscape, thick fog, pale grey and white, deep shadow, haunted",
-      "settings": {"timestep_min": 620, "timestep_max": 700, "guide_strength": 0.72, "guidance_scale": 2.0, "depth_guide": 0.5, "instability": 0.6},
+      "settings": {
+        "timestep_min": 460,
+        "timestep_max": 560,
+        "guide_strength": 0.88,
+        "guidance_scale": 2.0,
+        "depth_guide": 0.5,
+        "instability": 0.6
+      },
       "variants": [
         "corrupted, eroded layered strata as flat untextured blocks, melting and regrowing",
         "corrupted, a wide washed out canyon of stacked pale slabs, overhangs and cliffs, deep vanishing lines",
@@ -59,7 +94,14 @@
     {
       "name": "Warped Spacetime",
       "base": "eye level view inside a vast outdoor voxel landscape, abstraction, hard black shadows, high contrast, foggy, haunted",
-      "settings": {"timestep_min": 660, "timestep_max": 760, "guide_strength": 0.66, "guidance_scale": 2.0, "depth_guide": 0.55, "instability": 0.75},
+      "settings": {
+        "timestep_min": 510,
+        "timestep_max": 610,
+        "guide_strength": 0.82,
+        "guidance_scale": 2.0,
+        "depth_guide": 0.55,
+        "instability": 0.75
+      },
       "variants": [
         "corrupted, space and time folding, the landscape warped around a vanishing point",
         "corrupted, slabs stretched and bent through warped space, time smeared into streaks",
@@ -70,7 +112,14 @@
     {
       "name": "Corrupted Bloom",
       "base": "eye level view inside a vast outdoor blocky biophilic cityscape, bleeding corrupted colour, foggy, haunted, hard black shadows",
-      "settings": {"timestep_min": 640, "timestep_max": 740, "guide_strength": 0.68, "guidance_scale": 2.0, "depth_guide": 0.55, "instability": 0.7},
+      "settings": {
+        "timestep_min": 480,
+        "timestep_max": 600,
+        "guide_strength": 0.84,
+        "guidance_scale": 2.0,
+        "depth_guide": 0.55,
+        "instability": 0.7
+      },
       "variants": [
         "corrupted, biophilia blooming over the slabs, growth reading as data",
         "corrupted, saturated growth clumped on ledges and terraces, colour bleeding into fog",
@@ -81,7 +130,14 @@
     {
       "name": "Datamosh Ravines",
       "base": "eye level view inside a vast outdoor voxel landscape, deep shadow, high contrast, haunted, foggy",
-      "settings": {"timestep_min": 640, "timestep_max": 720, "guide_strength": 0.7, "guidance_scale": 2.0, "depth_guide": 0.5, "instability": 0.7},
+      "settings": {
+        "timestep_min": 480,
+        "timestep_max": 580,
+        "guide_strength": 0.86,
+        "guidance_scale": 2.0,
+        "depth_guide": 0.5,
+        "instability": 0.7
+      },
       "variants": [
         "corrupted, datamoshed ravine network carved through blocky ground, hard vanishing lines, walls of blocks on every side",
         "corrupted, a canyon of stacked slabs smeared by data corruption, walls warped through time",

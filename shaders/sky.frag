@@ -1,19 +1,27 @@
 #version 330
 
-in vec2 uv;
+in vec3 view_dir;
 
 uniform vec3 fog_color;
 uniform vec3 zenith_color;
-uniform float horizon_v;
+uniform vec3 nadir_color;
 
 out vec4 frag_color;
 
-// Sky gradient behind the landscape: fog colour at the horizon rising to a
-// darker, more saturated zenith. A flat white sky above eye level was read by
-// the sampler as a ceiling or a window wall; a graded sky reads as outdoors.
+// Background as a function of look direction: pale fog at the level of the eye,
+// rising to a saturated zenith and falling to near black below. proxy.frag runs
+// the same function per fragment so distant forms fade into whatever sits
+// behind them. The volume has no ground and no horizon line, so this gradient
+// is the only thing that tells the sampler which way is up. It must stay in
+// sync with the copy in proxy.frag.
+vec3 background_color(vec3 dir) {
+    float height = clamp(normalize(dir).y, -1.0, 1.0);
+    if (height >= 0.0) {
+        return mix(fog_color, zenith_color, pow(height, 0.80));
+    }
+    return mix(fog_color, nadir_color, pow(-height, 1.40));
+}
+
 void main() {
-    float t = clamp((uv.y - horizon_v) / max(1.0 - horizon_v, 0.05), 0.0, 1.0);
-    t = pow(t, 0.8);
-    vec3 color = mix(fog_color, zenith_color, t);
-    frag_color = vec4(color, 1.0);
+    frag_color = vec4(background_color(view_dir), 1.0);
 }

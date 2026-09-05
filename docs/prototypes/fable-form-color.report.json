@@ -1,0 +1,10 @@
+{
+  "projectId": "cartography-unseen",
+  "reportId": "fable-form-color-directions",
+  "publicId": "bbd5168012c38394406d",
+  "revision": 3,
+  "fileCount": 1,
+  "url": "https://reports.bynhat.com/r/bbd5168012c38394406d/",
+  "localFile": "fable-form-color.html",
+  "verification": "Authenticated HTTP 200 text/html; published bytes match local artifact; 21 embedded images decoded; HTML safety and additive geometry/prompt checks passed."
+}

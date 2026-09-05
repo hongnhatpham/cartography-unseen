@@ -32,6 +32,8 @@ BACKEND_SETTING_KEYS = (
     "memory_match_std",
     "memory_leash",
     "depth_guide",
+    "depth_shade",
+    "guide_wobble",
     "noise_walk_seconds",
     "noise_jitter",
     "prompt_walk_seconds",
@@ -52,10 +54,15 @@ class AppConfig:
     sampler: str = ""
     steps: int = 1
     guidance_scale: float = 2.0
-    timestep_min: int = 640
-    timestep_max: int = 720
+    # The timestep, not the guide strength, decides how much of the proxy's
+    # layout survives: at 640-720 only about a sixth of the signal entering the
+    # UNet is the guide, and the output's edges landed on the proxy's at an SSIM
+    # of 0.05 whatever the guide did. 480-580 roughly triples that while the
+    # picture still hallucinates; below about 450 it repaints the proxy.
+    timestep_min: int = 480
+    timestep_max: int = 580
     instability: float = 0.7
-    guide_strength: float = 0.7
+    guide_strength: float = 0.85
     # How hard the memory latent is pulled back to the guide's per-channel mean
     # and spread each frame. Below about 0.8 the feedback loop drifts.
     memory_match: float = 1.0
@@ -64,10 +71,27 @@ class AppConfig:
     # mid-grey band; around 0.5 holds the mean while letting contrast breathe.
     memory_match_std: float = 0.5
     # Half-width, in latent standard deviations, of the band the memory is held
-    # in around the guide. 0 removes the leash and the walk drifts off the proxy.
-    memory_leash: float = 1.1
-    # How much weaker the proxy pulls at the far plane than up close, 0..1.
+    # in around the guide. 0 removes the leash and the walk drifts off the proxy;
+    # 0.7 measured a little tighter to the proxy than 1.1 without flattening it.
+    memory_leash: float = 0.7
+    # How the proxy's pull varies with distance, -1..1. Positive holds the near
+    # field hardest and lets the horizon hallucinate; negative inverts that;
+    # 0 weights the frame flat. It is worth about 0.03 of conformance on its own
+    # and measures neutral once depth_shade is carrying the depth cue, so it
+    # stays as a per-family look knob rather than a structural one.
     depth_guide: float = 0.5
+    # Luminance ramp baked into the proxy before the encode, -1..1. Positive
+    # makes near geometry bright and the far field dark; negative reverses it;
+    # 0 leaves the render as the shader painted it. Negative wins because the
+    # proxy already fogs distance toward a bright sky, so darkening the near
+    # field deepens a cue the picture is reading rather than fighting it. Past
+    # about -0.8 the foreground goes to silhouette and the look flattens.
+    depth_shade: float = -0.6
+    # One-sided guide-strength wobble amplitude, 0..1. 0 holds the anchor
+    # steady, which is what keeps a wall solid frame to frame; the wobble
+    # measured neutral for conformance and only ever raised the average anchor,
+    # which guide_strength does more legibly.
+    guide_wobble: float = 0.0
     # Short keyframes plus a lively jitter. A slow noise walk let SD-Turbo lock
     # onto whatever object it first read in a noise blob (reliably a gamepad)
     # and hold it for the whole keyframe; refreshing the field every couple of
@@ -145,6 +169,7 @@ class AppConfig:
             "memory_match",
             "memory_match_std",
             "noise_jitter",
+            "guide_wobble",
         ):
             if not 0.0 <= getattr(self, key) <= 1.0:
                 raise RuntimeError(f"{key} must be in [0, 1]")
@@ -157,8 +182,9 @@ class AppConfig:
                 raise RuntimeError(f"{key} must be zero or greater")
         if not 0.0 <= self.memory_leash <= 8.0:
             raise RuntimeError("memory_leash must be in [0, 8]")
-        if not 0.0 <= self.depth_guide <= 1.0:
-            raise RuntimeError("depth_guide must be in [0, 1]")
+        for key in ("depth_guide", "depth_shade"):
+            if not -1.0 <= getattr(self, key) <= 1.0:
+                raise RuntimeError(f"{key} must be in [-1, 1]")
         if not 0.0 <= self.reprojection_strength <= 1.0:
             raise RuntimeError("reprojection_strength must be in [0, 1]")
         if self.reprojection_max_translation <= 0.0:

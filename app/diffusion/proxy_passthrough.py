@@ -34,6 +34,8 @@ class ProxyPassthroughBackend(DiffusionBackend):
         previous_frame: np.ndarray | None = None,
     ) -> np.ndarray:
         started = perf_counter()
+        if conditioning.edges is None:
+            raise ValueError("The proxy diagnostic backend requires edge conditioning")
         source = conditioning.rgb.astype(np.float32)
         edge = conditioning.edges.astype(np.float32)[:, :, None] / 255.0
         # A deliberately obvious diagnostic treatment, not a diffusion substitute.

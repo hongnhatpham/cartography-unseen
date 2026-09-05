@@ -41,12 +41,21 @@ def make_conditioning(
     rgb[:, :, 0] = np.clip(48 + xx * 145 / width + checker * 28, 0, 255)
     rgb[:, :, 1] = np.clip(55 + yy * 135 / height, 0, 255)
     rgb[:, :, 2] = np.clip(155 - checker * 52, 0, 255)
-    depth = np.clip(0.15 + yy / height * 0.8, 0, 1).astype(np.float32)
+    # A real depth buffer with a 0.05 near plane puts every surface past half a
+    # unit inside its top 1%, and the backend's depth path only does work in
+    # that band, so the ramp is built from world distances rather than invented
+    # in buffer space.
+    camera = Camera.create_default()
+    distance = 4.0 + (1.0 - yy / height) * 120.0
+    ndc = ((camera.far + camera.near) - 2.0 * camera.near * camera.far / distance) / (
+        camera.far - camera.near
+    )
+    depth = np.clip((ndc + 1.0) * 0.5, 0.0, 1.0).astype(np.float32)
     edges = np.zeros((height, width), dtype=np.uint8)
     edges[:, 47::48] = 255
     edges[47::48, :] = 255
     return ConditioningFrame(
-        rgb, depth, edges, Camera.create_default().snapshot(), perf_counter(), sequence
+        rgb, depth, edges, camera.snapshot(), perf_counter(), sequence
     )
 
 
@@ -71,8 +80,14 @@ def measure(
     guidance_scale: float,
     warmup: int,
     frames: int,
+    settings: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    """Time one mode/steps combination on an already-loaded backend."""
+    """Time one mode/steps combination on an already-loaded backend.
+
+    ``settings`` is the shipped live-settings block, so a mode is timed with the
+    depth and memory work the app actually does rather than with those paths off.
+    """
+    settings = dict(settings or {})
     width, height = mode
     result: dict[str, object] = {
         "resolution": f"{width}x{height}",
@@ -83,7 +98,7 @@ def measure(
     torch = getattr(backend, "torch", None)
     try:
         backend.set_resolution(width, height)
-        backend.apply_settings({"steps": steps, "guidance_scale": guidance_scale})
+        backend.apply_settings({**settings, "steps": steps, "guidance_scale": guidance_scale})
         if torch is not None and torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
@@ -193,7 +208,13 @@ def main() -> int:
         for mode in modes:
             for steps in args.steps:
                 item = measure(
-                    backend, mode, steps, guidance_scale, args.warmup, args.frames
+                    backend,
+                    mode,
+                    steps,
+                    guidance_scale,
+                    args.warmup,
+                    args.frames,
+                    config.backend_settings(),
                 )
                 payload["results"].append(item)  # type: ignore[union-attr]
                 print(

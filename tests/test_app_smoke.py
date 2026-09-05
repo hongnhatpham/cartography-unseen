@@ -6,6 +6,9 @@ from __future__ import annotations
 from dataclasses import fields
 from pathlib import Path
 
+import numpy as np
+import pytest
+
 from app.config import BACKEND_SETTING_KEYS, RESOLUTION_MODES, AppConfig
 from app.diffusion.latent_walk import SETTING_KEYS, normalise_settings
 from app.main import compose_prompt, load_prompt_library
@@ -63,10 +66,15 @@ def test_every_family_ships_its_own_sampler_regime() -> None:
         assert required <= set(settings), name
         assert set(settings) <= set(BACKEND_SETTING_KEYS), name
         AppConfig(**settings).validate()
-        # The band Hong liked in round 5: below about 600 SD-Turbo redraws the
-        # proxy as blocks, above about 780 the memory lets go and drifts.
-        assert 600 <= settings["timestep_min"] < settings["timestep_max"] <= 780, name
-        assert 0.6 <= settings["guide_strength"] <= 0.8, name
+        # Round 8 moved the whole library down into the conformance band. The
+        # timestep, not the guide strength, is what decides how much of the
+        # proxy's layout survives: at 640-720 only about a sixth of the signal
+        # entering the UNet is the guide, and the measured edge SSIM against the
+        # proxy was 0.09 whatever the guide did. 480-640 doubles it while the
+        # strips still hallucinate rather than redraw the proxy; below about 450
+        # the picture is the proxy repainted.
+        assert 450 <= settings["timestep_min"] < settings["timestep_max"] <= 640, name
+        assert 0.8 <= settings["guide_strength"] <= 0.92, name
 
 
 def test_negative_prompt_names_the_concrete_attractors() -> None:
@@ -92,3 +100,25 @@ def test_shipped_prompts_fit_the_clip_context() -> None:
     # One CLIP token is at most one word or punctuation mark, plus start and end.
     for text in texts:
         assert len(text.replace(",", " , ").split()) + 2 <= 77
+
+
+def test_conformance_metric_separates_a_copy_from_an_unrelated_picture() -> None:
+    """The instrument the round-8 tuning was decided with, checked on both ends.
+
+    Edge SSIM is the term that carries the headline conformance figure, so it has
+    to score a copy of the proxy near 1 and a picture whose structure is
+    somewhere else near 0. Without that the metric could rank a generic
+    hallucination above one that follows the proxy.
+    """
+    from tools.style_sheet import score_pair
+
+    rng = np.random.default_rng(11)
+    proxy = rng.integers(0, 256, (48, 64, 3), dtype=np.uint8)
+    nearness = np.linspace(1.0, 0.0, 48, dtype=np.float32)[:, None] * np.ones((1, 64), np.float32)
+
+    copied = score_pair(nearness, proxy, proxy.copy())
+    shifted = score_pair(nearness, proxy, np.roll(proxy, 9, axis=1))
+
+    assert copied["edge_ssim"] > 0.95
+    assert copied["correlation"] == pytest.approx(copied["proxy_correlation"], abs=1e-6)
+    assert shifted["edge_ssim"] < 0.2

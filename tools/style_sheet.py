@@ -7,9 +7,13 @@ keeps the real backend state (x0 memory, noise walk, prompt walk) so temporal
 continuity is visible.
 
 Family mode walks every style family through one world and lays them out one
-row per family, which is how the library's range is judged. Space-reset mode
-simulates consecutive Space presses (new world, new family, new noise seed),
-one row each, which is how "a reset changes everything" is judged.
+row per family, which is how the library's range is judged. The legacy
+space-reset mode sweeps worlds, families and noise seeds for comparison.
+The live Space key changes only the prompt and preserves the current tuning.
+
+Pairs mode is the conformance instrument: it walks, saves each proxy beside its
+output, and scores how much of the proxy's spatial layout survived into the
+picture (see ``score_pair`` and ``run_pairs``).
 
 Usage:
     runtime/python/python.exe tools/style_sheet.py               # grid + walk + html
@@ -17,12 +21,14 @@ Usage:
     runtime/python/python.exe tools/style_sheet.py --walk        # walk only
     runtime/python/python.exe tools/style_sheet.py --families    # look_families.jpg
     runtime/python/python.exe tools/style_sheet.py --space-resets 8  # space_resets.jpg
+    runtime/python/python.exe tools/style_sheet.py --pairs 24    # conformance.json
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import textwrap
@@ -39,6 +45,7 @@ if str(ROOT) not in sys.path:
 
 from app.config import AppConfig, configure_local_environment
 from app.diffusion.factory import create_backend
+from app.diffusion.latent_walk import FAR_REFERENCE, NEAR_REFERENCE, frame_nearness
 from app.main import (
     RECENT_FAMILY_MEMORY,
     PromptEntry,
@@ -56,6 +63,120 @@ from app.renderer.proxy_renderer import ProxyRenderer
 FONT = ImageFont.load_default()
 TILE_WIDTH = 200
 CAPTION_HEIGHT = 34
+
+# Everything in the conformance metric is measured on this grid. It is coarse on
+# purpose: the question is whether the output puts mass where the proxy put
+# geometry, not whether it reproduces the proxy's pixels.
+METRIC_GRID = (64, 48)
+# One camera placement in the wall test: where it stood, and where it looked.
+Pose = tuple[np.ndarray, float, float]
+# A pose counts as facing a wall when the median distance across the middle of
+# the frame is under this, and as facing open space when it is beyond the other.
+WALL_DISTANCE = 6.0
+OPEN_DISTANCE = 40.0
+# Degrees per second of pitch drift on an offline flight, and the period of the
+# drift. Without it a flight samples one level slice of a volume the player can
+# move through in every direction.
+FLIGHT_PITCH_RATE = 12.0
+FLIGHT_PITCH_SECONDS = 11.0
+
+
+def luminance(rgb: np.ndarray) -> np.ndarray:
+    """Rec.709 luminance of an HxWx3 uint8 image, as float32 in 0..1."""
+    channels = rgb.astype(np.float32)
+    return (
+        channels[:, :, 0] * 0.2126 + channels[:, :, 1] * 0.7152 + channels[:, :, 2] * 0.0722
+    ) / 255.0
+
+
+def resample(values: np.ndarray, size: tuple[int, int] = METRIC_GRID) -> np.ndarray:
+    """Area-average a float map down to the metric grid."""
+    image = Image.fromarray(values.astype(np.float32), mode="F")
+    return np.asarray(image.resize(size, Image.BOX), dtype=np.float32)
+
+
+def gradient_magnitude(values: np.ndarray) -> np.ndarray:
+    """Forward-difference gradient magnitude, same shape as the input."""
+    gx = np.abs(np.diff(values, axis=1, append=values[:, -1:]))
+    gy = np.abs(np.diff(values, axis=0, append=values[-1:, :]))
+    return gx + gy
+
+
+def pearson(left: np.ndarray, right: np.ndarray) -> float:
+    """Pearson correlation of two maps, 0.0 when either one is constant."""
+    a = left.ravel() - left.mean()
+    b = right.ravel() - right.mean()
+    denominator = float(np.sqrt((a * a).sum() * (b * b).sum()))
+    return float((a * b).sum() / denominator) if denominator > 1e-9 else 0.0
+
+
+def _box_mean(values: np.ndarray, radius: int) -> np.ndarray:
+    """Mean over a (2r+1) square window, edge-padded, via an integral image."""
+    padded = np.pad(values, radius, mode="edge")
+    integral = np.pad(padded.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+    span = 2 * radius + 1
+    total = (
+        integral[span:, span:]
+        - integral[:-span, span:]
+        - integral[span:, :-span]
+        + integral[:-span, :-span]
+    )
+    return total / float(span * span)
+
+
+def structural_similarity(left: np.ndarray, right: np.ndarray, radius: int = 3) -> float:
+    """Windowed SSIM of two maps already normalised into 0..1."""
+    c1, c2 = 0.01**2, 0.03**2
+    mu_a, mu_b = _box_mean(left, radius), _box_mean(right, radius)
+    var_a = _box_mean(left * left, radius) - mu_a * mu_a
+    var_b = _box_mean(right * right, radius) - mu_b * mu_b
+    covariance = _box_mean(left * right, radius) - mu_a * mu_b
+    numerator = (2.0 * mu_a * mu_b + c1) * (2.0 * covariance + c2)
+    denominator = (mu_a * mu_a + mu_b * mu_b + c1) * (var_a + var_b + c2)
+    return float(np.mean(numerator / denominator))
+
+
+def _unit(values: np.ndarray) -> np.ndarray:
+    """Scale a non-negative map so its maximum is 1, for a scale-free comparison."""
+    peak = float(values.max())
+    return values / peak if peak > 1e-9 else values
+
+
+def score_pair(nearness: np.ndarray, proxy_rgb: np.ndarray, output_rgb: np.ndarray) -> dict[str, float]:
+    """Conformance of one output to its proxy, on the metric grid.
+
+    ``correlation`` asks how the picture's detail is distributed with distance;
+    ``edge_ssim`` asks whether the picture's edges sit where the proxy's edges
+    sit. ``proxy_correlation`` is the same first figure measured on the proxy
+    itself. Its sign is a property of the world, not a target: in a world whose
+    foreground is large flat faces and whose distance is packed with small forms
+    it is strongly negative. What conformance means is that the output's figure
+    matches the proxy's, so the pair is read as a ratio, not as a raw score.
+    """
+    near = resample(nearness)
+    proxy_edges = _unit(resample(gradient_magnitude(luminance(proxy_rgb))))
+    output_edges = _unit(resample(gradient_magnitude(luminance(output_rgb))))
+    return {
+        "correlation": pearson(near, output_edges),
+        "proxy_correlation": pearson(near, proxy_edges),
+        "edge_ssim": structural_similarity(proxy_edges, output_edges),
+    }
+
+
+def centre_view(values: np.ndarray) -> np.ndarray:
+    """The middle ninth of a frame, where a walker reads wall or opening."""
+    height, width = values.shape[:2]
+    return values[height // 3 : 2 * height // 3, width // 3 : 2 * width // 3]
+
+
+def centre_distance(conditioning) -> float:
+    """Median world distance across the middle of a proxy frame."""
+    near = frame_nearness(conditioning)
+    if near is None:
+        return float("inf")
+    # Invert the log nearness remap back to world units.
+    span = np.log(FAR_REFERENCE / NEAR_REFERENCE)
+    return float(FAR_REFERENCE * np.exp(-span * np.median(centre_view(near))))
 
 
 def parse_args() -> argparse.Namespace:
@@ -86,9 +207,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--families", action="store_true",
                         help="one labelled row per style family into look_families.jpg")
     parser.add_argument("--space-resets", type=int, metavar="N",
-                        help="N simulated Space presses, one row each, into space_resets.jpg")
+                        help="Legacy world/style sweep with N rows, into space_resets.jpg")
     parser.add_argument("--reset-frames", type=int, default=64,
                         help="frames walked after each simulated Space press")
+    parser.add_argument("--pairs", type=int, metavar="N",
+                        help="N proxy/output pairs plus the wall test into conformance.json")
+    parser.add_argument("--wall-poses", type=int, default=6,
+                        help="poses per half of the wall test")
     return parser.parse_args()
 
 
@@ -230,7 +355,6 @@ def run_grid(args: argparse.Namespace, config: AppConfig, out_dir: Path) -> dict
             for seed in seeds:
                 renderer.randomize_world(seed)
                 renderer.spawn_camera(camera)
-                renderer.constrain_camera(camera, None)
                 conditioning = renderer.render_proxy(camera, perf_counter())
                 label = renderer.world_label()
                 Image.fromarray(conditioning.rgb, mode="RGB").save(
@@ -359,17 +483,16 @@ def run_walk(args: argparse.Namespace, config: AppConfig, out_dir: Path) -> dict
             effective_prompt = compose_prompt(entry.prompt, label)
             backend.set_prompt(effective_prompt, negative)
             for step in range(args.walk_frames):
-                before = camera.position.copy()
-                camera.walk(0.0, 1.0, args.walk_speed)
-                renderer.constrain_camera(camera, 1.0 / max(args.walk_clock_fps, 1.0))
-                # A person turns when a block stops them; the walk does the same.
-                if float(np.linalg.norm((camera.position - before)[[0, 2]])) < args.walk_speed * 0.4:
-                    open_yaw, distance = renderer.open_heading(camera)
-                    if distance > 0.0:
-                        camera.yaw = open_yaw
                 # The renderer animates on the clock it is handed, so the frame
                 # clock has to drive it too or the walk is not reproducible.
                 now = clock() if clock is not None else perf_counter()
+                step_flier(
+                    renderer,
+                    camera,
+                    args.walk_speed,
+                    1.0 / max(args.walk_clock_fps, 1.0),
+                    now,
+                )
                 conditioning = renderer.render_proxy(camera, now)
                 output = backend.generate(conditioning)
                 image = Image.fromarray(output, mode="RGB")
@@ -406,6 +529,265 @@ def run_walk(args: argparse.Namespace, config: AppConfig, out_dir: Path) -> dict
     print(
         f"Walk: {len(images)} frames, mean |delta| {report['mean_abs_diff']:.1f}/255, "
         f"{report['seconds']:.1f} s"
+    )
+    return report
+
+
+def step_flier(
+    renderer: ProxyRenderer, camera: Camera, speed: float, dt: float, elapsed: float = 0.0
+) -> None:
+    """One flight step with the app's stuck-turn: blocked fliers turn, they do not grind.
+
+    Movement follows the full look direction, and the pitch drifts slowly so an
+    offline flight climbs and dives through the volume instead of tracing one
+    level slice of it.
+    """
+    camera.pitch = float(
+        np.clip(
+            camera.pitch
+            + FLIGHT_PITCH_RATE * dt * math.sin(2.0 * math.pi * elapsed / FLIGHT_PITCH_SECONDS),
+            -50.0,
+            50.0,
+        )
+    )
+    before = camera.position.copy()
+    camera.fly(0.0, 0.0, 1.0, speed)
+    renderer.constrain_camera(camera)
+    if float(np.linalg.norm(camera.position - before)) < speed * 0.4:
+        open_yaw, open_pitch, distance = renderer.open_heading(camera)
+        if distance > 0.0:
+            camera.yaw, camera.pitch = open_yaw, open_pitch
+
+
+def side_by_side(proxy: np.ndarray, output: np.ndarray) -> Image.Image:
+    """One proxy/output pair as a single tile, proxy on the left."""
+    left = Image.fromarray(proxy, mode="RGB")
+    right = Image.fromarray(output, mode="RGB").resize(left.size)
+    tile = Image.new("RGB", (left.width * 2 + 4, left.height), (12, 12, 14))
+    tile.paste(left, (0, 0))
+    tile.paste(right, (left.width + 4, 0))
+    return tile
+
+
+def find_wall_and_open_poses(
+    renderer: ProxyRenderer, camera: Camera, count: int, clock: FrameClock
+) -> tuple[list[Pose], list[Pose]]:
+    """Poses whose centre faces a near form, and poses facing open space.
+
+    Sweeps the sphere at the current spot, flies on toward the longest opening
+    when a spot cannot supply both halves, and returns the closest and the most
+    open poses found. Each pose carries the position it was measured at, because
+    the search moves: a bare heading replayed from somewhere else is a different
+    view. Pitch is swept as well as yaw, so the search still finds both halves in
+    a world with no ground plane.
+    """
+    walls: list[tuple[float, Pose]] = []
+    opens: list[tuple[float, Pose]] = []
+    for _ in range(8):
+        origin = camera.position.copy()
+        for yaw in np.arange(0.0, 360.0, 15.0):
+            for pitch in (-25.0, 0.0, 25.0):
+                camera.position[:] = origin
+                camera.yaw, camera.pitch = float(yaw), pitch
+                distance = centre_distance(renderer.render_proxy(camera, clock()))
+                pose = (origin.copy(), float(yaw), pitch)
+                if distance <= WALL_DISTANCE:
+                    walls.append((distance, pose))
+                elif distance >= OPEN_DISTANCE:
+                    opens.append((distance, pose))
+        if len(walls) >= count and len(opens) >= count:
+            break
+        camera.position[:] = origin
+        # Far enough to reach a different pocket: a single step lands inside the
+        # same one and re-measures the same headings.
+        for _ in range(6):
+            step_flier(renderer, camera, 12.0, 0.1)
+    walls.sort(key=lambda item: item[0])
+    opens.sort(key=lambda item: -item[0])
+    return [pose for _, pose in walls[:count]], [pose for _, pose in opens[:count]]
+
+
+def _half_summary(rows: list[dict[str, float]], key: str) -> float:
+    return float(np.mean([row[key] for row in rows])) if rows else 0.0
+
+
+def run_wall_test(
+    renderer: ProxyRenderer,
+    backend: object,
+    camera: Camera,
+    clock: FrameClock,
+    count: int,
+    out_dir: Path,
+) -> dict[str, object]:
+    """Alternate facing a near form and facing open space, and compare the outputs.
+
+    The two halves are interleaved so the memory latent sees the same history a
+    player's would. What matters is not the absolute figures but how much of the
+    proxy's own separation between the halves survives into the picture: that is
+    the ``*_transfer`` ratio, 1.0 meaning the output separates wall from opening
+    exactly as strongly as the proxy does.
+    """
+    walls, opens = find_wall_and_open_poses(renderer, camera, count, clock)
+    halves: dict[str, list[dict[str, float]]] = {"wall": [], "open": []}
+    if not walls or not opens:
+        print(f"  wall test: only {len(walls)} wall and {len(opens)} open poses found")
+    tiles: list[tuple[str, list[Image.Image]]] = []
+    for index in range(max(len(walls), len(opens))):
+        row: list[Image.Image] = []
+        for name, poses in (("wall", walls), ("open", opens)):
+            if index >= len(poses):
+                continue
+            camera.position[:], camera.yaw, camera.pitch = poses[index]
+            conditioning = renderer.render_proxy(camera, clock())
+            output = backend.generate(conditioning)
+            clock.tick()
+            halves[name].append(
+                {
+                    "distance": centre_distance(conditioning),
+                    "proxy_luma": float(centre_view(luminance(conditioning.rgb)).mean()),
+                    "proxy_edges": float(
+                        centre_view(gradient_magnitude(luminance(conditioning.rgb))).mean()
+                    ),
+                    "output_luma": float(centre_view(luminance(output)).mean()),
+                    "output_edges": float(
+                        centre_view(gradient_magnitude(luminance(output))).mean()
+                    ),
+                }
+            )
+            row.append(caption_tile(side_by_side(conditioning.rgb, output), [name]))
+        if row:
+            tiles.append((f"pose {index + 1}", row))
+    compose_sheet(tiles, "Wall test - proxy | output, near form vs open space", out_dir / "wall_test.jpg")
+
+    result: dict[str, object] = {"wall_poses": len(halves["wall"]), "open_poses": len(halves["open"])}
+    for name, rows in halves.items():
+        for key in ("distance", "proxy_luma", "proxy_edges", "output_luma", "output_edges"):
+            result[f"{name}_{key}"] = _half_summary(rows, key)
+    complete = bool(halves["wall"]) and bool(halves["open"])
+    transfers: list[float] = []
+    for key in ("luma", "edges"):
+        proxy_delta = float(result[f"wall_proxy_{key}"]) - float(result[f"open_proxy_{key}"])
+        output_delta = float(result[f"wall_output_{key}"]) - float(result[f"open_output_{key}"])
+        transfer = (
+            output_delta / proxy_delta if complete and abs(proxy_delta) > 1e-6 else 0.0
+        )
+        result[f"{key}_delta_proxy"] = proxy_delta
+        result[f"{key}_delta_output"] = output_delta
+        result[f"{key}_transfer"] = transfer
+        transfers.append(transfer)
+    result["transfer"] = float(np.mean(transfers))
+    # Both halves have to exist and the picture has to move the same way the
+    # proxy does on both measures, or a walker cannot tell a wall from a gap.
+    result["separated"] = complete and all(value > 0.25 for value in transfers)
+    return result
+
+
+def run_pairs(args: argparse.Namespace, config: AppConfig, out_dir: Path) -> dict[str, object]:
+    """Walk, save every proxy beside its output, and score the conformance.
+
+    Writes ``proxy_vs_out.jpg`` (proxy left, output right) and
+    ``conformance.json``. The headline ``conformance`` figure is half edge SSIM
+    against the proxy and half the wall test's transfer ratio, both clipped into
+    0..1. A proxy passthrough scores about 0.98.
+
+    The depth/detail correlation is reported but deliberately kept out of the
+    headline: it is a first-order statistic that any generic depth vignette
+    satisfies. The round-7 settings paint the same blue tunnel over every proxy
+    - a bright vanishing point with dark detailed sides - and score 0.87 on the
+    correlation while their edges land on the proxy's at 0.048. Edge SSIM and
+    the wall test were the two figures that moved with what the strips showed.
+    """
+    frames = max(1, args.pairs)
+    entry = walk_prompt(args)
+    negative = config.negative_prompt if args.negative is None else args.negative
+    world_seed = config.world_seed if args.seed is None else args.seed
+    clock = FrameClock(args.walk_clock_fps if args.walk_clock_fps > 0 else 10.0)
+
+    renderer = ProxyRenderer(
+        ROOT,
+        config.diffusion_size,
+        fullscreen=False,
+        window_size=config.diffusion_size,
+        world_seed=world_seed,
+    )
+    scores: list[dict[str, float]] = []
+    tiles: list[Image.Image] = []
+    started = perf_counter()
+    try:
+        backend = create_backend(config.backend)
+        backend.load(config.backend_dict(ROOT))
+        try:
+            backend.apply_settings(config.backend_settings())
+            backend.reseed(config.seed)
+            if hasattr(backend, "set_clock"):
+                backend.set_clock(clock)
+            camera = Camera.create_default()
+            renderer.spawn_camera(camera)
+            label = renderer.world_label()
+            backend.set_prompt(compose_prompt(entry.prompt, label), negative)
+            for _ in range(frames):
+                step_flier(
+                    renderer,
+                    camera,
+                    args.walk_speed,
+                    1.0 / max(args.walk_clock_fps, 1.0),
+                    clock(),
+                )
+                conditioning = renderer.render_proxy(camera, clock())
+                output = backend.generate(conditioning)
+                clock.tick()
+                nearness = frame_nearness(conditioning)
+                if nearness is not None:
+                    scores.append(score_pair(nearness, conditioning.rgb, output))
+                tiles.append(side_by_side(conditioning.rgb, output))
+            wall = run_wall_test(renderer, backend, camera, clock, args.wall_poses, out_dir)
+        finally:
+            backend.unload()
+    finally:
+        renderer.close()
+
+    columns = 4
+    rows = (len(tiles) + columns - 1) // columns
+    width = TILE_WIDTH * 2
+    height = round(width * tiles[0].height / tiles[0].width)
+    sheet = Image.new("RGB", (columns * width, rows * height), (12, 12, 14))
+    for index, tile in enumerate(tiles):
+        sheet.paste(
+            tile.resize((width, height)),
+            ((index % columns) * width, (index // columns) * height),
+        )
+    sheet.save(out_dir / "proxy_vs_out.jpg", quality=90)
+
+    averages = {
+        key: float(np.mean([score[key] for score in scores])) if scores else 0.0
+        for key in ("correlation", "proxy_correlation", "edge_ssim")
+    }
+    reference = averages["proxy_correlation"]
+    averages["correlation_transfer"] = (
+        averages["correlation"] / reference if abs(reference) > 0.05 else 0.0
+    )
+    conformance = 0.5 * min(max(averages["edge_ssim"], 0.0), 1.0) + 0.5 * min(
+        max(float(wall["transfer"]), 0.0), 1.0
+    )
+    report = {
+        "prompt_name": entry.family,
+        "prompt_text": compose_prompt(entry.prompt, label),
+        "world_seed": world_seed,
+        "world_label": label,
+        "frames": len(scores),
+        "walk_speed": args.walk_speed,
+        "conformance": conformance,
+        **averages,
+        "wall_test": wall,
+        "seconds": perf_counter() - started,
+        **config.backend_settings(),
+    }
+    (out_dir / "conformance.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(
+        f"Pairs: conformance {conformance:.3f} "
+        f"(corr {averages['correlation']:.3f} of {averages['proxy_correlation']:.3f} "
+        f"= {averages['correlation_transfer']:.3f}, ssim {averages['edge_ssim']:.3f}, "
+        f"wall transfer {wall['transfer']:.3f}, separated {wall['separated']})"
     )
     return report
 
@@ -452,8 +834,13 @@ def run_families(args: argparse.Namespace, config: AppConfig, out_dir: Path) -> 
                 renderer.spawn_camera(camera)
                 frames: list[Image.Image] = []
                 for _ in range(args.family_frames):
-                    camera.walk(0.0, 1.0, args.walk_speed)
-                    renderer.constrain_camera(camera, 1.0 / max(args.walk_clock_fps, 1.0))
+                    step_flier(
+                        renderer,
+                        camera,
+                        args.walk_speed,
+                        1.0 / max(args.walk_clock_fps, 1.0),
+                        clock(),
+                    )
                     frames.append(
                         Image.fromarray(
                             backend.generate(renderer.render_proxy(camera, clock())), mode="RGB"
@@ -483,23 +870,10 @@ def run_families(args: argparse.Namespace, config: AppConfig, out_dir: Path) -> 
     return {"families": len(rows), "seconds": elapsed}
 
 
-def step_walker(
-    renderer: ProxyRenderer, camera: Camera, speed: float, dt: float
-) -> None:
-    """One walk step with the app's stuck-turn: blocked walkers turn, they do not grind."""
-    before = camera.position.copy()
-    camera.walk(0.0, 1.0, speed)
-    renderer.constrain_camera(camera, dt)
-    if float(np.linalg.norm((camera.position - before)[[0, 2]])) < speed * 0.4:
-        open_yaw, distance = renderer.open_heading(camera)
-        if distance > 0.0:
-            camera.yaw = open_yaw
-
-
 def run_space_resets(
     args: argparse.Namespace, config: AppConfig, out_dir: Path
 ) -> dict[str, object]:
-    """One row per simulated Space press, to judge whether a reset changes everything.
+    """Legacy sweep of worlds, families and noise seeds, one row per combination.
 
     Mirrors the Space handler in ``app.main``: a new world seed, a new diffusion
     noise seed (which drops the memory latent and the noise walk), and a family
@@ -551,7 +925,7 @@ def run_space_resets(
                 backend.set_prompt(effective, config.negative_prompt)
                 frames: list[Image.Image] = []
                 for _ in range(args.reset_frames):
-                    step_walker(renderer, camera, args.walk_speed, 1.0 / clock_fps)
+                    step_flier(renderer, camera, args.walk_speed, 1.0 / clock_fps, clock())
                     frames.append(
                         Image.fromarray(
                             backend.generate(renderer.render_proxy(camera, clock())), mode="RGB"
@@ -582,7 +956,7 @@ def run_space_resets(
         renderer.close()
     compose_sheet(
         rows,
-        f"Space resets - {presses} presses, {config.resolution_label}, "
+        f"World/style sweep - {presses} worlds, {config.resolution_label}, "
         f"{args.reset_frames} frames each, every {stride}th shown",
         out_dir / "space_resets.jpg",
     )
@@ -590,7 +964,7 @@ def run_space_resets(
         json.dumps({"presses": report}, indent=2), encoding="utf-8"
     )
     elapsed = perf_counter() - started
-    print(f"Space resets: {len(rows)} rows in {elapsed:.1f} s")
+    print(f"World/style sweep: {len(rows)} rows in {elapsed:.1f} s")
     return {"presses": len(rows), "seconds": elapsed}
 
 
@@ -650,6 +1024,9 @@ def build_html(out_dir: Path) -> None:
             "memory_match",
             "memory_match_std",
             "memory_leash",
+            "depth_guide",
+            "depth_shade",
+            "guide_wobble",
             "noise_walk_seconds",
             "noise_jitter",
             "prompt_walk_seconds",
@@ -670,7 +1047,7 @@ def main() -> int:
     # The family's own settings come first so an explicit --set still wins.
     # Space-reset mode applies each row's family settings itself, so the base
     # config must stay as shipped.
-    if args.walk or not (args.grid or args.families or args.space_resets):
+    if args.walk or args.pairs or not (args.grid or args.families or args.space_resets):
         for key, value in walk_prompt(args).settings.items():
             setattr(config, key, value)
     overrides = apply_overrides(config, args.set)
@@ -678,7 +1055,10 @@ def main() -> int:
         print(f"Overrides: {overrides}")
     out_dir = args.out
     out_dir.mkdir(parents=True, exist_ok=True)
-    run_both = not (args.grid or args.walk or args.families or args.space_resets)
+    run_both = not (args.grid or args.walk or args.families or args.space_resets or args.pairs)
+    if args.pairs:
+        run_pairs(args, config, out_dir)
+        return 0
     if args.space_resets:
         run_space_resets(args, config, out_dir)
         return 0

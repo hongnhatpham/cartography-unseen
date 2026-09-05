@@ -1,158 +1,118 @@
-"""Procedural chaotic landscape streamed as instanced cubes.
+"""Volumetric field of forms streamed as instanced cubes.
 
-One world seed picks a palette and a roster of biomes; a low-frequency biome
-field decides which generators add forms to each patch of ground and blends
-neighbours at the borders, so flying a few hundred units crosses into a
-different landscape. Everything is a deterministic function of (chunk, seed).
+There is no ground and no gravity. Space is an endless field of cubic cells; every
+cell face is either an opening or a wall built from a few thick panels, and
+every cell interior may carry one biome's vocabulary - drifting reefs, lattice
+bars, tilted shards, monolith columns, giant overhangs. A flier moves along the
+full look direction and can climb or dive as freely as it turns.
 
-The landform carries the drama. Quantised terraces over a carved ravine network
-give more than 100 units of relief across a short flight, and every ground cube
-is a column sized to the drop onto its neighbours, so cliff faces are solid and
-the silhouette and horizon keep changing instead of reading as one level field
-of debris. Ground is emitted once per chunk, not once per biome, so blend zones
-stay solid; a biome's identity is the forms it stacks on top.
+The cell shell is what makes the volume legible. A wall is a real barrier, an
+opening is a real gap a cell wide. ``legibility`` measures the balance of near
+surfaces and long clear headings. Connectivity comes from a 3D channel field:
+ridge surfaces of value noise force the faces they touch open, so the open
+space is one connected sheet network instead of a lattice of sealed rooms;
+``walkable_components`` floods an 8-unit grid to check it.
 
-The walker must never have to retrace. Terraces are separated by walls, so
-every level change happens on a pass corridor, and the corridors are ridge
-lines of two value-noise fields at different scales: ridge lines branch and
-meet, so the network is connected by construction and reaches every terrace.
-Ravine floors are corridors as well, un-terraced along the channel and opened
-at the crossings where a corridor widens their mouth. Standing forms are then
-thinned so each keeps a walkable gap from its neighbours and none stands on a
-deep ravine floor. ``walkable_components`` measures the result: it floods an
-8-unit grid over the streamed window exactly as the walker moves, and the tests
-hold every seed above 90 per cent reachable with under 3 per cent pockets.
+Everything is a deterministic function of (cell, seed), so chunks generate
+independently and in any order. A bounded 3D window follows the camera on every
+axis. Interior groups thin along open channels while panels retain the sense
+of enclosure. There is no ceiling, floor or altitude clamp.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from colorsys import hsv_to_rgb
 from dataclasses import dataclass, replace
 from functools import lru_cache
-from math import atan2, cos, degrees, floor, radians, sin, sqrt
+from math import cos, floor, radians, sin, sqrt
 from random import Random
 from typing import Callable, Iterable, Literal, TypeAlias
 
 import numpy as np
 
-ChunkCoord: TypeAlias = tuple[int, int]
+ChunkCoord: TypeAlias = tuple[int, int, int]
+Cell: TypeAlias = tuple[int, int, int]
 Vec3: TypeAlias = tuple[float, float, float]
 Color: TypeAlias = tuple[float, float, float]
-Role: TypeAlias = Literal["ground", "form"]
-HeightGrid: TypeAlias = dict[tuple[int, int], float]
+Role: TypeAlias = Literal["panel", "mass"]
 
 CHUNK_SIZE = 64.0
 ACTIVE_CHUNK_RADIUS = 5
-MAX_ACTIVE_CHUNKS = (ACTIVE_CHUNK_RADIUS * 2 + 1) ** 2
+MAX_ACTIVE_CHUNKS = (ACTIVE_CHUNK_RADIUS * 2 + 1) ** 3
 MAX_OBJECTS_PER_CHUNK = 512
-# Standing blocks per chunk shared by every biome; roughly one per 60 square
-# units, so a walker always has forms within a few steps on every side.
-FIELD_BLOCKS_PER_CHUNK = 46
-# Skyline giants: a few very tall, wide monoliths per chunk so the horizon is
-# a jagged silhouette from anywhere at eye level. Without them a flat horizon
-# under a pale sky reads as a lobby with a window wall.
-SKYLINE_PER_CHUNK = 2
 
-# Ground grid shared by every biome in a chunk: 8-unit cells plus a one-cell
-# margin, so a column can be sized against neighbours across a chunk border.
-GRID_DIVISIONS = 8
-GRID_CELL = CHUNK_SIZE / GRID_DIVISIONS
-GROUND_MIN_DEPTH = 16.0
-# Ground checker tones, before the ravine falloff and the per-cell jitter. The
-# spread is wide on purpose: a floor inside one narrow pale band reads as a
-# tabletop to the sampler.
-GROUND_TONE_LIGHT = 0.92
-GROUND_TONE_DARK = 0.34
-
-# One biome cell is four chunks across, so a 200-400 unit flight crosses a
-# border and the blend band is roughly half a cell wide.
-BIOME_CELL = 256.0
-BIOME_NAMES: tuple[str, ...] = ("strata", "shards", "canyons", "voxels", "monoliths")
-BIOMES_PER_WORLD = 3
-MIN_BIOME_WEIGHT = 0.06
-
-# Walker height. The eye follows the terrain sampled a short ring ahead, so a
-# terrace riser starts lifting the walker before the wall is reached, and the
-# climb is rate-limited in world units per second so a 16-unit step reads as a
-# half-second rise rather than a cut. The hard floor below the eye is what
-# keeps the camera out of the ground columns during a sprint.
-EYE_HEIGHT = 2.2
-# Ground changes taller than this between two footfalls are walls, not steps,
-# and so is any grade steeper than MAX_SLOPE (rise per unit of horizontal
-# travel), which is what keeps a tiny per-frame step off a near-cliff ramp.
-STEP_MAX = 4.5
-MAX_SLOPE = 1.2
-# Shortest run the grade test is applied over.
-STEP_RUN = 3.0
-# Radius of the ring the eye height is averaged over, so 8-unit ground cells
-# on a slope read as a ramp rather than a staircase.
-EYE_SMOOTH_RADIUS = 5.0
-CLIMB_RATE = 14.0
-# Walker body radius for collision against standing forms, and the share of a
-# push that is redirected along the face so head-on contact slides.
-WALKER_RADIUS = 0.8
+# One volume cell. Chambers this wide read as a room's worth of open space at
+# flight speed while still putting a surface within a couple of body lengths of
+# almost every point, which is what the legibility statistic measures.
+VOLUME_CELL = 32.0
+CELLS_PER_CHUNK = int(CHUNK_SIZE / VOLUME_CELL)
+# Initial positions sample a familiar region; this never limits flight.
+SPAWN_HEIGHT_RANGE = 90.0
+# The longest clear line out of a spawn pocket is often straight up or straight
+# down; the flier is free to take it, but opening on a frame of ceiling reads as
+# a mistake, so the spawn only considers headings inside this band.
+SPAWN_PITCH_LIMIT = 30.0
+# Body radius used for collision and for the volumetric probe. Wide on purpose:
+# at 82 degrees of field of view a panel one unit from the eye is the whole
+# frame, so the body has to hold the camera a couple of metres off every
+# surface for the proxy to keep showing a space rather than a texture.
+WALKER_RADIUS = 2.2
 SLIDE_NUDGE = 0.35
-# Standing forms must leave a walkable gap: no form whose body spans the
-# walker's eye line may come this close to another, measured between
-# footprint circles and after the walker's own width, and none may stand on a
-# ravine floor, where the channel is only a few cells wide.
-MIN_FORM_GAP = 3.0
-FORM_FREE_RAVINE = 28.0
-# How far the ground around a standing form has to stay walkable for the
-# form to be kept, so forms never wedge a gap shut against a riser.
-FORM_CLEAR_REACH = 6.0
 
 _MASK_64 = (1 << 64) - 1
-_TERRAIN_SALT = 0x7E44A1
 _BIOME_SALT = 0xB10E5
 _OBJECT_COLOR_SALT = 0xC01045
 _ACCENT_SALT = 0xACCE27
 _SKY_COLOR_SALT = 0x5A7C010
 _SPAWN_SALT = 0x5AA17
-_GROUND_SALT = 0x6120D
+_FACE_SALT = 0xFACE05
+_PANEL_SALT = 0x9A4E1
+_INTERIOR_SALT = 0xE73A5
+_CHANNEL_SALT = 0xC4A77E
+_LEGIBLE_SALT = 0x1E6187
 
-# Landform scales. Three smooth octaves plus the ravine cut are summed and then
-# quantised once: quantising the sum is what produces terraces several ground
-# cells wide with a 16-unit riser between them, instead of the per-cell stepping
-# that quantising each octave separately gives.
-_MACRO_CELL, _MACRO_AMPLITUDE = 560.0, 132.0
-_MID_CELL, _MID_AMPLITUDE = 250.0, 52.0
-_FINE_CELL, _FINE_AMPLITUDE = 110.0, 6.0
-_TERRACE_STEP = 24.0
-_RAVINE_CELL, _RAVINE_DEPTH, _RAVINE_EDGE = 160.0, 60.0, 0.70
-# How deep the cut has to get before the floor counts as a corridor, and how
-# far a pass corridor widens the ravine mouth and shallows the cut where it
-# crosses, which is the only way in or out of a channel.
-_RAVINE_FLOOR_SHARE = 0.55
-_RAVINE_MOUTH, _RAVINE_CORRIDOR_DEPTH = 0.50, 0.40
-# Pass corridors: ridge lines of two value-noise fields at different scales,
-# where the terraces give way to the smooth landform and the ravine cut fades,
-# so a walker can change level on a slope. Everywhere else a terrace riser is a
-# cliff and a wall. Ridge lines are continuous curves that branch and meet, so
-# each field is a connected network and the two crossed are a mesh; an isoline band of one field gave closed rings that
-# never reached each other.
-_PASS_CELLS = (340.0, 220.0, 150.0)
-_PASS_EDGE, _PASS_PEAK = 0.64, 0.86
+# Share of cell faces that are open before the channel field is added. Vertical
+# travel is deliberately freer than horizontal: the point of the volume is that
+# up and down are directions, not a fall.
+_FACE_OPEN_SIDE = 0.44
+_FACE_OPEN_UPDOWN = 0.58
+_FACE_OPEN_CHANNEL = 0.52
+# Channel field: ridge surfaces of 3D value noise at two scales. Where they peak
+# every face opens, so the open space is a connected sheet network.
+_CHANNEL_CELLS = (280.0, 150.0)
+_CHANNEL_EDGE, _CHANNEL_PEAK = 0.72, 0.93
+
+# One biome cell is a few chunks across, so a couple of hundred units of flight
+# crosses a border.
+BIOME_CELL = 256.0
+BIOME_NAMES: tuple[str, ...] = ("reefs", "lattice", "shards", "columns", "overhangs")
+BIOMES_PER_WORLD = 3
+MIN_BIOME_WEIGHT = 0.06
+# Share of cells left empty, which is what keeps the chambers flyable.
+_EMPTY_CELL_SHARE = 0.30
 
 _HUE_OFFSETS = (0.17, 0.33, 0.5)
 _LEGIBILITY_MARGIN = 0.25
-_ROLE_HUE_SLOT: dict[str, int] = {"ground": 0, "form": 1}
-# Base values before shading and tone; the banded key light in proxy.frag
-# drops away-facing sides to roughly a sixth of these.
+_ROLE_HUE_SLOT: dict[str, int] = {"panel": 0, "mass": 1}
+# Base values before shading and tone; the banded key light in proxy.frag drops
+# away-facing sides to roughly a quarter of these.
 _ROLE_VALUE_RANGE: dict[str, tuple[float, float]] = {
-    "ground": (0.62, 0.90),
-    "form": (0.70, 0.96),
+    "panel": (0.62, 0.90),
+    "mass": (0.70, 0.96),
 }
-# The accent is a low-frequency ridge field, not a per-cube coin flip, so a
-# whole terrace or ravine floor takes the hue and it survives diffusion at
-# 512x384. The ridge form is used because plain thresholded noise swings from
-# 5% to 68% coverage between seeds, which floods some worlds entirely.
-_ACCENT_CELL = 110.0
-_ACCENT_THRESHOLD = 0.86
+# The accent is a low-frequency 3D ridge field, not a per-cube coin flip, so a
+# whole wall or reef takes the hue and it survives diffusion at 512x384.
+_ACCENT_CELL = 120.0
+_ACCENT_THRESHOLD = 0.94
 _NEUTRAL_SATURATION = (0.04, 0.13)
-_ACCENT_SATURATION = (0.74, 0.96)
+_ACCENT_SATURATION = (0.62, 0.88)
 _ACCENT_VALUE = (0.60, 0.92)
 _MIN_TONE = 0.10
+# Panel tone checker: neighbouring walls alternate light and dark, so a frame
+# filled by the shell still carries a value break instead of one flat band.
+_TONE_LIGHT = 0.94
+_TONE_DARK = 0.42
 _HUE_NAMES = (
     (0.04, "red"), (0.10, "amber"), (0.19, "lime"), (0.42, "green"),
     (0.53, "cyan"), (0.66, "cobalt"), (0.79, "violet"), (0.92, "magenta"),
@@ -164,8 +124,8 @@ _HUE_NAMES = (
 class WorldCube:
     """Renderer-neutral cube using the renderer's half-extent convention.
 
-    ``tone`` scales the colour value down; ravine floors and column bodies use
-    it to put true blacks next to the pale slabs.
+    ``tone`` scales the colour value down, which is what puts true blacks next
+    to the pale panels.
     """
 
     role: Role
@@ -216,167 +176,92 @@ def _smoothstep(t: float) -> float:
     return t * t * (3.0 - 2.0 * t)
 
 
-@lru_cache(maxsize=8192)
-def _lattice(world_seed: int, salt: int, ix: int, iz: int) -> float:
-    """Cached noise value at one lattice corner; chunks reuse corners heavily."""
+@lru_cache(maxsize=1 << 17)
+def _lattice(world_seed: int, salt: int, ix: int, iy: int, iz: int) -> float:
+    """Cached noise value at one lattice corner; neighbours reuse corners heavily."""
 
-    return _unit_float(world_seed, salt, ix, iz)
-
-
-def _value_noise(x: float, z: float, cell: float, world_seed: int, salt: int) -> float:
-    """Smooth lattice noise in [0, 1), continuous in x and z."""
-
-    fx, fz = x / cell, z / cell
-    ix, iz = floor(fx), floor(fz)
-    tx, tz = _smoothstep(fx - ix), _smoothstep(fz - iz)
-    c00 = _lattice(world_seed, salt, ix, iz)
-    c10 = _lattice(world_seed, salt, ix + 1, iz)
-    c01 = _lattice(world_seed, salt, ix, iz + 1)
-    c11 = _lattice(world_seed, salt, ix + 1, iz + 1)
-    low = c00 + (c10 - c00) * tx
-    high = c01 + (c11 - c01) * tx
-    return low + (high - low) * tz
+    return _unit_float(world_seed, salt, ix, iy, iz)
 
 
-def _ridge(x: float, z: float, cell: float, world_seed: int, salt: int) -> float:
-    """Ridged variant of the value noise, in [0, 1], peaking on ridge lines."""
+def value_noise(
+    x: float, y: float, z: float, cell: float, world_seed: int, salt: int
+) -> float:
+    """Smooth trilinear lattice noise in [0, 1), continuous in x, y and z."""
 
-    return 1.0 - abs(2.0 * _value_noise(x, z, cell, world_seed, salt) - 1.0)
-
-
-def ravine_depth(x: float, z: float, world_seed: int) -> float:
-    """How far the ravine network cuts below the plateau here; 0 on the plateau.
-
-    Ridge lines of the noise are the channel centres, so the ravines form a
-    connected branching network rather than isolated pits. Where a pass
-    corridor crosses, the mouth widens and the cut shallows, so the wall
-    becomes a ramp: the floors are connected to each other by construction but
-    without a mouth they are sealed off from the plateau, which was the single
-    largest source of unreachable ground.
-    """
-
-    return _ravine_cut(x, z, world_seed, pass_weight(x, z, world_seed))
-
-
-def _ravine_cut(x: float, z: float, world_seed: int, passing: float) -> float:
-    """The ravine cut for an already-computed corridor weight.
-
-    ``terrain_height`` needs both fields at the same point, and the corridor
-    weight is three ridge lookups, so it is computed once and shared.
-    """
-
-    channel = _ridge(x, z, _RAVINE_CELL, world_seed, _TERRAIN_SALT + 4)
-    edge = _RAVINE_EDGE - _RAVINE_MOUTH * passing
-    t = (channel - edge) / (1.0 - edge)
-    if t <= 0.0:
-        return 0.0
-    depth = _RAVINE_DEPTH * (1.0 - (1.0 - _RAVINE_CORRIDOR_DEPTH) * passing)
-    return depth * _smoothstep(min(t, 1.0))
+    fx, fy, fz = x / cell, y / cell, z / cell
+    ix, iy, iz = floor(fx), floor(fy), floor(fz)
+    tx, ty, tz = _smoothstep(fx - ix), _smoothstep(fy - iy), _smoothstep(fz - iz)
+    plane = []
+    for dz in (0, 1):
+        row = []
+        for dy in (0, 1):
+            low = _lattice(world_seed, salt, ix, iy + dy, iz + dz)
+            high = _lattice(world_seed, salt, ix + 1, iy + dy, iz + dz)
+            row.append(low + (high - low) * tx)
+        plane.append(row[0] + (row[1] - row[0]) * ty)
+    return plane[0] + (plane[1] - plane[0]) * tz
 
 
-def pass_weight(x: float, z: float, world_seed: int) -> float:
-    """1 inside a pass corridor, 0 on the terraces, smooth in between.
+def ridge(x: float, y: float, z: float, cell: float, world_seed: int, salt: int) -> float:
+    """Ridged variant of the value noise, in [0, 1], peaking on ridge surfaces."""
 
-    The union of ridge networks at several scales, so corridors branch and
-    cross instead of forming isolated bands. ``_PASS_EDGE`` sets how much of
-    the world a corridor touches and ``_PASS_PEAK`` how quickly the weight
-    saturates, so the corridor has a fully smooth interior with the blend
-    confined to its walls. A corridor that only reached weight 1 on the ridge
-    line itself was a wall along its whole length.
+    return 1.0 - abs(2.0 * value_noise(x, y, z, cell, world_seed, salt) - 1.0)
+
+
+def channel_weight(x: float, y: float, z: float, world_seed: int) -> float:
+    """1 inside an open channel, 0 in the plain cell shell, smooth in between.
+
+    Ridge surfaces of 3D value noise at two scales. In three dimensions a ridge
+    peak is a curved sheet rather than a line, so the channels are wide, they
+    branch and meet, and the open space they carve is connected by construction.
+    Thresholded plain noise gives isolated bubbles instead.
     """
 
     best = 0.0
-    for index, cell in enumerate(_PASS_CELLS):
-        ridge = _ridge(x, z, cell, world_seed, _TERRAIN_SALT + 7 + index)
-        best = max(best, (ridge - _PASS_EDGE) / (_PASS_PEAK - _PASS_EDGE))
+    for index, cell in enumerate(_CHANNEL_CELLS):
+        value = ridge(x, y, z, cell, world_seed, _CHANNEL_SALT + index)
+        best = max(best, (value - _CHANNEL_EDGE) / (_CHANNEL_PEAK - _CHANNEL_EDGE))
     return _smoothstep(min(1.0, max(0.0, best)))
 
 
-def terrain_height(x: float, z: float, world_seed: int) -> float:
-    """Continuous landform shared by every biome, so seams and clamps agree.
-
-    Mesa, bench and grain octaves sum into a smooth field. On the terraces it
-    is quantised into hard steps and the ravine network cuts through it; inside
-    a pass corridor the smooth field shows through and the cut fades, which is
-    the slope a walker uses to change level.
-    """
-
-    smooth = (
-        _MACRO_AMPLITUDE * _value_noise(x, z, _MACRO_CELL, world_seed, _TERRAIN_SALT + 1)
-        + _MID_AMPLITUDE * _value_noise(x, z, _MID_CELL, world_seed, _TERRAIN_SALT + 2)
-        + _FINE_AMPLITUDE * _value_noise(x, z, _FINE_CELL, world_seed, _TERRAIN_SALT + 3)
-    )
-    passing = pass_weight(x, z, world_seed)
-    cut = _ravine_cut(x, z, world_seed, passing)
-    value = smooth - cut
-    # The ravine floor is a corridor as well: the network is connected by
-    # construction, but terracing its floor would drop a riser across the
-    # channel every 24 units and turn it back into a chain of pits.
-    channel = _smoothstep(min(1.0, cut / (_RAVINE_DEPTH * _RAVINE_FLOOR_SHARE)))
-    smoothness = max(passing, channel)
-    # Soft quantiser: the top ``smoothness`` share of each terrace becomes a
-    # ramp to the next one. At smoothness 0 that is a hard floor with a riser
-    # at every step; at 1 the whole terrace is the ramp, so the corridor is a
-    # continuous slope no steeper than the smooth field itself. Blending a
-    # hard floor with the smooth field instead left a scaled-down riser at
-    # every step of the corridor, which the slope test still calls a wall.
-    steps = value / _TERRACE_STEP + 0.5
-    level = floor(steps)
-    frac = steps - level
-    width = max(1e-3, smoothness)
-    # The ramp sits in the middle of each tread, so the surface is identical
-    # at every tread edge whatever ``smoothness`` is and the corridor never
-    # rises more than half a terrace above the terrace beside it. Anchoring
-    # the ramp at the top of the tread instead made the corridor a raised
-    # ridge with a full 24-unit wall along both of its sides.
-    ramp = min(1.0, max(0.0, (frac - 0.5 * (1.0 - width)) / width))
-    return (level - 0.5 + ramp) * _TERRACE_STEP
+def world_to_chunk(x: float, y: float, z: float) -> ChunkCoord:
+    return floor(x / CHUNK_SIZE), floor(y / CHUNK_SIZE), floor(z / CHUNK_SIZE)
 
 
-def world_to_chunk(x: float, z: float) -> ChunkCoord:
-    return floor(x / CHUNK_SIZE), floor(z / CHUNK_SIZE)
+@lru_cache(maxsize=8)
+def _chunk_offsets(radius: int) -> tuple[ChunkCoord, ...]:
+    """Centre-first load order, shared by every streaming position."""
+    if radius < 0:
+        raise ValueError("radius must be zero or greater")
+    coords = ((x, y, z) for x in range(-radius, radius + 1)
+              for y in range(-radius, radius + 1) for z in range(-radius, radius + 1))
+    return tuple(sorted(coords, key=lambda c: (max(map(abs, c)), sum(map(abs, c)), c)))
 
 
 def active_chunk_coords(
-    x: float, z: float, radius: int = ACTIVE_CHUNK_RADIUS
+    x: float, y: float, z: float, radius: int = ACTIVE_CHUNK_RADIUS
 ) -> tuple[ChunkCoord, ...]:
     """Return the finite chunk window around a world-space position."""
 
-    if radius < 0:
-        raise ValueError("radius must be zero or greater")
-    center_x, center_z = world_to_chunk(x, z)
-    coords = (
-        (chunk_x, chunk_z)
-        for chunk_z in range(center_z - radius, center_z + radius + 1)
-        for chunk_x in range(center_x - radius, center_x + radius + 1)
-    )
-    return tuple(
-        sorted(
-            coords,
-            key=lambda coord: (
-                max(abs(coord[0] - center_x), abs(coord[1] - center_z)),
-                abs(coord[0] - center_x) + abs(coord[1] - center_z),
-                coord[1],
-                coord[0],
-            ),
-        )
-    )
+    cx, cy, cz = world_to_chunk(x, y, z)
+    return tuple((cx + dx, cy + dy, cz + dz) for dx, dy, dz in _chunk_offsets(radius))
 
 
 def plan_chunk_cache(
     existing: Iterable[ChunkCoord],
     x: float,
+    y: float,
     z: float,
     radius: int = ACTIVE_CHUNK_RADIUS,
 ) -> ChunkCachePlan:
     """Plan loads and evictions without retaining generated chunks here."""
 
-    desired = active_chunk_coords(x, z, radius)
+    desired = active_chunk_coords(x, y, z, radius)
     desired_set = set(desired)
     existing_set = set(existing)
     order = {coord: index for index, coord in enumerate(desired)}
     return ChunkCachePlan(
-        center=world_to_chunk(x, z),
+        center=world_to_chunk(x, y, z),
         desired=desired,
         load=tuple(coord for coord in desired if coord not in existing_set),
         keep=tuple(sorted(existing_set & desired_set, key=order.__getitem__)),
@@ -398,21 +283,28 @@ def _sky_hsv(world_seed: int) -> tuple[float, float, float]:
 
 
 def sky_color(world_seed: int) -> Color:
-    """Return the seeded clear and fog color shared by one world."""
+    """Return the seeded mid-level fog colour shared by one world."""
 
     return hsv_to_rgb(*_sky_hsv(world_seed))
 
 
 def zenith_color(world_seed: int) -> Color:
-    """Sky colour overhead: the secondary hue, deeper and darker than the fog.
-
-    The gradient from pale horizon to a saturated zenith is what keeps the top
-    of an eye-level frame reading as open sky rather than a white ceiling.
-    """
+    """Colour straight up: the secondary hue, deeper and darker than the fog."""
 
     _, secondary, _ = world_palette(world_seed)
     _, _, sky_value = _sky_hsv(world_seed)
     return hsv_to_rgb(secondary, 0.55, max(0.30, sky_value - 0.42))
+
+
+def nadir_color(world_seed: int) -> Color:
+    """Colour straight down: the same hue as the zenith, taken almost to black.
+
+    A dark lower background gives the scene an orientation without a ground
+    plane. Distant geometry fades into this colour when looking down.
+    """
+
+    _, secondary, _ = world_palette(world_seed)
+    return hsv_to_rgb(secondary, 0.42, 0.11)
 
 
 def _hue_distance(a: float, b: float) -> float:
@@ -426,12 +318,11 @@ def _hue_distance(a: float, b: float) -> float:
 def world_palette(world_seed: int) -> tuple[float, float, float]:
     """Two or three hues shared by every object in one world.
 
-    The primary hue matches the sky and the secondary steps around the wheel
-    by a per-seed offset. Only the accent slot is ever drawn at full
-    saturation, so these read as one pale field plus a bold region. An offset
-    of 0.5 folds accent = primary + 2*0.5 back onto the primary; that is still
-    a deliberate two-tone world, but the accent slot would then share the sky
-    hue and vanish, so it maps to the secondary hue instead.
+    The primary hue matches the fog and the secondary steps around the wheel by
+    a per-seed offset. Only the accent slot is ever drawn at full saturation, so
+    these read as one pale field plus a bold vein. An offset of 0.5 folds the
+    accent back onto the primary, which would make it share the fog hue and
+    vanish, so it maps to the secondary hue instead.
     """
 
     primary_hue, _, _ = _sky_hsv(world_seed)
@@ -442,39 +333,32 @@ def world_palette(world_seed: int) -> tuple[float, float, float]:
     return primary_hue, secondary_hue, accent_hue
 
 
-def is_accent_region(x: float, z: float, world_seed: int) -> bool:
-    """Whether this patch of ground belongs to a contiguous accent region."""
+def is_accent_region(x: float, y: float, z: float, world_seed: int) -> bool:
+    """Whether this pocket of the volume belongs to a contiguous accent vein."""
 
-    return _ridge(x, z, _ACCENT_CELL, world_seed, _ACCENT_SALT) > _ACCENT_THRESHOLD
+    return ridge(x, y, z, _ACCENT_CELL, world_seed, _ACCENT_SALT) > _ACCENT_THRESHOLD
 
 
 def object_color(world_seed: int, position: Vec3, role: Role, tone: float) -> Color:
     """Colour one cube from its world position: pale neutral, or accent hue.
 
-    The accent comes from a low-frequency spatial field, so contiguous
-    regions - a whole terrace, a whole ravine floor - carry the hue. ``tone``
-    then scales the value down, which is what puts blacks in the frame.
+    The accent comes from a low-frequency 3D field, so a whole wall or reef
+    carries the hue. ``tone`` then scales the value down.
     """
 
     x, y, z = position
     parts = (_OBJECT_COLOR_SALT, int(x * 8.0), int(y * 8.0), int(z * 8.0))
     palette = world_palette(world_seed)
-    # Flat plateau floors stay neutral: a saturated plate at eye level reads
-    # as a tabletop. Forms and ravine floors carry the accent.
-    accent = is_accent_region(x, z, world_seed) and (
-        role == "form" or ravine_depth(x, z, world_seed) > 8.0
-    )
+    accent = is_accent_region(x, y, z, world_seed)
     hue = palette[2 if accent else _ROLE_HUE_SLOT[role]]
     sat_low, sat_high = _ACCENT_SATURATION if accent else _NEUTRAL_SATURATION
     saturation = sat_low + (sat_high - sat_low) * _unit_float(world_seed, *parts, 2)
     low, high = _ACCENT_VALUE if accent else _ROLE_VALUE_RANGE[role]
     value = low + (high - low) * _unit_float(world_seed, *parts, 3)
 
-    # Ground carries the sky hue by design. At these saturations the tint is
-    # barely visible, but a ground cube whose value also matches the sky would
-    # vanish into the fog, so separate it by value instead of leaving the
-    # palette. Every object band sits below the sky, so the push is downward
-    # and cannot overshoot past white.
+    # Panels carry the fog hue by design. At these saturations the tint is
+    # barely visible, but a panel whose value also matches the fog would vanish
+    # into it, so separate it by value instead of leaving the palette.
     if _hue_distance(hue, palette[0]) <= 1e-6:
         _, _, sky_value = _sky_hsv(world_seed)
         if abs(value - sky_value) < _LEGIBILITY_MARGIN:
@@ -506,209 +390,446 @@ def biome_roster(world_seed: int) -> tuple[str, ...]:
     return tuple(rng.sample(BIOME_NAMES, BIOMES_PER_WORLD))
 
 
-@lru_cache(maxsize=4096)
-def _biome_at_cell(cell_x: int, cell_z: int, world_seed: int) -> int:
+@lru_cache(maxsize=1 << 15)
+def _biome_at_cell(cell_x: int, cell_y: int, cell_z: int, world_seed: int) -> int:
     roster = biome_roster(world_seed)
     return min(
         len(roster) - 1,
-        int(_unit_float(world_seed, _BIOME_SALT, cell_x, cell_z, 7) * len(roster)),
+        int(_unit_float(world_seed, _BIOME_SALT, cell_x, cell_y, cell_z, 7) * len(roster)),
     )
 
 
-def biome_weights(x: float, z: float, world_seed: int) -> dict[str, float]:
-    """Blend weights over the world's biomes, summing to one."""
+def biome_weights(x: float, y: float, z: float, world_seed: int) -> dict[str, float]:
+    """Blend weights over the world's biomes at one point, summing to one."""
 
     roster = biome_roster(world_seed)
-    fx, fz = x / BIOME_CELL - 0.5, z / BIOME_CELL - 0.5
-    ix, iz = floor(fx), floor(fz)
-    tx, tz = _smoothstep(fx - ix), _smoothstep(fz - iz)
+    fx = x / BIOME_CELL - 0.5
+    fy = y / (BIOME_CELL * 0.75) - 0.5
+    fz = z / BIOME_CELL - 0.5
+    ix, iy, iz = floor(fx), floor(fy), floor(fz)
+    tx, ty, tz = _smoothstep(fx - ix), _smoothstep(fy - iy), _smoothstep(fz - iz)
     weights = dict.fromkeys(roster, 0.0)
     for offset_z, weight_z in ((0, 1.0 - tz), (1, tz)):
-        for offset_x, weight_x in ((0, 1.0 - tx), (1, tx)):
-            name = roster[_biome_at_cell(ix + offset_x, iz + offset_z, world_seed)]
-            weights[name] += weight_x * weight_z
+        for offset_y, weight_y in ((0, 1.0 - ty), (1, ty)):
+            for offset_x, weight_x in ((0, 1.0 - tx), (1, tx)):
+                name = roster[
+                    _biome_at_cell(ix + offset_x, iy + offset_y, iz + offset_z, world_seed)
+                ]
+                weights[name] += weight_x * weight_y * weight_z
     return weights
 
 
-def dominant_biome(x: float, z: float, world_seed: int) -> str:
-    weights = biome_weights(x, z, world_seed)
+def dominant_biome(x: float, y: float, z: float, world_seed: int) -> str:
+    weights = biome_weights(x, y, z, world_seed)
     return max(weights, key=lambda name: (weights[name], name))
 
 
-def surface_height(x: float, z: float, world_seed: int) -> float:
-    """Top of the solid ground layer, which every biome shares.
+def world_label(world_seed: int, x: float = 0.0, y: float = 0.0, z: float = 0.0) -> str:
+    """Short biome and palette label for the on-screen overlay."""
 
-    Ground is emitted once per chunk rather than once per biome, so blend zones
-    keep full coverage instead of showing sky through a half-thinned floor, and
-    the camera clamp can trust a single height field.
+    weights = biome_weights(x, y, z, world_seed)
+    ranked = sorted(weights.items(), key=lambda item: (-item[1], item[0]))
+    here = "+".join(name for name, weight in ranked if weight >= 0.2) or ranked[0][0]
+    primary, secondary, accent = world_palette(world_seed)
+    hues = [_hue_name(primary), _hue_name(secondary)]
+    if _hue_distance(accent, secondary) > 1e-6:
+        hues.append(_hue_name(accent))
+    return f"{here} / {'-'.join(dict.fromkeys(hues))}"
+
+
+# --- cell shell ------------------------------------------------------------
+
+
+def cell_center(cell: Cell) -> Vec3:
+    """World-space centre of one volume cell."""
+
+    return (
+        (cell[0] + 0.5) * VOLUME_CELL,
+        (cell[1] + 0.5) * VOLUME_CELL,
+        (cell[2] + 0.5) * VOLUME_CELL,
+    )
+
+
+def face_open(cell: Cell, axis: int, world_seed: int) -> bool:
+    """Whether the face on the positive ``axis`` side of ``cell`` is an opening.
+
+    A per-face coin flip - vertical faces open more often, so climbing and
+    diving stay as available as turning - lifted wherever the channel field runs
+    through, which is what strings openings into continuous routes instead of
+    scattering them.
     """
 
-    return terrain_height(x, z, world_seed)
+    here = cell_center(cell)
+    step = [0, 0, 0]
+    step[axis] = 1
+    there = cell_center((cell[0] + step[0], cell[1] + step[1], cell[2] + step[2]))
+    channel = max(channel_weight(*here, world_seed), channel_weight(*there, world_seed))
+    base = _FACE_OPEN_UPDOWN if axis == 1 else _FACE_OPEN_SIDE
+    chance = min(0.97, base + _FACE_OPEN_CHANNEL * channel)
+    return _unit_float(world_seed, _FACE_SALT, cell[0], cell[1], cell[2], axis) < chance
 
 
-def walk_height(x: float, z: float, world_seed: int) -> float:
-    """Eye height here: the ground averaged over a small ring, plus eye height.
+def _panel_tone(cell: Cell, axis: int, rng: Random) -> float:
+    """Checker tone for one panel, on global cell parity.
 
-    Risers are walls (``step_blocked``), so the only ground changes a walker
-    crosses are slope cells; averaging over a ring turns those 8-unit cells
-    into a ramp. Samples more than a step above the ground underfoot are
-    ignored so a wall the walker stands beside does not lift the eye.
+    One pale band filling the frame is the sampler's strongest attractor toward
+    flat interiors, so neighbouring walls alternate light and dark.
     """
 
-    here = surface_height(x, z, world_seed)
-    total, weight = here, 1.0
-    for step in range(8):
-        angle = radians(step * 45.0)
-        sample = surface_height(
-            x + EYE_SMOOTH_RADIUS * cos(angle), z + EYE_SMOOTH_RADIUS * sin(angle), world_seed
+    parity = (cell[0] + cell[1] + cell[2] + axis) % 2
+    return (_TONE_DARK if parity else _TONE_LIGHT) * rng.uniform(0.88, 1.12)
+
+
+def _face_panels(cell: Cell, axis: int, world_seed: int) -> list[WorldCube]:
+    """The wall on one closed cell face: one to three thick panels.
+
+    A single wide panel is the common case, which is what makes a wall read as a
+    wall. The rest are partial and the plane itself is jittered off the cell
+    boundary, so the shell stays ragged rather than architectural.
+    """
+
+    rng = Random(_stable_seed(world_seed, _PANEL_SALT, cell[0], cell[1], cell[2], axis))
+    centre = list(cell_center(cell))
+    centre[axis] += VOLUME_CELL * 0.5
+    tangents = [index for index in range(3) if index != axis]
+    count = 1 if rng.random() < 0.62 else rng.randrange(2, 4)
+    coverage = 1.0 if count == 1 else 0.72
+    cubes: list[WorldCube] = []
+    for _ in range(count):
+        half = [0.0, 0.0, 0.0]
+        position = list(centre)
+        half[axis] = rng.uniform(2.0, 4.4)
+        position[axis] += rng.uniform(-1.0, 1.0) * VOLUME_CELL * 0.20
+        for tangent in tangents:
+            share = min(1.0, coverage * rng.uniform(0.72, 1.14))
+            half[tangent] = VOLUME_CELL * 0.5 * share
+            slack = VOLUME_CELL * 0.5 - half[tangent]
+            position[tangent] += rng.uniform(-slack, slack)
+        # Yaw is free on a horizontal panel (its thin axis stays vertical) and
+        # small on an upright one, so a wall never turns edge-on to its cell.
+        yaw = rng.uniform(0.0, 360.0) if axis == 1 else rng.uniform(-9.0, 9.0)
+        cubes.append(
+            WorldCube(
+                "panel",
+                (position[0], position[1], position[2]),
+                (half[0], half[1], half[2]),
+                (rng.uniform(-7.0, 7.0), yaw, rng.uniform(-7.0, 7.0)),
+                (0.0, 0.0, 0.0),
+                _panel_tone(cell, axis, rng),
+            )
         )
-        # Soft weight: a sample fades out as it approaches a step above or
-        # below, so a wall entering the ring never jolts the eye.
-        share = max(0.0, 1.0 - abs(sample - here) / STEP_MAX)
-        total += sample * share
-        weight += share
-    return total / weight + EYE_HEIGHT
+    return cubes
 
 
-def step_blocked(from_x: float, from_z: float, to_x: float, to_z: float, world_seed: int) -> bool:
-    """Whether the ground between two footfalls is a wall: too tall or too steep."""
-
-    rise = abs(surface_height(to_x, to_z, world_seed) - surface_height(from_x, from_z, world_seed))
-    run = sqrt((to_x - from_x) ** 2 + (to_z - from_z) ** 2)
-    # The grade limit is measured over a full step, so a per-frame move of a
-    # few centimetres onto a terrace edge is not a wall the way a whole step
-    # onto it would be.
-    return rise > STEP_MAX or rise > MAX_SLOPE * max(run, STEP_RUN)
+# --- biome vocabulary ------------------------------------------------------
+#
+# Each generator fills one cell interior. They read only the cell centre and a
+# seeded rng, so generation stays a pure function of (cell, seed) and chunks can
+# be built in any order. Interiors are sparse on purpose: the shell carries the
+# structure, these carry the character and the near-field detail.
 
 
-def settle_height(x: float, y: float, z: float, world_seed: int, dt: float | None) -> float:
-    """Move the eye toward ``walk_height`` at ``CLIMB_RATE``; ``dt`` None snaps.
+def _gen_reefs(centre: Vec3, rng: Random) -> list[WorldCube]:
+    """A drifting clump of small blocks, a voxel ridge torn loose."""
 
-    Descents and climbs both ease, but the eye is never allowed below the
-    ground directly underfoot, so a sprint into a cliff cannot clip inside it.
+    anchor = tuple(value + rng.uniform(-10.0, 10.0) for value in centre)
+    spread = rng.uniform(4.0, 9.0)
+    return [
+        WorldCube(
+            "mass",
+            (
+                anchor[0] + rng.uniform(-spread, spread),
+                anchor[1] + rng.uniform(-spread, spread),
+                anchor[2] + rng.uniform(-spread, spread),
+            ),
+            (rng.uniform(2.2, 5.0), rng.uniform(2.2, 5.0), rng.uniform(2.2, 5.0)),
+            (0.0, rng.uniform(0.0, 45.0), 0.0),
+            (0.0, 0.0, 0.0),
+            rng.uniform(0.45, 1.0),
+        )
+        for _ in range(rng.randrange(3, 6))
+    ]
+
+
+def _gen_lattice(centre: Vec3, rng: Random) -> list[WorldCube]:
+    """Thin bars strung across the cell, a wire frame hanging in the air."""
+
+    cubes: list[WorldCube] = []
+    for _ in range(rng.randrange(2, 5)):
+        axis = rng.randrange(3)
+        half = [rng.uniform(0.9, 2.4), rng.uniform(0.9, 2.4), rng.uniform(0.9, 2.4)]
+        half[axis] = VOLUME_CELL * rng.uniform(0.34, 0.5)
+        position = [value + rng.uniform(-11.0, 11.0) for value in centre]
+        position[axis] = centre[axis] + rng.uniform(-3.0, 3.0)
+        cubes.append(
+            WorldCube(
+                "mass",
+                (position[0], position[1], position[2]),
+                (half[0], half[1], half[2]),
+                (rng.uniform(-5.0, 5.0), rng.uniform(-5.0, 5.0), rng.uniform(-5.0, 5.0)),
+                (0.0, 0.0, 0.0),
+                rng.uniform(0.5, 1.0),
+            )
+        )
+    return cubes
+
+
+def _gen_shards(centre: Vec3, rng: Random) -> list[WorldCube]:
+    """Steeply tilted plates hanging in the middle of the cell."""
+
+    return [
+        WorldCube(
+            "mass",
+            (
+                centre[0] + rng.uniform(-11.0, 11.0),
+                centre[1] + rng.uniform(-11.0, 11.0),
+                centre[2] + rng.uniform(-11.0, 11.0),
+            ),
+            (rng.uniform(2.6, 7.0), rng.uniform(0.5, 1.4), rng.uniform(2.2, 5.5)),
+            (rng.uniform(-46.0, 46.0), rng.uniform(0.0, 360.0), rng.uniform(-46.0, 46.0)),
+            (0.0, 0.0, 0.0),
+            rng.uniform(0.55, 1.0),
+        )
+        for _ in range(2)
+    ]
+
+
+def _gen_columns(centre: Vec3, rng: Random) -> list[WorldCube]:
+    """Monoliths spanning the whole cell, floor to ceiling and on past it.
+
+    Neighbouring cells of the same biome put theirs near the cell centre too, so
+    a run of them reads as one shaft crossing many cells.
     """
 
-    target = walk_height(x, z, world_seed)
-    if dt is None:
-        return target
-    limit = CLIMB_RATE * max(0.0, dt)
-    y = y + max(-limit, min(limit, target - y))
-    return max(y, surface_height(x, z, world_seed) + EYE_HEIGHT * 0.5)
+    return [
+        WorldCube(
+            "mass",
+            (
+                centre[0] + rng.uniform(-9.0, 9.0),
+                centre[1],
+                centre[2] + rng.uniform(-9.0, 9.0),
+            ),
+            (rng.uniform(2.4, 5.5), VOLUME_CELL * 0.5, rng.uniform(2.4, 5.5)),
+            (0.0, rng.uniform(0.0, 90.0), 0.0),
+            (0.0, 0.0, 0.0),
+            rng.uniform(0.5, 1.0),
+        )
+        for _ in range(1 if rng.random() < 0.7 else 2)
+    ]
 
 
-def chunk_colliders(chunk: "WorldChunk") -> np.ndarray:
-    """Standing forms of one chunk as yaw-aligned footprints for collision.
+def _gen_overhangs(centre: Vec3, rng: Random) -> list[WorldCube]:
+    """One giant flat slab, wider than the cell, jutting through it."""
 
-    Rows are (cx, cz, cos_yaw, sin_yaw, half_x, half_z, y_low, y_high). Tilt is
-    ignored: the forms a walker can hit are the upright ones, and the tilted
-    giants hang above head height by construction.
+    return [
+        WorldCube(
+            "mass",
+            (
+                centre[0] + rng.uniform(-8.0, 8.0),
+                centre[1] + rng.uniform(-10.0, 10.0),
+                centre[2] + rng.uniform(-8.0, 8.0),
+            ),
+            (rng.uniform(10.0, 22.0), rng.uniform(0.8, 2.4), rng.uniform(8.0, 18.0)),
+            (rng.uniform(-12.0, 12.0), rng.uniform(0.0, 360.0), rng.uniform(-12.0, 12.0)),
+            (0.0, 0.0, 0.0),
+            rng.uniform(0.6, 1.0),
+        )
+    ]
+
+
+_BIOME_GENERATOR: dict[str, Callable[[Vec3, Random], list[WorldCube]]] = {
+    "reefs": _gen_reefs,
+    "lattice": _gen_lattice,
+    "shards": _gen_shards,
+    "columns": _gen_columns,
+    "overhangs": _gen_overhangs,
+}
+
+
+def _cell_interior(cell: Cell, world_seed: int) -> list[WorldCube]:
+    """Fill one cell interior with the locally dominant biome's vocabulary.
+
+    The biome is drawn from the blend weights rather than taken from the top
+    one, so a border band is a real cell-by-cell mixture of two vocabularies.
+    """
+
+    rng = Random(_stable_seed(world_seed, _INTERIOR_SALT, cell[0], cell[1], cell[2]))
+    if rng.random() < _EMPTY_CELL_SHARE:
+        return []
+    centre = cell_center(cell)
+    weights = biome_weights(*centre, world_seed)
+    draw = rng.random()
+    total = 0.0
+    name = max(weights, key=lambda key: (weights[key], key))
+    for candidate in sorted(weights):
+        total += weights[candidate]
+        if draw <= total:
+            name = candidate
+            break
+    return _BIOME_GENERATOR[name](centre, rng)
+
+
+# --- chunk assembly --------------------------------------------------------
+
+
+def chunk_cells(coord: ChunkCoord) -> list[Cell]:
+    """The eight volume cells owned by a cubic chunk, at any altitude."""
+
+    return [
+        (coord[0] * CELLS_PER_CHUNK + dx, coord[1] * CELLS_PER_CHUNK + dy,
+         coord[2] * CELLS_PER_CHUNK + dz)
+        for dz in range(CELLS_PER_CHUNK)
+        for dx in range(CELLS_PER_CHUNK)
+        for dy in range(CELLS_PER_CHUNK)
+    ]
+
+
+def keep_interior(position: Vec3, world_seed: int) -> bool:
+    """Approved C spacing: clear interior groups along the existing channels."""
+    group = tuple(floor(value / 16.0) for value in position)
+    removal = 0.05 + 0.60 * channel_weight(*position, world_seed)
+    return _unit_float(world_seed, 0x5AACE, *group) >= removal
+
+
+@lru_cache(maxsize=MAX_ACTIVE_CHUNKS * 2)
+def generate_chunk(coord: ChunkCoord, world_seed: int) -> WorldChunk:
+    """Generate one chunk independently of cache state or generation order.
+
+    A chunk owns the three positive-side faces of each of its cells, so every
+    face in the world is emitted exactly once. Panels come first because the
+    per-chunk cap truncates the tail and the shell is what has to survive.
+
+    Memoised because the spawn search and the renderer's cold fill ask for
+    overlapping windows of the same seed, and a chunk costs several
+    milliseconds to build. The result is frozen, so sharing one is safe.
+    """
+
+    panels: list[WorldCube] = []
+    interiors: list[WorldCube] = []
+    for cell in chunk_cells(coord):
+        for axis in range(3):
+            if not face_open(cell, axis, world_seed):
+                panels.extend(_face_panels(cell, axis, world_seed))
+        interiors.extend(_cell_interior(cell, world_seed))
+    cubes = [cube for cube in (panels + interiors)[:MAX_OBJECTS_PER_CHUNK]
+             if cube.role == "panel" or keep_interior(cube.position, world_seed)]
+
+    weights = biome_weights(
+        *((axis + 0.5) * CHUNK_SIZE for axis in coord), world_seed
+    )
+    present = tuple(
+        sorted(
+            (name for name, weight in weights.items() if weight >= MIN_BIOME_WEIGHT),
+            key=lambda name: (-weights[name], name),
+        )
+    )
+    return WorldChunk(
+        coord=coord,
+        biomes=present,
+        objects=tuple(
+            replace(cube, color=object_color(world_seed, cube.position, cube.role, cube.tone))
+            for cube in cubes
+        ),
+    )
+
+
+# --- collision -------------------------------------------------------------
+
+
+def chunk_colliders(chunk: WorldChunk) -> np.ndarray:
+    """Every cube of one chunk as a yaw-aligned box.
+
+    Rows are (cx, cy, cz, cos_yaw, sin_yaw, half_x, half_y, half_z). Tilt is
+    folded into the vertical half extent rather than modelled, so a tilted plate
+    is a slightly taller box and never a surface the flier slips through.
     """
 
     rows = [
         (
             cube.position[0],
+            cube.position[1],
             cube.position[2],
             cos(radians(cube.rotation[1])),
             sin(radians(cube.rotation[1])),
             cube.half_extents[0],
+            cube.half_extents[1]
+            + cube.half_extents[0] * abs(sin(radians(cube.rotation[2])))
+            + cube.half_extents[2] * abs(sin(radians(cube.rotation[0]))),
             cube.half_extents[2],
-            cube.position[1] - cube.half_extents[1],
-            cube.position[1] + cube.half_extents[1],
         )
         for cube in chunk.objects
-        if cube.role == "form"
     ]
     return np.asarray(rows, dtype=np.float64).reshape(-1, 8)
 
 
+def _local_offsets(
+    x: float, y: float, z: float, rows: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Offsets from a point to each box centre, in each box's own frame."""
+
+    dx, dz = x - rows[:, 0], z - rows[:, 2]
+    cosine, sine = rows[:, 3], rows[:, 4]
+    return dx * cosine - dz * sine, y - rows[:, 1], dx * sine + dz * cosine
+
+
+def is_blocked(
+    x: float, y: float, z: float, colliders: np.ndarray, radius: float = WALKER_RADIUS
+) -> bool:
+    """Whether a body of ``radius`` at (x, y, z) overlaps any form."""
+
+    if colliders.shape[0] == 0:
+        return False
+    local_x, local_y, local_z = _local_offsets(x, y, z, colliders)
+    return bool(
+        np.any(
+            (np.abs(local_x) < colliders[:, 5] + radius)
+            & (np.abs(local_y) < colliders[:, 6] + radius)
+            & (np.abs(local_z) < colliders[:, 7] + radius)
+        )
+    )
+
+
 def resolve_collisions(
     x: float, y: float, z: float, colliders: np.ndarray, radius: float = WALKER_RADIUS
-) -> tuple[float, float]:
-    """Push (x, z) out of every footprint whose vertical span contains ``y``.
+) -> Vec3:
+    """Push (x, y, z) out of every box it overlaps, sliding along the surface.
 
-    Each overlap is resolved along its shallower axis in the form's own frame,
-    which makes the walker slide along a wall instead of stopping dead. The
-    loop runs until nothing overlaps, so standing between two forms settles to
-    a point both accept instead of bouncing between them every frame.
+    Each overlap is resolved along its shallowest of the three axes in the box's
+    own frame, plus a nudge across the face toward the nearer edge, so head-on
+    contact slides instead of pinning. The loop runs until nothing overlaps, so
+    a body wedged between two forms settles rather than bouncing between them.
     """
 
     if colliders.shape[0] == 0:
-        return x, z
+        return x, y, z
     for _ in range(6):
-        hit = (colliders[:, 6] < y) & (y < colliders[:, 7])
-        if not hit.any():
-            break
-        rows = colliders[hit]
-        dx, dz = x - rows[:, 0], z - rows[:, 1]
-        c, s_ = rows[:, 2], rows[:, 3]
-        # The model rotates local x/z by yaw; undo it to get footprint coords.
-        local_x = dx * c - dz * s_
-        local_z = dx * s_ + dz * c
-        pen_x = rows[:, 4] + radius - np.abs(local_x)
-        pen_z = rows[:, 5] + radius - np.abs(local_z)
-        inside = (pen_x > 0.0) & (pen_z > 0.0)
+        local_x, local_y, local_z = _local_offsets(x, y, z, colliders)
+        pen = (
+            colliders[:, 5] + radius - np.abs(local_x),
+            colliders[:, 6] + radius - np.abs(local_y),
+            colliders[:, 7] + radius - np.abs(local_z),
+        )
+        inside = (pen[0] > 0.0) & (pen[1] > 0.0) & (pen[2] > 0.0)
         if not inside.any():
             break
-        index = int(np.argmax(np.where(inside, np.minimum(pen_x, pen_z), -np.inf)))
-        # Resolve along the shallow axis, plus a nudge along the face toward the
-        # nearer edge, so a head-on walk into a block slides off it instead of
-        # pinning the walker against the wall.
-        # The nudge scales with how far off centre the contact is, so a dead-on
-        # hit is a clean push and an off-centre one curls around the corner.
-        if pen_x[index] < pen_z[index]:
-            push_x = np.copysign(pen_x[index], local_x[index])
-            push_z = SLIDE_NUDGE * pen_x[index] * local_z[index] / (rows[index, 5] + radius)
-        else:
-            push_z = np.copysign(pen_z[index], local_z[index])
-            push_x = SLIDE_NUDGE * pen_z[index] * local_x[index] / (rows[index, 4] + radius)
-        # Back to world axes: the inverse rotation of the one above.
-        x += push_x * c[index] + push_z * s_[index]
-        z += -push_x * s_[index] + push_z * c[index]
-    return x, z
-
-
-# --- connectivity probe ----------------------------------------------------
-
-PROBE_CELL = 8.0
-PROBE_RADIUS = 320.0
-# The walker moves a fraction of a unit per frame, so the grade test is
-# sampled at this stride rather than across a whole probe cell.
-PROBE_SUBSTEP = 2.0
-# Window and threshold the spawn search uses to reject pockets.
-_SPAWN_PROBE_RADIUS = 112.0
-_SPAWN_MIN_REACHABLE = 0.9
-# Window of the form-aware spawn check; small, since it is the slow probe.
-_SPAWN_FORM_PROBE_RADIUS = 48.0
-
-
-@dataclass(frozen=True, slots=True)
-class Walkability:
-    """Flood-fill survey of an 8-unit grid over one streamed window.
-
-    ``open_cells`` are cells a walker can stand in; ``reachable`` is the subset
-    connected to the origin cell without leaving the window; ``dead_ends`` are
-    open cells with exactly one walkable neighbour in any of the eight
-    directions, the pockets a walker has to back out of.
-    """
-
-    cell: float
-    origin: tuple[int, int]
-    bounds: tuple[int, int, int, int]
-    open_cells: frozenset[tuple[int, int]]
-    reachable: frozenset[tuple[int, int]]
-    dead_ends: frozenset[tuple[int, int]]
-
-    @property
-    def reachable_fraction(self) -> float:
-        """Share of walkable cells connected to the origin."""
-
-        return len(self.reachable) / max(1, len(self.open_cells))
-
-    @property
-    def dead_end_fraction(self) -> float:
-        """Share of walkable cells with exactly one walkable neighbour."""
-
-        return len(self.dead_ends) / max(1, len(self.open_cells))
+        shallow = np.minimum(np.minimum(pen[0], pen[1]), pen[2])
+        index = int(np.argmax(np.where(inside, shallow, -np.inf)))
+        offsets = (local_x[index], local_y[index], local_z[index])
+        depths = (pen[0][index], pen[1][index], pen[2][index])
+        halves = (colliders[index, 5], colliders[index, 6], colliders[index, 7])
+        axis = int(np.argmin(depths))
+        push = [
+            SLIDE_NUDGE * depths[axis] * offsets[other] / (halves[other] + radius)
+            for other in range(3)
+        ]
+        push[axis] = float(
+            np.copysign(depths[axis], offsets[axis] if offsets[axis] else 1.0)
+        )
+        cosine, sine = colliders[index, 3], colliders[index, 4]
+        x += push[0] * cosine + push[2] * sine
+        y += push[1]
+        z += -push[0] * sine + push[2] * cosine
+    return x, y, z
 
 
 @lru_cache(maxsize=512)
@@ -716,209 +837,437 @@ def _chunk_collider_rows(coord: ChunkCoord, world_seed: int) -> np.ndarray:
     return chunk_colliders(generate_chunk(coord, world_seed))
 
 
-@lru_cache(maxsize=256)
+@lru_cache(maxsize=64)
 def _neighbourhood_colliders(coord: ChunkCoord, world_seed: int) -> np.ndarray:
-    """Form footprints of one chunk and its eight neighbours.
-
-    A form near a chunk border still blocks cells on the far side, so the
-    probe tests against the 3x3 neighbourhood rather than the chunk alone.
-    """
+    """Boxes of one chunk and its 26 neighbours, for a local query."""
 
     return np.concatenate(
         [
-            _chunk_collider_rows((coord[0] + dx, coord[1] + dz), world_seed)
+            _chunk_collider_rows((coord[0] + dx, coord[1] + dy, coord[2] + dz), world_seed)
             for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
             for dz in (-1, 0, 1)
         ]
     )
 
 
-def _form_blocked(x: float, y: float, z: float, colliders: np.ndarray) -> bool:
-    """Whether a walker disc at (x, z, eye ``y``) overlaps any standing form."""
+# --- heading search --------------------------------------------------------
+
+# Directions the open-heading search tries: a ring of yaws at several pitches,
+# plus straight up and straight down.
+_HEADING_YAWS = 12
+_HEADING_PITCHES = (-60.0, -30.0, 0.0, 30.0, 60.0, 88.0, -88.0)
+SPAWN_PITCHES = (-30.0, -15.0, 0.0, 15.0, 30.0)
+# Short enough that a line grazing a corner a metre ahead is rejected: the body
+# is 2.2 wide, so a coarser march picks headings the flier immediately slides
+# off.
+_HEADING_STEP = 1.25
+_HEADING_RANGE = 70.0
+
+
+def direction_of(yaw: float, pitch: float) -> Vec3:
+    """Unit look direction for a (yaw, pitch) pair, matching ``Camera.forward``."""
+
+    yaw_r, pitch_r = radians(yaw), radians(pitch)
+    return (sin(yaw_r) * cos(pitch_r), sin(pitch_r), -cos(yaw_r) * cos(pitch_r))
+
+
+def _rows_near(origin: Vec3, colliders: np.ndarray, reach: float) -> np.ndarray:
+    """Boxes whose centre is within ``reach`` of a point, on every axis.
+
+    A ray march only ever touches this neighbourhood, and cutting a few thousand
+    chunk boxes down to a couple of hundred is what makes the vectorised march
+    cheap enough to run per spawn candidate.
+    """
 
     if colliders.shape[0] == 0:
-        return False
-    rows = colliders[(colliders[:, 6] < y) & (y < colliders[:, 7])]
-    if rows.shape[0] == 0:
-        return False
-    dx, dz = x - rows[:, 0], z - rows[:, 1]
-    local_x = dx * rows[:, 2] - dz * rows[:, 3]
-    local_z = dx * rows[:, 3] + dz * rows[:, 2]
-    return bool(
-        np.any(
-            (np.abs(local_x) < rows[:, 4] + WALKER_RADIUS)
-            & (np.abs(local_z) < rows[:, 5] + WALKER_RADIUS)
-        )
+        return colliders
+    keep = (
+        (np.abs(colliders[:, 0] - origin[0]) < reach)
+        & (np.abs(colliders[:, 1] - origin[1]) < reach)
+        & (np.abs(colliders[:, 2] - origin[2]) < reach)
     )
+    return colliders[keep]
+
+
+def clear_distances(
+    origin: Vec3,
+    directions: tuple[Vec3, ...],
+    colliders: np.ndarray,
+    reach: float = _HEADING_RANGE,
+    step: float = _HEADING_STEP,
+) -> np.ndarray:
+    """Distance run clear along each direction before a form blocks it.
+
+    Every direction and every march sample is tested against the local boxes in
+    one vectorised pass, which turns a spawn search from seconds into
+    milliseconds.
+    """
+
+    count = len(directions)
+    steps = max(1, int(reach / step))
+    rows = _rows_near(origin, colliders, reach + 32.0)
+    if rows.shape[0] == 0:
+        return np.full(count, reach)
+    offsets = (np.arange(1, steps + 1) * step)[None, :, None]
+    points = np.asarray(origin) + np.asarray(directions)[:, None, :] * offsets
+    flat = points.reshape(-1, 3)
+    dx = flat[:, 0, None] - rows[None, :, 0]
+    dz = flat[:, 2, None] - rows[None, :, 2]
+    local_x = dx * rows[:, 3] - dz * rows[:, 4]
+    local_z = dx * rows[:, 4] + dz * rows[:, 3]
+    local_y = flat[:, 1, None] - rows[None, :, 1]
+    hit = (
+        (
+            (np.abs(local_x) < rows[:, 5] + WALKER_RADIUS)
+            & (np.abs(local_y) < rows[:, 6] + WALKER_RADIUS)
+            & (np.abs(local_z) < rows[:, 7] + WALKER_RADIUS)
+        )
+        .any(axis=1)
+        .reshape(count, steps)
+    )
+    return np.where(hit.any(axis=1), hit.argmax(axis=1), steps) * step
+
+
+def open_heading(
+    x: float,
+    y: float,
+    z: float,
+    colliders: np.ndarray,
+    candidates: int = _HEADING_YAWS,
+    pitches: tuple[float, ...] = _HEADING_PITCHES,
+) -> tuple[float, float, float]:
+    """The (yaw, pitch) with the longest clear line from a point, and its length.
+
+    Used by the spawn and by the autopilot when it runs into something; a spawn
+    facing a wall would otherwise pin the flier against it. ``pitches`` narrows
+    the search: the spawn keeps its gaze near level, the autopilot may climb or
+    dive straight out of a pocket.
+    """
+
+    x, y, z = resolve_collisions(x, y, z, colliders)
+    poses = [
+        (index * 360.0 / candidates, pitch)
+        for index in range(candidates)
+        for pitch in pitches
+    ]
+    distances = clear_distances(
+        (x, y, z), tuple(direction_of(*pose) for pose in poses), colliders
+    )
+    best = int(np.argmax(distances))
+    return poses[best][0], poses[best][1], float(distances[best])
+
+
+def spawn_pose(world_seed: int) -> tuple[Vec3, float, float]:
+    """Float in an open pocket of the volume, facing the longest clear line.
+
+    Candidates are scored by how legible the pocket is - a long run to fly down
+    plus something solid close by to read scale against. Empty pockets score
+    badly on purpose: the first frame has to show walls, not blank fog.
+    """
+
+    scattered = [
+        (
+            (_unit_float(world_seed, _SPAWN_SALT, index, 1) - 0.5) * 512.0,
+            (_unit_float(world_seed, _SPAWN_SALT, index, 2) - 0.5) * 2.0 * SPAWN_HEIGHT_RANGE,
+            (_unit_float(world_seed, _SPAWN_SALT, index, 3) - 0.5) * 512.0,
+        )
+        for index in range(12)
+    ]
+    # Rank on the channel field first, which costs a few noise lookups, and only
+    # build chunks for the best few: the full probe needs nine chunks per
+    # candidate and a world reset already pays for one window fill.
+    scattered.sort(key=lambda point: -channel_weight(*point, world_seed))
+    best_score = -1e9
+    best: tuple[Vec3, float, float] = (scattered[0], 0.0, 0.0)
+    for x, y, z in scattered[:4]:
+        colliders = _neighbourhood_colliders(world_to_chunk(x, y, z), world_seed)
+        x, y, z = resolve_collisions(x, y, z, colliders)
+        if is_blocked(x, y, z, colliders):
+            continue
+        yaw, pitch, distance = open_heading(x, y, z, colliders, pitches=SPAWN_PITCHES)
+        if distance < 24.0:
+            continue
+        sideways = clear_distances(
+            (x, y, z),
+            tuple(direction_of(yaw + 90.0, angle) for angle in (-40.0, 0.0, 40.0)),
+            colliders,
+        )
+        # Reward a long run ahead and a nearby surface off to the side.
+        score = min(distance, 60.0) - 0.9 * min(float(sideways.min()), 40.0)
+        if score > best_score:
+            best_score = score
+            best = ((x, y, z), yaw, pitch)
+    return best
+
+
+# --- volumetric probe ------------------------------------------------------
+
+PROBE_CELL = 8.0
+PROBE_RADIUS = 200.0
+# The 26 compass directions the legibility statistic samples.
+_COMPASS: tuple[Vec3, ...] = tuple(
+    (
+        dx / sqrt(dx * dx + dy * dy + dz * dz),
+        dy / sqrt(dx * dx + dy * dy + dz * dz),
+        dz / sqrt(dx * dx + dy * dy + dz * dz),
+    )
+    for dx in (-1, 0, 1)
+    for dy in (-1, 0, 1)
+    for dz in (-1, 0, 1)
+    if (dx, dy, dz) != (0, 0, 0)
+)
+# A direction counts as open when it runs this far clear, and as blocked when it
+# meets a form this close. Two of each is what makes a pocket legible.
+LEGIBLE_OPEN = 30.0
+LEGIBLE_NEAR = 8.0
+LEGIBLE_SAMPLES = 200
+
+
+@dataclass(frozen=True, slots=True)
+class Occupancy:
+    """A boolean grid of the volume: True where a body would not fit."""
+
+    cell: float
+    origin: Vec3
+    solid: np.ndarray
+
+    def index_of(self, point: Vec3) -> tuple[int, int, int]:
+        """Grid index nearest a world point; may fall outside the grid."""
+
+        return (
+            int(round((point[0] - self.origin[0]) / self.cell)),
+            int(round((point[1] - self.origin[1]) / self.cell)),
+            int(round((point[2] - self.origin[2]) / self.cell)),
+        )
+
+    def center_of(self, index: tuple[int, int, int]) -> Vec3:
+        return (
+            self.origin[0] + index[0] * self.cell,
+            self.origin[1] + index[1] * self.cell,
+            self.origin[2] + index[2] * self.cell,
+        )
+
+    def blocked(self, index: tuple[int, int, int]) -> bool:
+        """Solid, or outside the grid, which the probes treat as unknown."""
+
+        for axis in range(3):
+            if not 0 <= index[axis] < self.solid.shape[axis]:
+                return True
+        return bool(self.solid[index])
+
+
+def occupancy_grid(
+    world_seed: int,
+    origin: Vec3 | None = None,
+    radius: float = PROBE_RADIUS,
+    cell: float = PROBE_CELL,
+) -> Occupancy:
+    """Rasterise every form near ``origin`` into a cubic boolean grid.
+
+    Each box is inflated by the body radius and marked through its yaw-aware
+    bounding box, so a grid cell is solid roughly when a body at its centre
+    would be inside something. Rasterising once and sharing the grid is what
+    makes both the flood fill and the legibility march cheap enough per seed.
+    """
+
+    if origin is None:
+        origin = spawn_pose(world_seed)[0]
+    span = int(radius / cell)
+    size = 2 * span + 1
+    base = (origin[0] - span * cell, origin[1] - span * cell, origin[2] - span * cell)
+    solid = np.zeros((size, size, size), dtype=bool)
+
+    reach = int(radius / CHUNK_SIZE) + 1
+    home = world_to_chunk(*origin)
+    rows = np.concatenate(
+        [
+            _chunk_collider_rows((home[0] + dx, home[1] + dy, home[2] + dz), world_seed)
+            for dx in range(-reach, reach + 1)
+            for dy in range(-reach, reach + 1)
+            for dz in range(-reach, reach + 1)
+        ]
+    )
+    if rows.shape[0] == 0:
+        return Occupancy(cell, base, solid)
+    cosine, sine = np.abs(rows[:, 3]), np.abs(rows[:, 4])
+    extent = np.stack(
+        [
+            rows[:, 5] * cosine + rows[:, 7] * sine + WALKER_RADIUS,
+            rows[:, 6] + WALKER_RADIUS,
+            rows[:, 5] * sine + rows[:, 7] * cosine + WALKER_RADIUS,
+        ],
+        axis=1,
+    )
+    anchor = np.asarray(base)
+    low = np.ceil((rows[:, 0:3] - extent - anchor) / cell).astype(np.int64)
+    high = np.floor((rows[:, 0:3] + extent - anchor) / cell).astype(np.int64)
+    np.clip(low, 0, size, out=low)
+    np.clip(high, -1, size - 1, out=high)
+    for index in range(rows.shape[0]):
+        solid[
+            low[index, 0] : high[index, 0] + 1,
+            low[index, 1] : high[index, 1] + 1,
+            low[index, 2] : high[index, 2] + 1,
+        ] = True
+    return Occupancy(cell, base, solid)
+
+
+@dataclass(frozen=True, slots=True)
+class Walkability:
+    """Flood-fill survey of the volume on an 8-unit grid.
+
+    ``open_cells`` counts cells a body fits in and ``reachable`` the subset
+    connected to the centre through face-adjacent open cells. ``reached`` is
+    that subset as a mask over the grid, which is what the map slices draw.
+    """
+
+    cell: float
+    open_cells: int
+    reachable: int
+    components: int
+    reached: np.ndarray
+
+    @property
+    def reachable_fraction(self) -> float:
+        """Share of the open volume connected to the spawn."""
+
+        return self.reachable / max(1, self.open_cells)
 
 
 def walkable_components(
     world_seed: int,
-    origin: tuple[float, float] | None = None,
+    origin: Vec3 | None = None,
     radius: float = PROBE_RADIUS,
     cell: float = PROBE_CELL,
+    grid: Occupancy | None = None,
 ) -> Walkability:
-    """Survey which cells of a window a walker can reach from ``origin``.
+    """Survey how much of the volume a flier can reach from the spawn.
 
-    Cells are open when no standing form covers their centre; two open
-    neighbours are linked when neither the riser between them is a wall
-    (``step_blocked``) nor a form sits in the gap. The flood fill runs on the
-    four orthogonal strides and starts at the open cell nearest ``origin`` (the
-    spawn when omitted); diagonals are only checked where they decide whether a
-    cell is a pocket.
+    Six-connected flood fill over the open cells of ``occupancy_grid``, started
+    at the open cell nearest the centre. Diagonal moves are ignored: a route
+    that exists only on a diagonal needs the flier to thread a corner exactly,
+    which is not a route.
     """
 
-    if origin is None:
-        position, _, _ = spawn_pose(world_seed)
-        origin = (position[0], position[2])
-    span = int(radius / cell)
-    base_x, base_z = origin
+    if grid is None:
+        grid = occupancy_grid(world_seed, origin, radius, cell)
+    size = grid.solid.shape[0]
+    flat = grid.solid.reshape(-1)
+    strides = (size * size, size, 1)
+    seen = np.zeros(flat.shape, dtype=bool)
+    open_count = int((~flat).sum())
+    if open_count == 0:
+        return Walkability(cell, 0, 0, 0, np.zeros_like(grid.solid))
 
-    def centre(ix: int, iz: int) -> tuple[float, float]:
-        return base_x + ix * cell, base_z + iz * cell
+    def flood(start: int) -> int:
+        queue = deque([start])
+        seen[start] = True
+        filled = 0
+        while queue:
+            current = queue.popleft()
+            filled += 1
+            first, remainder = divmod(current, strides[0])
+            second, third = divmod(remainder, size)
+            for axis, position in enumerate((first, second, third)):
+                for step in (-1, 1):
+                    if not 0 <= position + step < size:
+                        continue
+                    other = current + step * strides[axis]
+                    if not flat[other] and not seen[other]:
+                        seen[other] = True
+                        queue.append(other)
+        return filled
 
-    heights: dict[tuple[int, int], float] = {}
-    open_cells: set[tuple[int, int]] = set()
-    for iz in range(-span, span + 1):
-        for ix in range(-span, span + 1):
-            x, z = centre(ix, iz)
-            top = surface_height(x, z, world_seed)
-            heights[(ix, iz)] = top
-            colliders = _neighbourhood_colliders(world_to_chunk(x, z), world_seed)
-            if not _form_blocked(x, top + EYE_HEIGHT, z, colliders):
-                open_cells.add((ix, iz))
+    centre = size // 2
+    start = int(np.ravel_multi_index((centre, centre, centre), grid.solid.shape))
+    if flat[start]:
+        free = np.flatnonzero(~flat)
+        start = int(free[np.argmin(np.abs(free - start))])
+    reachable = flood(start)
+    reached = seen.copy().reshape(grid.solid.shape)
 
-    def linked(a: tuple[int, int], b: tuple[int, int]) -> bool:
-        """Whether a walker can stride from cell ``a`` to ``b``.
-
-        The segment is sampled at ``PROBE_SUBSTEP`` so the grade test matches
-        the short steps the walker actually takes; testing the 8-unit stride
-        in one go would read every slope as a wall.
-        """
-
-        ax, az = centre(*a)
-        bx, bz = centre(*b)
-        steps = max(1, int(round(cell / PROBE_SUBSTEP)))
-        px, pz, ph = ax, az, heights[a]
-        for index in range(1, steps + 1):
-            t = index / steps
-            nx, nz = ax + (bx - ax) * t, az + (bz - az) * t
-            nh = heights[b] if index == steps else surface_height(nx, nz, world_seed)
-            run = sqrt((nx - px) ** 2 + (nz - pz) ** 2)
-            if abs(nh - ph) > STEP_MAX or abs(nh - ph) > MAX_SLOPE * run:
-                return False
-            colliders = _neighbourhood_colliders(world_to_chunk(nx, nz), world_seed)
-            if _form_blocked(nx, nh + EYE_HEIGHT, nz, colliders):
-                # The walker slides round a form rather than stopping at it.
-                # Accept the stride if the slid-out point is still on the way
-                # to ``b`` and on walkable ground; a form sealing the whole
-                # gap leaves no such point.
-                sx, sz = resolve_collisions(nx, nh + EYE_HEIGHT, nz, colliders)
-                if _form_blocked(sx, nh + EYE_HEIGHT, sz, colliders):
-                    return False
-                if (sx - px) * (bx - ax) + (sz - pz) * (bz - az) <= 0.0:
-                    return False
-                sh = surface_height(sx, sz, world_seed)
-                if abs(sh - ph) > STEP_MAX:
-                    return False
-                nx, nz, nh = sx, sz, sh
-            px, pz, ph = nx, nz, nh
-        return True
-
-    neighbours: dict[tuple[int, int], list[tuple[int, int]]] = {c: [] for c in open_cells}
-    for a in open_cells:
-        for step in ((1, 0), (0, 1)):
-            b = (a[0] + step[0], a[1] + step[1])
-            if b in open_cells and linked(a, b):
-                neighbours[a].append(b)
-                neighbours[b].append(a)
-
-    # A cell with one orthogonal neighbour is only a pocket if it has no
-    # diagonal one either: the walker turns freely, so leaving on the diagonal
-    # is not retracing. Cells with two orthogonal neighbours already have a
-    # way through, so only the thin tail needs the extra four strides.
-    for a in (c for c in open_cells if len(neighbours[c]) < 2):
-        for step in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
-            b = (a[0] + step[0], a[1] + step[1])
-            if b in open_cells and b not in neighbours[a] and linked(a, b):
-                neighbours[a].append(b)
-
-    start = min(open_cells, key=lambda c: c[0] * c[0] + c[1] * c[1], default=None)
-    reachable: set[tuple[int, int]] = set()
-    if start is not None:
-        stack = [start]
-        reachable.add(start)
-        while stack:
-            current = stack.pop()
-            for other in neighbours[current]:
-                if other not in reachable:
-                    reachable.add(other)
-                    stack.append(other)
-    dead_ends = frozenset(c for c in open_cells if len(neighbours[c]) == 1)
-    return Walkability(
-        cell=cell,
-        origin=(0, 0),
-        bounds=(-span, -span, span, span),
-        open_cells=frozenset(open_cells),
-        reachable=frozenset(reachable),
-        dead_ends=dead_ends,
-    )
+    components = 1
+    for index in np.flatnonzero(~flat):
+        if not seen[index]:
+            components += 1
+            flood(int(index))
+    return Walkability(cell, open_count, reachable, components, reached)
 
 
-def open_heading(
-    x: float, y: float, z: float, colliders: np.ndarray, candidates: int = 16,
-    world_seed: int | None = None,
-) -> tuple[float, float]:
-    """Yaw with the longest unobstructed walk from (x, z), and that distance.
+def legibility(
+    world_seed: int,
+    origin: Vec3 | None = None,
+    radius: float = PROBE_RADIUS,
+    cell: float = PROBE_CELL,
+    grid: Occupancy | None = None,
+    samples: int = LEGIBLE_SAMPLES,
+) -> float:
+    """Share of open pockets that read as a place with walls and a way out.
 
-    Steps 1.5 units at a time along each candidate heading, resolving
-    collisions as the walker would and, when a seed is given, treating a
-    riser taller than a step as a wall. Stops when a step gains under a third
-    of its length. A spawn facing a wall would otherwise pin the walker.
+    From each sampled open cell the 26 compass directions are marched through
+    the occupancy grid. The pocket is legible when at least two run clear for
+    ``LEGIBLE_OPEN`` units - somewhere to go - and at least two meet a form
+    within ``LEGIBLE_NEAR`` - something to judge that opening against. Scattered
+    debris fails the second test; a sealed cellular foam fails the first.
     """
 
-    best_yaw, best_distance = 0.0, -1.0
-    # Start from a settled spot: a walker wedged between forms is inside an
-    # overlap, and probing from inside one reports every heading as open.
-    x, z = resolve_collisions(x, y, z, colliders)
-    for index in range(candidates):
-        yaw = index * 360.0 / candidates
-        heading = (sin(radians(yaw)), -cos(radians(yaw)))
-        px, pz = x, z
-        travelled = 0.0
-        for _ in range(40):
-            nx, nz = resolve_collisions(px + heading[0] * 1.5, y, pz + heading[1] * 1.5, colliders)
-            if world_seed is not None and step_blocked(px, pz, nx, nz, world_seed):
-                break
-            gained = (nx - px) * heading[0] + (nz - pz) * heading[1]
-            # A step that slides sideways more than it advances is a wall.
-            side = abs((nx - px) * heading[1] - (nz - pz) * heading[0])
-            if gained < 0.5 or side > gained:
-                break
-            travelled += gained
-            px, pz = nx, nz
-        if travelled > best_distance:
-            best_yaw, best_distance = yaw, travelled
-    return best_yaw, best_distance
+    if grid is None:
+        grid = occupancy_grid(world_seed, origin, radius, cell)
+    # Keep samples clear of the grid edge so a march never runs out of grid
+    # before it runs out of range.
+    margin = int(LEGIBLE_OPEN / cell) + 1
+    interior = grid.solid[margin:-margin, margin:-margin, margin:-margin]
+    free = np.argwhere(~interior) + margin
+    if free.shape[0] == 0:
+        return 0.0
+    rng = Random(_stable_seed(world_seed, _LEGIBLE_SALT))
+    step = cell * 0.5
+    legible = 0
+    for _ in range(samples):
+        pick = free[rng.randrange(free.shape[0])]
+        point = grid.center_of((int(pick[0]), int(pick[1]), int(pick[2])))
+        far_open = 0
+        near_blocked = 0
+        for direction in _COMPASS:
+            travelled = 0.0
+            while travelled < LEGIBLE_OPEN:
+                travelled += step
+                probe = (
+                    point[0] + direction[0] * travelled,
+                    point[1] + direction[1] * travelled,
+                    point[2] + direction[2] * travelled,
+                )
+                if grid.blocked(grid.index_of(probe)):
+                    if travelled <= LEGIBLE_NEAR:
+                        near_blocked += 1
+                    break
+            else:
+                far_open += 1
+        if far_open >= 2 and near_blocked >= 2:
+            legible += 1
+    return legible / samples
+
+
+# --- autopilot -------------------------------------------------------------
 
 
 class Autowalk:
-    """Idle stroll: wander at walking pace, drifting the gaze, turning at walls.
+    """Idle drift: fly at cruising pace, easing yaw and pitch, turning at walls.
 
     Heading and gaze both ease toward slowly re-rolled targets so the motion
-    reads as a person looking around rather than a camera on rails. A blocked
-    step (the walker gained under a third of it) picks the longest open heading
-    instead; ``open_heading`` is the same search the spawn uses.
+    reads as someone looking around rather than a camera on rails. A blocked
+    step - the flier gained under a third of it - retargets to the longest open
+    direction in three dimensions, the same search the spawn uses.
     """
 
     def __init__(self, seed: int = 0) -> None:
         self._rng = Random(seed)
-        self._world_seed = seed
         self._target_yaw: float | None = None
-        self._target_pitch = -4.0
+        self._target_pitch = 0.0
         self._retarget_at = 0.0
         self._turning_until = 0.0
-        self._anchor: tuple[float, float, float] | None = None
+        self._anchor: tuple[float, float, float, float] | None = None
         self._low_frames = 0
 
     def reset(self) -> None:
@@ -928,7 +1277,8 @@ class Autowalk:
         self._anchor = None
 
     def turning(self, now: float) -> bool:
-        """True while the walker stands and turns after a blocked step."""
+        """True while the flier hovers and turns after a blocked step."""
+
         return now < self._turning_until
 
     def step(
@@ -942,811 +1292,58 @@ class Autowalk:
         step_length: float,
         colliders: np.ndarray,
     ) -> tuple[float, float]:
-        """Advance the stroll one frame; returns the new (yaw, pitch).
+        """Advance the drift one frame; returns the new (yaw, pitch).
 
-        ``gained`` is the horizontal distance the previous step actually moved
-        after collision, against the ``step_length`` it asked for.
+        ``gained`` is the distance the previous step actually moved in three
+        dimensions after collision, against the ``step_length`` it asked for.
         """
+
         if self._target_yaw is None or now >= self._retarget_at:
             self._target_yaw = (yaw + self._rng.uniform(-70.0, 70.0)) % 360.0
-            self._target_pitch = self._rng.uniform(-14.0, 6.0)
+            self._target_pitch = self._rng.uniform(-26.0, 26.0)
             self._retarget_at = now + self._rng.uniform(4.0, 9.0)
-        # Progress is judged over a one-second window, not per frame: a walker
-        # oscillating against a riser still "gains" a step every frame.
+        # Progress is judged over a one-second window, not per frame: a flier
+        # grinding along a panel still "gains" a sliver every frame.
         stuck = False
         if self.turning(now) or step_length <= 0.0:
             self._anchor = None
             self._low_frames = 0
-            # Turning has an end: once the heading has swung round, walk,
-            # even if the target was reached early.
+            # Turning has an end: once the heading has swung round, fly on.
             if abs((self._target_yaw - yaw + 180.0) % 360.0 - 180.0) < 4.0:
                 self._turning_until = 0.0
         else:
             self._low_frames = self._low_frames + 1 if gained < step_length * 0.35 else 0
             stuck = self._low_frames >= 10
-        if self.turning(now) or step_length <= 0.0:
-            pass
-        elif self._anchor is None:
-            self._anchor = (position[0], position[2], now)
-        elif now - self._anchor[2] >= 1.0:
-            moved = sqrt((position[0] - self._anchor[0]) ** 2 + (position[2] - self._anchor[1]) ** 2)
-            stuck = stuck or moved < step_length / max(dt, 1e-6) * 0.35
-            self._anchor = (position[0], position[2], now)
+            if self._anchor is None:
+                self._anchor = (position[0], position[1], position[2], now)
+            elif now - self._anchor[3] >= 1.0:
+                moved = sqrt(
+                    sum((position[axis] - self._anchor[axis]) ** 2 for axis in range(3))
+                )
+                stuck = stuck or moved < step_length / max(dt, 1e-6) * 0.35
+                self._anchor = (position[0], position[1], position[2], now)
         if stuck:
-            open_yaw, distance = open_heading(
-                position[0], position[1], position[2], colliders, world_seed=self._world_seed
+            open_yaw, open_pitch, distance = open_heading(
+                position[0], position[1], position[2], colliders
             )
             self._low_frames = 0
-            if distance <= 3.0:
+            if distance <= 4.0:
                 # Boxed in on every heading: turn well away and try again.
                 open_yaw = (yaw + self._rng.uniform(120.0, 240.0)) % 360.0
+                open_pitch = self._rng.choice((-60.0, 60.0))
             elif distance < 25.0 and abs((open_yaw - yaw + 180.0) % 360.0 - 180.0) < 15.0:
                 # A pocket: every heading is short and the best one is the one
                 # just tried. Leave along a different edge instead.
                 open_yaw = (open_yaw + self._rng.choice((-90.0, 90.0, 180.0))) % 360.0
             self._target_yaw = open_yaw
+            self._target_pitch = max(-80.0, min(80.0, open_pitch))
             self._retarget_at = now + self._rng.uniform(3.0, 6.0)
-            # Stand and turn for a moment: pushing into the wall while the
-            # heading eases round is what made the stroll jitter in place.
+            # Hover and turn for a moment: pushing into the wall while the
+            # heading eases round is what made the drift jitter in place.
             self._turning_until = now + 1.2
         # Ease toward the targets along the shortest arc so a turn never spins.
         delta = (self._target_yaw - yaw + 180.0) % 360.0 - 180.0
         rate = 2.6 if self.turning(now) else 1.4
         new_yaw = (yaw + delta * min(1.0, rate * dt)) % 360.0
-        new_pitch = pitch + (self._target_pitch - pitch) * min(1.0, 0.9 * dt)
-        return new_yaw, new_pitch
-
-
-def _stride_points(
-    ax: float, az: float, bx: float, bz: float
-) -> list[tuple[float, float]]:
-    """Sample points along one probe stride, ending at (bx, bz)."""
-
-    run = sqrt((bx - ax) ** 2 + (bz - az) ** 2)
-    steps = max(1, int(round(run / PROBE_SUBSTEP)))
-    return [
-        (ax + (bx - ax) * index / steps, az + (bz - az) * index / steps)
-        for index in range(1, steps + 1)
-    ]
-
-
-def _landform_open(ax: float, az: float, bx: float, bz: float, world_seed: int) -> bool:
-    """Whether the landform along one probe stride stays walkable throughout.
-
-    Sampled at ``PROBE_SUBSTEP`` so the grade test matches the short steps the
-    walker takes; judging a whole probe cell in one stride reads every corridor
-    ramp as a wall.
-    """
-
-    px, pz = ax, az
-    ph = surface_height(ax, az, world_seed)
-    for nx, nz in _stride_points(ax, az, bx, bz):
-        nh = surface_height(nx, nz, world_seed)
-        rise = abs(nh - ph)
-        if rise > STEP_MAX or rise > MAX_SLOPE * sqrt((nx - px) ** 2 + (nz - pz) ** 2):
-            return False
-        px, pz, ph = nx, nz, nh
-    return True
-
-
-def _largest_component(neighbours: dict[tuple[int, int], list[tuple[int, int]]]) -> int:
-    """Size of the biggest connected group in an adjacency map."""
-
-    seen: set[tuple[int, int]] = set()
-    best = 0
-    for cell in neighbours:
-        if cell in seen:
-            continue
-        stack, size = [cell], 0
-        seen.add(cell)
-        while stack:
-            current = stack.pop()
-            size += 1
-            for other in neighbours[current]:
-                if other not in seen:
-                    seen.add(other)
-                    stack.append(other)
-        best = max(best, size)
-    return best
-
-
-def landform_reachable(
-    x: float,
-    z: float,
-    world_seed: int,
-    radius: float = _SPAWN_PROBE_RADIUS,
-    cell: float = PROBE_CELL,
-) -> float:
-    """Share of the landform within ``radius`` a walker can reach from (x, z).
-
-    Landform only: standing forms are thinned to leave gaps between them, so it
-    is the terraces and ravine walls that decide whether a spot is a pocket,
-    and skipping chunk generation keeps this cheap enough to run per spawn
-    candidate.
-    """
-
-    span = int(radius / cell)
-    cells = [
-        (ix, iz) for iz in range(-span, span + 1) for ix in range(-span, span + 1)
-    ]
-    neighbours: dict[tuple[int, int], list[tuple[int, int]]] = {c: [] for c in cells}
-    start = (0, 0)
-    reachable = {start}
-    stack = [start]
-    linked: dict[tuple[int, int], list[tuple[int, int]]] = {}
-
-    def edges(cell_key: tuple[int, int]) -> list[tuple[int, int]]:
-        if cell_key not in linked:
-            ax, az = x + cell_key[0] * cell, z + cell_key[1] * cell
-            linked[cell_key] = [
-                other
-                for other in (
-                    (cell_key[0] + dx, cell_key[1] + dz)
-                    for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1))
-                )
-                if other in neighbours
-                and _landform_open(
-                    ax, az, x + other[0] * cell, z + other[1] * cell, world_seed
-                )
-            ]
-        return linked[cell_key]
-
-    while stack:
-        current = stack.pop()
-        for other in edges(current):
-            if other not in reachable:
-                reachable.add(other)
-                stack.append(other)
-    return len(reachable) / len(cells)
-
-
-def spawn_pose(world_seed: int) -> tuple[Vec3, float, float]:
-    """Stand on open ground inside the relief, looking out along a drop.
-
-    Candidates are scored by how much the ring around them rises and falls, so
-    the walker starts surrounded by risers and ravines rather than on a flat
-    plate, and then taken best-first until one whose neighbourhood is at least
-    ``_SPAWN_MIN_REACHABLE`` connected is found: a dramatic spot the walker
-    cannot leave without retracing is worse than a plain one. The yaw faces
-    the lowest neighbour, which puts depth in the first frame.
-    """
-
-    candidates: list[tuple[float, float, float, float]] = []
-    for index in range(20):
-        x = (_unit_float(world_seed, _SPAWN_SALT, index, 1) - 0.5) * 700.0
-        z = (_unit_float(world_seed, _SPAWN_SALT, index, 2) - 0.5) * 700.0
-        here = surface_height(x, z, world_seed)
-        if ravine_depth(x, z, world_seed) > 20.0:
-            continue
-        # Reject a pocket: if every direction rises within a few steps the
-        # walker starts face-first in a riser.
-        close = [
-            surface_height(x + 12.0 * cos(radians(a)), z + 12.0 * sin(radians(a)), world_seed)
-            for a in range(0, 360, 45)
-        ]
-        if min(close) > here + 8.0:
-            continue
-        ring = [
-            (
-                surface_height(
-                    x + 40.0 * cos(radians(step * 45.0)),
-                    z + 40.0 * sin(radians(step * 45.0)),
-                    world_seed,
-                ),
-                step * 45.0,
-            )
-            for step in range(8)
-        ]
-        lowest, lowest_angle = min(ring)
-        highest = max(height for height, _ in ring)
-        score = min(highest - here, 48.0) + min(here - lowest, 48.0)
-        # Camera forward is (sin yaw, ., -cos yaw); the ring offset is
-        # (cos a, sin a) in x/z, so yaw = a + 90 points at that ring point.
-        candidates.append((score, x, z, (90.0 + lowest_angle) % 360.0))
-
-    candidates.sort(key=lambda item: -item[0])
-    chosen = candidates[0] if candidates else (0.0, 0.0, 0.0, 0.0)
-    for candidate in candidates:
-        if landform_reachable(candidate[1], candidate[2], world_seed) < _SPAWN_MIN_REACHABLE:
-            continue
-        # The landform check ignores forms. Run the form-aware probe over a
-        # short window too, so a spot the standing forms box in is skipped.
-        survey = walkable_components(
-            world_seed, (candidate[1], candidate[2]), _SPAWN_FORM_PROBE_RADIUS
-        )
-        if survey.reachable_fraction >= _SPAWN_MIN_REACHABLE:
-            chosen = candidate
-            break
-
-    _, x, z, yaw = chosen
-    # The landform check ignores forms; the chunk's standing forms may still
-    # box the spot in. Slide out of them the way the walker does, then walk
-    # the probe ring to the nearest cell a stride can leave from.
-    colliders = _neighbourhood_colliders(world_to_chunk(x, z), world_seed)
-    eye = surface_height(x, z, world_seed) + EYE_HEIGHT
-    x, z = resolve_collisions(x, eye, z, colliders)
-    if _form_blocked(x, eye, z, colliders) or open_heading(x, eye, z, colliders, world_seed=world_seed)[1] < 6.0:
-        for ring in (8.0, 16.0, 24.0):
-            for step in range(8):
-                nx = x + ring * cos(radians(step * 45.0))
-                nz = z + ring * sin(radians(step * 45.0))
-                ne = surface_height(nx, nz, world_seed) + EYE_HEIGHT
-                if not _form_blocked(nx, ne, nz, colliders) and open_heading(
-                    nx, ne, nz, colliders, world_seed=world_seed
-                )[1] >= 6.0:
-                    x, z = nx, nz
-                    break
-            else:
-                continue
-            break
-    pitch = -4.0 - 8.0 * _unit_float(world_seed, _SPAWN_SALT, 3)
-    return (x, walk_height(x, z, world_seed), z), yaw, pitch
-
-
-def world_label(world_seed: int, x: float = 0.0, z: float = 0.0) -> str:
-    """Short biome and palette label for the on-screen overlay."""
-
-    weights = biome_weights(x, z, world_seed)
-    ranked = sorted(weights.items(), key=lambda item: (-item[1], item[0]))
-    here = "+".join(name for name, weight in ranked if weight >= 0.2) or ranked[0][0]
-    primary, secondary, accent = world_palette(world_seed)
-    hues = [_hue_name(primary), _hue_name(secondary)]
-    if _hue_distance(accent, secondary) > 1e-6:
-        hues.append(_hue_name(accent))
-    return f"{here} / {'-'.join(dict.fromkeys(hues))}"
-
-
-# --- chunk scaffolding -----------------------------------------------------
-
-
-def _chunk_grid(coord: ChunkCoord, world_seed: int) -> tuple[HeightGrid, HeightGrid]:
-    """Landform top and ravine cut per cell of one chunk plus a one-cell margin.
-
-    Sampled once and shared by every biome generator in the chunk. The margin
-    is what lets a generator size a column against its neighbours across a
-    chunk border, so cliff faces come out solid instead of floating.
-    """
-
-    origin_x, origin_z = coord[0] * CHUNK_SIZE, coord[1] * CHUNK_SIZE
-    centers = {
-        (ix, iz): (origin_x + (ix + 0.5) * GRID_CELL, origin_z + (iz + 0.5) * GRID_CELL)
-        for iz in range(-1, GRID_DIVISIONS + 1)
-        for ix in range(-1, GRID_DIVISIONS + 1)
-    }
-    tops = {key: terrain_height(x, z, world_seed) for key, (x, z) in centers.items()}
-    cuts = {key: ravine_depth(x, z, world_seed) for key, (x, z) in centers.items()}
-    return tops, cuts
-
-
-def _cell_center(coord: ChunkCoord, ix: int, iz: int) -> tuple[float, float]:
-    return (
-        coord[0] * CHUNK_SIZE + (ix + 0.5) * GRID_CELL,
-        coord[1] * CHUNK_SIZE + (iz + 0.5) * GRID_CELL,
-    )
-
-
-
-def _ground_columns(
-    coord: ChunkCoord, tops: HeightGrid, cuts: HeightGrid, rng: Random
-) -> list[WorldCube]:
-    """The solid ground layer of one chunk: one column per grid cell.
-
-    Each column reaches down past its lowest neighbour, which is what turns a
-    terrace step into a real cliff face - a fixed-thickness plate leaves the
-    wall hollow and the landform reads flat from the air. Columns inside the
-    ravine network fade towards black so the channels stay legible.
-    """
-
-    cubes: list[WorldCube] = []
-    for iz in range(GRID_DIVISIONS):
-        for ix in range(GRID_DIVISIONS):
-            top = tops[(ix, iz)]
-            depth = max(GROUND_MIN_DEPTH, _neighbour_drop(tops, ix, iz) + 5.0)
-            center_x, center_z = _cell_center(coord, ix, iz)
-            # A flat pale floor plane is the sampler's strongest attractor at
-            # eye level: it completes it as a desk with a game controller on
-            # it, whatever the prompt says. A hard checker on global cell
-            # parity gives that plane converging grid lines instead, and the
-            # dark half supplies the true blacks the reference has. Parity is
-            # global so the pattern runs unbroken across chunk seams.
-            parity = (coord[0] * GRID_DIVISIONS + ix + coord[1] * GRID_DIVISIONS + iz) % 2
-            tone = (GROUND_TONE_DARK if parity else GROUND_TONE_LIGHT) * rng.uniform(
-                0.88, 1.12
-            )
-            # Ravine floors darken to about a third, not black: the walker
-            # stands in them now, and a black frame gives the sampler nothing.
-            tone = min(1.0, tone) * (1.0 - 0.62 * min(1.0, cuts[(ix, iz)] / 40.0))
-            cubes.append(
-                WorldCube(
-                    "ground",
-                    (center_x, top - depth * 0.5, center_z),
-                    (GRID_CELL * 0.5, depth * 0.5, GRID_CELL * 0.5),
-                    (0.0, 0.0, 0.0),
-                    (0.0, 0.0, 0.0),
-                    tone,
-                )
-            )
-    return cubes
-
-
-def _standing_blocks(
-    coord: ChunkCoord, world_seed: int, rng: Random
-) -> list[WorldCube]:
-    """Human-scale blocks and pillars scattered over the whole chunk.
-
-    This is what puts the walker among structures: a few dozen standing forms
-    between waist height and three storeys, dense enough that something is
-    always within a few steps in every direction but never so tight that a
-    heading is blocked. Every biome shares it; the biome generators add their
-    own giants on top.
-    """
-
-    cubes: list[WorldCube] = []
-    origin_x, origin_z = coord[0] * CHUNK_SIZE, coord[1] * CHUNK_SIZE
-    for _ in range(SKYLINE_PER_CHUNK):
-        x = origin_x + rng.uniform(4.0, CHUNK_SIZE - 4.0)
-        z = origin_z + rng.uniform(4.0, CHUNK_SIZE - 4.0)
-        base = terrain_height(x, z, world_seed)
-        height = rng.uniform(55.0, 110.0)
-        width = rng.uniform(2.0, 4.5)
-        cubes.append(
-            WorldCube(
-                "form",
-                (x, base + height * 0.5, z),
-                (width, height * 0.5, width * rng.uniform(0.6, 1.5)),
-                (rng.uniform(-3.0, 3.0), rng.uniform(0.0, 90.0), rng.uniform(-3.0, 3.0)),
-                (0.0, 0.0, 0.0),
-                rng.uniform(0.7, 1.0),
-            )
-        )
-    for _ in range(FIELD_BLOCKS_PER_CHUNK):
-        x = origin_x + rng.uniform(0.0, CHUNK_SIZE)
-        z = origin_z + rng.uniform(0.0, CHUNK_SIZE)
-        base = terrain_height(x, z, world_seed)
-        height = rng.choice((5.0, 9.0, 14.0, 22.0, 30.0)) * rng.uniform(0.7, 1.3)
-        # Slender: a form wider than a few steps fills the frame at eye level,
-        # and a narrow footprint is what lets the spacing rule keep a dense
-        # field instead of thinning it down to a handful per chunk.
-        width = rng.uniform(0.8, 2.0) * (1.0 + height / 90.0)
-        cubes.append(
-            WorldCube(
-                "form",
-                (x, base + height * 0.5, z),
-                (width, height * 0.5, width * rng.uniform(0.5, 1.4)),
-                (rng.uniform(-6.0, 6.0), rng.uniform(0.0, 90.0), rng.uniform(-6.0, 6.0)),
-                (0.0, 0.0, 0.0),
-                rng.uniform(0.6, 1.0),
-            )
-        )
-    return cubes
-
-
-def _neighbour_drop(tops: HeightGrid, ix: int, iz: int) -> float:
-    """Height difference from this cell down to its lowest 4-neighbour."""
-
-    top = tops[(ix, iz)]
-    return top - min(
-        tops.get((ix + dx, iz + dz), top)
-        for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1))
-    )
-
-
-def _fragment_cluster(
-    rng: Random, center: Vec3, scale: float, count: int
-) -> list[WorldCube]:
-    """A floating cluster of slabs at one size class.
-
-    Clusters are drawn at wildly different scales - gravel, plate, chunk-sized
-    slab - so a frame holds several orders of size at once instead of uniform
-    confetti.
-    """
-
-    spread = scale * 3.4
-    return [
-        WorldCube(
-            "form",
-            (
-                center[0] + rng.uniform(-spread, spread),
-                center[1] + rng.uniform(-spread * 0.5, spread * 0.9),
-                center[2] + rng.uniform(-spread, spread),
-            ),
-            (
-                scale * rng.uniform(0.6, 1.9),
-                scale * rng.uniform(0.12, 0.45),
-                scale * rng.uniform(0.5, 1.6),
-            ),
-            (rng.uniform(-48.0, 48.0), rng.uniform(0.0, 360.0), rng.uniform(-48.0, 48.0)),
-            (0.0, 0.0, 0.0),
-            rng.uniform(0.75, 1.0),
-        )
-        for _ in range(count)
-    ]
-
-
-# --- biome generators ------------------------------------------------------
-#
-# Generators add forms on top of the shared ground layer, thinned by their
-# blend weight, so a border chunk holds a mix of two landscapes over one solid
-# floor. They read only the shared grid, which is a pure function of the chunk
-# coord and seed, so generation stays deterministic and order independent.
-# Structural forms come first because the per-chunk cap truncates the tail.
-
-
-def _gen_strata(
-    coord: ChunkCoord,
-    world_seed: int,
-    weight: float,
-    rng: Random,
-    tops: HeightGrid,
-    cuts: HeightGrid,
-) -> list[WorldCube]:
-    """Terrace caps: chunk-sized flat slabs on the plateaus, rim overhangs, grit."""
-
-    cubes: list[WorldCube] = []
-    origin_x, origin_z = coord[0] * CHUNK_SIZE, coord[1] * CHUNK_SIZE
-
-    for _ in range(int(round(5 * weight))):
-        ix, iz = rng.randrange(GRID_DIVISIONS), rng.randrange(GRID_DIVISIONS)
-        center_x, center_z = _cell_center(coord, ix, iz)
-        # Caps hang above head height so the walker passes under them, not
-        # through them: a slab across the eye line is a blank frame for seconds.
-        half_height = rng.uniform(1.2, 3.6)
-        cubes.append(
-            WorldCube(
-                "form",
-                (center_x, tops[(ix, iz)] + half_height + rng.uniform(7.0, 16.0), center_z),
-                (rng.uniform(14.0, 30.0), half_height, rng.uniform(9.0, 22.0)),
-                (0.0, rng.uniform(0.0, 360.0), rng.uniform(-4.0, 4.0)),
-                (0.0, 0.0, 0.0),
-                rng.uniform(0.85, 1.0),
-            )
-        )
-
-    for iz in range(GRID_DIVISIONS):
-        for ix in range(GRID_DIVISIONS):
-            if rng.random() > weight * 0.45 or _neighbour_drop(tops, ix, iz) < 12.0:
-                continue
-            center_x, center_z = _cell_center(coord, ix, iz)
-            reach = GRID_CELL * rng.uniform(0.9, 1.8)
-            cubes.append(
-                WorldCube(
-                    "form",
-                    (
-                        center_x + rng.uniform(-reach, reach),
-                        tops[(ix, iz)] + rng.uniform(0.4, 2.6),
-                        center_z + rng.uniform(-reach, reach),
-                    ),
-                    (reach, rng.uniform(0.5, 1.6), GRID_CELL * rng.uniform(0.4, 0.9)),
-                    (rng.uniform(-10.0, 10.0), rng.uniform(0.0, 360.0), rng.uniform(-10.0, 10.0)),
-                    (0.0, 0.0, 0.0),
-                    rng.uniform(0.8, 1.0),
-                )
-            )
-
-    for _ in range(int(round(8 * weight))):
-        x = origin_x + rng.uniform(0.0, CHUNK_SIZE)
-        z = origin_z + rng.uniform(0.0, CHUNK_SIZE)
-        size = rng.uniform(1.5, 4.0)
-        cubes.append(
-            WorldCube(
-                "form",
-                (x, terrain_height(x, z, world_seed) + size, z),
-                (size, size, size),
-                (0.0, rng.uniform(0.0, 45.0), 0.0),
-                (0.0, 0.0, 0.0),
-                rng.uniform(0.5, 1.0),
-            )
-        )
-    return cubes
-
-
-def _gen_shards(
-    coord: ChunkCoord,
-    world_seed: int,
-    weight: float,
-    rng: Random,
-    tops: HeightGrid,
-    cuts: HeightGrid,
-) -> list[WorldCube]:
-    """Steeply tilted giant slabs and floating fragment clusters at three scales."""
-
-    cubes: list[WorldCube] = []
-    origin_x, origin_z = coord[0] * CHUNK_SIZE, coord[1] * CHUNK_SIZE
-
-    for _ in range(int(round(4 * weight))):
-        ix, iz = rng.randrange(GRID_DIVISIONS), rng.randrange(GRID_DIVISIONS)
-        center_x, center_z = _cell_center(coord, ix, iz)
-        # Tilted giants clear head height at their centre; their tilt still
-        # brings one edge down to the ground, which is the shard look.
-        cubes.append(
-            WorldCube(
-                "form",
-                (center_x, tops[(ix, iz)] + rng.uniform(12.0, 26.0), center_z),
-                (rng.uniform(12.0, 30.0), rng.uniform(1.0, 3.4), rng.uniform(7.0, 18.0)),
-                (rng.uniform(-28.0, 28.0), rng.uniform(0.0, 360.0), rng.uniform(-28.0, 28.0)),
-                (0.0, 0.0, 0.0),
-                rng.uniform(0.8, 1.0),
-            )
-        )
-
-    for _ in range(int(round(3 * weight))):
-        x = origin_x + rng.uniform(0.0, CHUNK_SIZE)
-        z = origin_z + rng.uniform(0.0, CHUNK_SIZE)
-        scale = rng.choice((2.6, 2.6, 4.5, 7.0))
-        # Big clusters stay low; at cruise altitude a high one fills the frame.
-        lift = rng.uniform(8.0, 46.0) if scale < 3.0 else rng.uniform(5.0, 20.0)
-        cubes += _fragment_cluster(
-            rng, (x, terrain_height(x, z, world_seed) + lift, z), scale, rng.randrange(3, 7)
-        )
-    return cubes
-
-
-def _gen_canyons(
-    coord: ChunkCoord,
-    world_seed: int,
-    weight: float,
-    rng: Random,
-    tops: HeightGrid,
-    cuts: HeightGrid,
-) -> list[WorldCube]:
-    """Ravine furniture: spires off the dark floors, slabs jutting over the rims."""
-
-    cubes: list[WorldCube] = []
-    for iz in range(GRID_DIVISIONS):
-        for ix in range(GRID_DIVISIONS):
-            if rng.random() > weight:
-                continue
-            center_x, center_z = _cell_center(coord, ix, iz)
-            top = tops[(ix, iz)]
-            if cuts[(ix, iz)] > 20.0:
-                if rng.random() < 0.3:
-                    spire = rng.uniform(12.0, 40.0)
-                    cubes.append(
-                        WorldCube(
-                            "form",
-                            (center_x, top + spire * 0.5, center_z),
-                            (rng.uniform(1.0, 3.2), spire * 0.5, rng.uniform(1.0, 3.2)),
-                            (0.0, rng.uniform(0.0, 90.0), 0.0),
-                            (0.0, 0.0, 0.0),
-                            rng.uniform(0.25, 0.7),
-                        )
-                    )
-                continue
-            if _neighbour_drop(tops, ix, iz) < 11.0 or rng.random() > 0.5:
-                continue
-            reach = GRID_CELL * rng.uniform(1.1, 2.4)
-            cubes.append(
-                WorldCube(
-                    "form",
-                    (center_x + rng.uniform(-reach, reach), top - rng.uniform(0.5, 5.0), center_z),
-                    (reach, rng.uniform(0.5, 1.5), GRID_CELL * rng.uniform(0.5, 1.2)),
-                    (0.0, rng.uniform(0.0, 360.0), rng.uniform(-7.0, 7.0)),
-                    (0.0, 0.0, 0.0),
-                    rng.uniform(0.7, 1.0),
-                )
-            )
-    return cubes
-
-
-def _gen_voxels(
-    coord: ChunkCoord,
-    world_seed: int,
-    weight: float,
-    rng: Random,
-    tops: HeightGrid,
-    cuts: HeightGrid,
-) -> list[WorldCube]:
-    """Dense ridges of small cubes plus a handful of house-sized boulders."""
-
-    cubes: list[WorldCube] = []
-    origin_x, origin_z = coord[0] * CHUNK_SIZE, coord[1] * CHUNK_SIZE
-
-    for _ in range(int(round(3 * weight))):
-        ix, iz = rng.randrange(GRID_DIVISIONS), rng.randrange(GRID_DIVISIONS)
-        center_x, center_z = _cell_center(coord, ix, iz)
-        size = rng.uniform(5.0, 13.0)
-        cubes.append(
-            WorldCube(
-                "form",
-                (center_x, tops[(ix, iz)] + size, center_z),
-                (size, size, size * rng.uniform(0.6, 1.0)),
-                (0.0, rng.uniform(0.0, 90.0), 0.0),
-                (0.0, 0.0, 0.0),
-                rng.uniform(0.8, 1.0),
-            )
-        )
-
-    for _ in range(int(round(60 * weight))):
-        x = origin_x + rng.uniform(0.0, CHUNK_SIZE)
-        z = origin_z + rng.uniform(0.0, CHUNK_SIZE)
-        if _ridge(x, z, 47.0, world_seed, _TERRAIN_SALT + 21) < 0.62:
-            continue
-        base = terrain_height(x, z, world_seed)
-        size = rng.uniform(1.6, 3.6)
-        for level in range(rng.randrange(1, 4)):
-            cubes.append(
-                WorldCube(
-                    "form",
-                    (x, base + size * (2 * level + 1), z),
-                    (size, size, size),
-                    (0.0, rng.uniform(0.0, 45.0), 0.0),
-                    (0.0, 0.0, 0.0),
-                    rng.uniform(0.45, 1.0),
-                )
-            )
-    return cubes
-
-
-def _gen_monoliths(
-    coord: ChunkCoord,
-    world_seed: int,
-    weight: float,
-    rng: Random,
-    tops: HeightGrid,
-    cuts: HeightGrid,
-) -> list[WorldCube]:
-    """Upright slabs, block bridges strung between them, and high fragments."""
-
-    cubes: list[WorldCube] = []
-    origin_x, origin_z = coord[0] * CHUNK_SIZE, coord[1] * CHUNK_SIZE
-
-    towers: list[Vec3] = []
-    for _ in range(int(round(5 * weight))):
-        x = origin_x + rng.uniform(5.0, CHUNK_SIZE - 5.0)
-        z = origin_z + rng.uniform(5.0, CHUNK_SIZE - 5.0)
-        height = rng.uniform(18.0, 48.0)
-        base = terrain_height(x, z, world_seed)
-        cubes.append(
-            WorldCube(
-                "form",
-                (x, base + height * 0.5, z),
-                (rng.uniform(3.0, 9.0), height * 0.5, rng.uniform(2.0, 6.0)),
-                (0.0, rng.uniform(0.0, 90.0), rng.uniform(-6.0, 6.0)),
-                (0.0, 0.0, 0.0),
-                rng.uniform(0.6, 1.0),
-            )
-        )
-        towers.append((x, base + height, z))
-
-    for index in range(len(towers) - 1):
-        if rng.random() > 0.55:
-            continue
-        start, end = towers[index], towers[index + 1]
-        span = sqrt((end[0] - start[0]) ** 2 + (end[2] - start[2]) ** 2)
-        blocks = max(4, min(12, int(span / 6.0)))
-        yaw = -degrees(atan2(end[2] - start[2], end[0] - start[0]))
-        for step in range(blocks):
-            amount = (step + 0.5) / blocks
-            arc = 4.0 * amount * (1.0 - amount)
-            cubes.append(
-                WorldCube(
-                    "form",
-                    (
-                        start[0] + (end[0] - start[0]) * amount,
-                        start[1] + (end[1] - start[1]) * amount - arc * rng.uniform(1.0, 6.0),
-                        start[2] + (end[2] - start[2]) * amount,
-                    ),
-                    (span / blocks * 0.55, rng.uniform(0.5, 1.4), rng.uniform(1.0, 2.6)),
-                    (0.0, yaw, 0.0),
-                    (0.0, 0.0, 0.0),
-                    rng.uniform(0.5, 0.95),
-                )
-            )
-
-    for _ in range(int(round(3 * weight))):
-        x = origin_x + rng.uniform(0.0, CHUNK_SIZE)
-        z = origin_z + rng.uniform(0.0, CHUNK_SIZE)
-        base = terrain_height(x, z, world_seed) + rng.uniform(52.0, 108.0)
-        cubes += _fragment_cluster(rng, (x, base, z), rng.choice((1.0, 2.4)), rng.randrange(3, 7))
-    return cubes
-
-
-_BIOME_GENERATOR: dict[
-    str, Callable[[ChunkCoord, int, float, Random, HeightGrid, HeightGrid], list[WorldCube]]
-] = {
-    "strata": _gen_strata,
-    "shards": _gen_shards,
-    "canyons": _gen_canyons,
-    "voxels": _gen_voxels,
-    "monoliths": _gen_monoliths,
-}
-
-
-def _blocks_walker(cube: WorldCube, world_seed: int) -> bool:
-    """Whether a form's body spans the walker's eye line on the ground below."""
-
-    if cube.role != "form":
-        return False
-    eye = terrain_height(cube.position[0], cube.position[2], world_seed) + EYE_HEIGHT
-    return (
-        cube.position[1] - cube.half_extents[1]
-        < eye
-        < cube.position[1] + cube.half_extents[1]
-    )
-
-
-def _thin_forms(cubes: list[WorldCube], world_seed: int) -> list[WorldCube]:
-    """Drop standing forms that would seal a walkable gap.
-
-    A form whose body spans the walker's eye line is kept only when it stands
-    on open ground off the ravine floors and clears every form already kept by
-    ``MIN_FORM_GAP`` plus the walker's own width. Overhead slabs and giants are
-    untouched, so the silhouette keeps its scale while the ground stays open.
-    """
-
-    blocks = [_blocks_walker(cube, world_seed) for cube in cubes]
-    radii = [
-        sqrt(cube.half_extents[0] ** 2 + cube.half_extents[2] ** 2) for cube in cubes
-    ]
-    # Biggest first: the giants carry the silhouette, so the field blocks are
-    # the ones thinned around them rather than the other way round.
-    order = sorted(
-        (index for index, blocking in enumerate(blocks) if blocking),
-        key=lambda index: (-radii[index], index),
-    )
-    keep = set()
-    footprints: list[tuple[float, float, float]] = []
-    clear = MIN_FORM_GAP + 2.0 * WALKER_RADIUS
-    for index in order:
-        cube = cubes[index]
-        x, z = cube.position[0], cube.position[2]
-        if ravine_depth(x, z, world_seed) > FORM_FREE_RAVINE:
-            continue
-        radius = radii[index]
-        if any(
-            (x - fx) ** 2 + (z - fz) ** 2 < (radius + fr + clear) ** 2
-            for fx, fz, fr in footprints
-        ):
-            continue
-        # A form standing against a riser wedges the gap beside it shut, which
-        # is where most of the remaining pockets came from; only ground that
-        # stays within a step on all four sides keeps one. This runs last
-        # because it is four extra height samples and the spacing test has
-        # already dropped most candidates.
-        here = terrain_height(x, z, world_seed)
-        if any(
-            abs(
-                terrain_height(
-                    x + dx * FORM_CLEAR_REACH, z + dz * FORM_CLEAR_REACH, world_seed
-                )
-                - here
-            )
-            > STEP_MAX
-            for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1))
-        ):
-            continue
-        keep.add(index)
-        footprints.append((x, z, radius))
-    return [
-        cube
-        for index, cube in enumerate(cubes)
-        if not blocks[index] or index in keep
-    ]
-
-
-def generate_chunk(coord: ChunkCoord, world_seed: int) -> WorldChunk:
-    """Generate one chunk independently of cache state or generation order."""
-
-    center_x = (coord[0] + 0.5) * CHUNK_SIZE
-    center_z = (coord[1] + 0.5) * CHUNK_SIZE
-    weights = biome_weights(center_x, center_z, world_seed)
-    present = sorted(
-        (name for name, weight in weights.items() if weight >= MIN_BIOME_WEIGHT),
-        key=lambda name: (-weights[name], name),
-    )
-    tops, cuts = _chunk_grid(coord, world_seed)
-    ground_rng = Random(_stable_seed(world_seed, coord[0], coord[1], _GROUND_SALT))
-    cubes = _ground_columns(coord, tops, cuts, ground_rng)
-    cubes.extend(_standing_blocks(coord, world_seed, ground_rng))
-    for name in present:
-        rng = Random(_stable_seed(world_seed, coord[0], coord[1], BIOME_NAMES.index(name)))
-        cubes.extend(_BIOME_GENERATOR[name](coord, world_seed, weights[name], rng, tops, cuts))
-    cubes = _thin_forms(cubes, world_seed)[:MAX_OBJECTS_PER_CHUNK]
-    return WorldChunk(
-        coord=coord,
-        biomes=tuple(present),
-        objects=tuple(
-            replace(cube, color=object_color(world_seed, cube.position, cube.role, cube.tone))
-            for cube in cubes
-        ),
-    )
+        new_pitch = pitch + (self._target_pitch - pitch) * min(1.0, rate * 0.7 * dt)
+        return new_yaw, max(-88.0, min(88.0, new_pitch))

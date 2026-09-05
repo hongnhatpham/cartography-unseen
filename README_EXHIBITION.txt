@@ -51,13 +51,14 @@ setup_first_run.bat
 
 CONTROLS
 --------
-W / A / S / D    Walk and strafe
+W / A / S / D    Fly along your gaze and strafe
+Q / E            Descend / rise, independent of gaze
 Mouse            Look around
-Shift            Run while held
+Shift            Fly faster while held
 Escape           Exit
 
-Space            New world: landscape seed, spawn viewpoint, style family
-                 (with its own sampler settings), prompt and diffusion seed
+Space            New prompt; keep current tuning, world, viewpoint and
+                 diffusion seed
 Shift + R        Choose a new diffusion seed
 P                Edit the prompt
 Enter            Apply a prompt while editing
@@ -75,9 +76,9 @@ F8               Toggle feedback reprojection: the previous frame, aligned
                  to the camera, becomes the walk memory (slower, stickier)
 F9               Cycle prompt auto-advance: off, 12, 24, 48, 96 s. Advancing
                  usually stays inside the current family and changes family
-                 about one time in three, and rotates the world's hue pair
-F12              Toggle autowalk. With no input for a minute the walker
-                 strolls on its own; any key or mouse movement takes over
+                 about one time in three. Current tuning and palette stay fixed
+F12              Toggle idle flight. With no input for a minute the camera
+                 flies on its own; any key or mouse movement takes over
 F10              Cycle generation resolution/aspect modes
 F11              Toggle fullscreen / windowed mode
 
@@ -91,13 +92,23 @@ N                Cycle noise-walk seconds: off, 2.5, 5, 10, 20, 40
 M                Cycle prompt-walk seconds: off, 3, 6, 12, 25, 50
 C                Cycle CFG: 1, 1.25, 1.5, 2, 3
 
-The walker stands at eye height on the terrain. Terrace risers are walls; the
-smooth pass corridors between levels are how you climb or descend. Standing
-forms are solid and you slide along them; overhangs hang above head height.
+Look up and hold W to climb, or look down to descend. Q/E changes height
+without changing your gaze. Release the keys to stop: there is no gravity
+or fixed eye height. There is no altitude limit: the world continues above
+and below you as well as horizontally. Forms are solid and you slide along
+them; pass above or below wherever there is space. Idle flight also steers
+up and down.
 
-Space preserves the current F1 state. If the F1 overlay is visible, it remains
-visible during a world change. If it is hidden, it remains hidden. Space never
-flashes the proxy geometry while the replacement generation is pending.
+The generated image carries the dense slab and terrace-like environment.
+There are no navigation contours or proximity reveals. Interior clutter
+thins along existing passages, giving them more room while retaining
+surrounding panels and denser areas. New geometry streams in as you fly
+up or down, keeping the environment around you at every height.
+
+Space changes only the prompt. CFG, guide strength and all other current
+settings stay as you set them. Your position, world seed, diffusion seed and
+diagnostic state also stay unchanged. The picture transitions using the current
+prompt-walk duration. Automatic prompt changes also preserve your tuning.
 
 Every accepted setting is written to config.json immediately and restored on the
 next launch. Freeze and diagnostic views remain session-only so the artwork does
@@ -138,8 +149,8 @@ list of prompts. Each family has:
   base       the tail shared by the family's variants
   variants   four subjects; one library prompt is built per variant as
              "<variant>, <base>"
-  settings   sampler overrides that apply while that family is selected
-             (timestep window, guide strength, CFG, depth guide, instability)
+  settings   sampler presets for offline style comparisons; live prompt
+             changes preserve your current tuning
 
 master_prefix ("corrupted 3D render") is prepended to every prompt.
 
@@ -150,9 +161,9 @@ and time, lattice, and the blocky biophilic cityscape of the original piece.
 Material nouns such as chrome or glass are kept out because they resolve into
 product shots and furnished rooms.
 
-Space always leaves the current family, so every reset changes the look
-completely rather than shuffling within one style. Automatic advance usually
-picks another variant of the same family.
+Space chooses a prompt from another family, avoiding recently used families
+when possible. Automatic advance usually picks another variant of the same
+family. Neither action applies the family's sampler presets.
 
 Families and variants can be added, removed or rewritten. Changes are read on the
 next Space press or automatic prompt change. A family's settings block may only
@@ -181,19 +192,22 @@ Four keys control how unstable the picture is. All of them are live and saved.
                             flickering. Off means unrelated noise every frame.
 
 prompt_walk_seconds (M) is how long the picture takes to morph from the current
-prompt to a new one; F9 sets how often a new library prompt is chosen. A style
-family's own settings are applied underneath, so a Space press changes the
-sampler regime as well as the words. Set either
-to 0 to turn it off. F7 provides a subtle prompt caption without the full F1
-diagnostics.
+prompt to a new one; F9 sets how often a new library prompt is chosen. Space
+and automatic prompt changes keep the current sampler settings. Set
+prompt_walk_seconds to 0 for an immediate transition, or the auto-advance
+interval to 0 to stop automatic changes. F7 provides a subtle prompt caption
+without the full F1 diagnostics.
 
 
 HOW THE IMAGE IS MADE
 ---------------------
-The application renders a fast procedural landscape of instanced cubes: stacked
-terraces, shard fields, ravine networks, voxel ridges and monolith bridges,
-blended across space so walking far enough reaches a different landscape. Each
-world derives its palette and sky from a seed.
+The application renders a dense procedural field of instanced cubes: thick
+panels, reefs, lattice bars, shards, columns and overhangs. Openings connect
+in three dimensions, with less interior clutter along passages. Each world
+derives its palette and sky from a seed. The renderer keeps a finite window
+of nearby chunks and streams new ones as you move in any direction. There
+is no ceiling or bottom boundary. Returning to a location recreates the
+same geometry. Fog hides the streaming edges.
 
 That render is never shown. It is uploaded to the GPU and encoded by TAESD into
 a latent, and then used only as a steering signal for a continuous walk: the
@@ -232,6 +246,12 @@ Launch directly in a particular generation mode with:
 
 TROUBLESHOOTING
 ---------------
+The normal AI view draws the proxy at the conditioning rate, while movement and
+world streaming keep updating at the display rate. Chunk loading uploads new
+geometry incrementally. These optimizations preserve the resolution, image
+settings and world density. F1 reports display and diffusion FPS separately;
+60 display FPS does not mean 60 newly generated AI images per second.
+
 First-run setup logs:
   logs\first_run_setup_YYYYMMDD_HHMMSS.log
 

@@ -1,0 +1,10 @@
+﻿{
+    "verification":  "Authenticated HTTP 200 text/html with expected content. Embedded-image and HTML validation, JavaScript syntax check, and generated-image visual inspection passed.",
+    "reportId":  "fable-spacing-directions",
+    "fileCount":  1,
+    "revision":  3,
+    "url":  "https://reports.bynhat.com/r/6082cc92993e561ab22f/",
+    "publicId":  "6082cc92993e561ab22f",
+    "localFile":  "fable-spacing.html",
+    "projectId":  "cartography-unseen"
+}

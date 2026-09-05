@@ -19,7 +19,10 @@ from app.diffusion.latent_walk import (
     blend_correlated_noise,
     breathing_timestep,
     classifier_free_guidance_enabled,
+    depth_nearness,
+    frame_nearness,
     infer_sampler,
+    near_far_from_projection,
     lcm_scalings,
     normalise_settings,
     predict_x0,
@@ -30,6 +33,7 @@ from app.diffusion.latent_walk import (
     wobbled_guide_strength,
 )
 from app.diffusion.worker import DiffusionWorker
+from app.renderer.camera import perspective
 from app.types import CameraSnapshot, ConditioningFrame
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -141,18 +145,42 @@ def test_the_slow_breath_tone_carries_a_long_loop_between_regimes() -> None:
 
 
 def test_guide_wobble_only_ever_tightens_the_anchor() -> None:
-    steady = {wobbled_guide_strength(t * 0.5, 0.65, 0.0) for t in range(20)}
-    wobbled = [wobbled_guide_strength(t * 0.5, 0.65, 1.0) for t in range(120)]
+    # Amplitude 0 is the shipped default: a steady anchor is what keeps a wall
+    # solid frame to frame, which is what the conformance work measured.
+    off = {wobbled_guide_strength(t * 0.5, 0.65, 1.0) for t in range(20)}
+    steady = {wobbled_guide_strength(t * 0.5, 0.65, 0.0, 0.28) for t in range(20)}
+    wobbled = [wobbled_guide_strength(t * 0.5, 0.65, 1.0, 0.28) for t in range(120)]
 
+    assert off == {0.65}
     assert steady == {0.65}
     # guide_strength is a floor: a trough below it is where the walk let go of
     # the proxy and drifted into interiors and lettering.
     assert min(wobbled) >= 0.65 - 1e-9
     assert max(wobbled) > 0.65
     assert all(0.0 <= value <= 1.0 for value in wobbled)
-    assert wobbled_guide_strength(7.25, 0.95, 1.0) == 1.0
+    assert wobbled_guide_strength(7.25, 0.95, 1.0, 0.28) == 1.0
     # The wobble is slow on purpose: a look has to hold long enough to settle.
     assert max(wobbled) - min(wobbled) > 0.2
+
+
+def test_nearness_spreads_a_depth_buffer_the_raw_values_flatten() -> None:
+    """The whole point of linearising: the raw buffer is useless past a metre."""
+    near, far = 0.05, 280.0
+    projection = perspective(82.0, 4.0 / 3.0, near, far)
+    assert near_far_from_projection(projection) == pytest.approx((near, far), rel=1e-3)
+    # A placeholder snapshot must not raise; it just switches the depth path off.
+    assert near_far_from_projection(np.identity(4)) == (0.0, 0.0)
+
+    distances = np.array([[2.0, 6.0, 40.0, 160.0]], dtype=np.float64)
+    ndc = ((far + near) - 2.0 * near * far / distances) / (far - near)
+    nearness = depth_nearness(((ndc + 1.0) * 0.5).astype(np.float32), near, far)
+
+    assert nearness[0, 0] == pytest.approx(1.0, abs=1e-3)
+    assert nearness[0, -1] == pytest.approx(0.0, abs=1e-3)
+    # Six units and forty units are a wall and an opening; they have to be far
+    # apart here or no downstream knob can tell them apart.
+    assert nearness[0, 1] - nearness[0, 2] > 0.3
+    assert all(nearness[0, i] > nearness[0, i + 1] for i in range(3))
 
 
 # -- memory statistics ------------------------------------------------------

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from math import cos, pi, radians, sin, tan
+from math import cos, radians, sin, tan
 from pathlib import Path
 from time import perf_counter
 import textwrap
@@ -19,16 +19,18 @@ from app.renderer.camera import Camera
 from app.renderer.world import (
     ACTIVE_CHUNK_RADIUS,
     CHUNK_SIZE,
+    MAX_ACTIVE_CHUNKS,
+    ChunkCoord,
     WorldChunk,
     WorldCube,
     chunk_colliders,
     open_heading,
     resolve_collisions,
-    settle_height,
-    step_blocked,
     generate_chunk,
+    nadir_color,
     plan_chunk_cache,
     sky_color,
+    SPAWN_PITCHES,
     zenith_color,
     spawn_pose,
     world_label,
@@ -36,10 +38,9 @@ from app.renderer.world import (
 )
 from app.types import ConditioningFrame, GeneratedFrame
 
-# Chunks generated per frame once the streaming window is warm. Eleven chunks
-# arrive per boundary crossing and a crossing takes about twenty frames at
-# cruise speed, so one per frame keeps the window warm inside the 16.7 ms budget.
-CHUNK_LOAD_BUDGET = 1
+# A boundary crossing adds a plane of small cubic chunks. Load the nearest
+# first; three per frame fills that plane well before it enters the visible fog.
+CHUNK_LOAD_BUDGET = 3
 
 
 def _cube_vertices() -> np.ndarray:
@@ -147,7 +148,7 @@ class ProxyRenderer:
             for name, buffer in self.mesh_buffers.items()
         }
         self._instance_counts = {name: 0 for name in meshes}
-        # Observability counter: how many times the instance buffer was rewritten.
+        # Observability counter: how many times geometry was uploaded.
         self._instance_buffer_revision = 0
         quad = np.asarray(
             [
@@ -165,9 +166,12 @@ class ProxyRenderer:
             self.reproject_program,
             [(self.quad_buffer, "2f 2f", "in_position", "in_uv")],
         )
+        # The sky reconstructs its ray from the clip-space corner, so the quad's
+        # uv pair is skipped rather than bound to an attribute GL would optimise
+        # away.
         self.sky_vao = self.ctx.vertex_array(
             self.sky_program,
-            [(self.quad_buffer, "2f 2f", "in_position", "in_uv")],
+            [(self.quad_buffer, "2f 2x4", "in_position")],
         )
         render_size = (self.render_width, self.render_height)
         self.color_texture = self.ctx.texture(render_size, 3, dtype="f1")
@@ -201,11 +205,13 @@ class ProxyRenderer:
 
         self.world_seed = world_seed
         self.sky_color = sky_color(world_seed)
-        self._chunks: dict[tuple[int, int], WorldChunk] = {}
-        self._chunk_instances: dict[tuple[int, int], np.ndarray] = {}
-        self._chunk_colliders: dict[tuple[int, int], np.ndarray] = {}
-        self._last_footfall: tuple[float, float] | None = None
-        self._stream_center: tuple[int, int] | None = None
+        self._chunks: dict[ChunkCoord, WorldChunk] = {}
+        self._chunk_instances: dict[ChunkCoord, np.ndarray] = {}
+        self._chunk_colliders: dict[ChunkCoord, np.ndarray] = {}
+        self._stream_center: ChunkCoord | None = None
+        self._render_origin = np.zeros(3, dtype=np.float64)
+        # Where the overlay label is sampled from; the biome field is 3D now.
+        self._focus: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self.sequence = 0
         self._closed = False
 
@@ -280,7 +286,9 @@ class ProxyRenderer:
         self.resize_window_to_render()
 
     @staticmethod
-    def _pack_instances(objects: tuple[WorldCube, ...]) -> np.ndarray:
+    def _pack_instances(
+        objects: tuple[WorldCube, ...], origin: np.ndarray | None = None
+    ) -> np.ndarray:
         """Pack column-major transforms and colors for one instanced draw.
 
         Vectorised over the whole chunk: a per-cube Python loop building 4x4
@@ -290,7 +298,9 @@ class ProxyRenderer:
         packed = np.zeros((count, 19), dtype="f4")
         if count == 0:
             return packed
-        position = np.array([item.position for item in objects], dtype="f4")
+        position = np.array([item.position for item in objects], dtype=np.float64)
+        if origin is not None:
+            position -= origin
         extents = np.array([item.half_extents for item in objects], dtype="f4")
         angles = np.radians(np.array([item.rotation for item in objects], dtype="f4"))
         cos_x, cos_y, cos_z = np.cos(angles).T
@@ -316,6 +326,10 @@ class ProxyRenderer:
         packed[:, 16:] = np.array([item.color for item in objects], dtype="f4")
         return packed
 
+    def update_world(self, position: np.ndarray) -> None:
+        """Keep streaming and the location label current even without a draw."""
+        self._update_world(position)
+
     def _update_world(self, position: np.ndarray) -> None:
         """Move the fixed chunk window, loading a bounded number of chunks.
 
@@ -324,13 +338,14 @@ class ProxyRenderer:
         populated, boundary crossings load at most CHUNK_LOAD_BUDGET chunks per
         frame; plan.load is centre-out, so the nearest arrive first.
         """
-        plan = plan_chunk_cache(
-            self._chunks,
-            float(position[0]),
-            float(position[2]),
-            ACTIVE_CHUNK_RADIUS,
-        )
+        self._focus = (float(position[0]), float(position[1]), float(position[2]))
+        center = world_to_chunk(*self._focus)
+        if center == self._stream_center and len(self._chunks) == MAX_ACTIVE_CHUNKS:
+            return
+        plan = plan_chunk_cache(self._chunks, *self._focus, ACTIVE_CHUNK_RADIUS)
+        rebuild = self._stream_center != plan.center or bool(plan.evict)
         self._stream_center = plan.center
+        self._render_origin = np.asarray(plan.center, dtype=np.float64) * CHUNK_SIZE
         if not plan.load and not plan.evict:
             return
 
@@ -339,110 +354,102 @@ class ProxyRenderer:
             del self._chunk_instances[coord]
             self._chunk_colliders.pop(coord, None)
         budget = len(plan.load) if not self._chunks else CHUNK_LOAD_BUDGET
-        for coord in plan.load[:budget]:
+        loaded = plan.load[:budget]
+        for coord in loaded:
             chunk = generate_chunk(coord, self.world_seed)
             self._chunks[coord] = chunk
-            self._chunk_instances[coord] = self._pack_instances(chunk.objects)
+            self._chunk_instances[coord] = self._pack_instances(
+                chunk.objects, origin=np.asarray(coord, dtype=np.float64) * CHUNK_SIZE
+            )
             self._chunk_colliders[coord] = chunk_colliders(chunk)
 
-        cube_data = np.concatenate(
-            tuple(
-                self._chunk_instances[coord]
-                for coord in plan.desired
-                if coord in self._chunk_instances
-            ),
-            axis=0,
-        )
         cube_buffer = self.instance_buffers["cube"]
-        if cube_data.nbytes > cube_buffer.size:
-            cube_buffer.orphan(cube_data.nbytes)
-        # np.concatenate is C-contiguous, so moderngl can upload it directly;
-        # tobytes() here costs a second copy of a couple of megabytes per load.
-        cube_buffer.write(cube_data)
-        self._instance_counts["cube"] = len(cube_data)
+        count = sum(len(part) for part in self._chunk_instances.values())
+        required_bytes = count * 19 * np.dtype("f4").itemsize
+        if required_bytes > cube_buffer.size:
+            # Growing a GL buffer discards its contents. Leave room for the rest
+            # of this window so its following batches can append in place.
+            cube_buffer.orphan(max(required_bytes, cube_buffer.size * 2))
+            rebuild = True
+        coords = (
+            tuple(coord for coord in plan.desired if coord in self._chunk_instances)
+            if rebuild else loaded
+        )
+        if coords:
+            parts = [self._chunk_instances[coord] for coord in coords]
+            cube_data = np.concatenate(parts, axis=0)
+            # Translate all instances together. Integer subtraction before the
+            # float conversion preserves detail during long vertical flights.
+            offsets = (np.asarray(coords, dtype=np.int64) - plan.center) * CHUNK_SIZE
+            cube_data[:, 12:15] += np.repeat(offsets, [len(part) for part in parts], axis=0)
+            offset = 0 if rebuild else self._instance_counts["cube"] * 19 * 4
+            cube_buffer.write(cube_data, offset=offset)
+        self._instance_counts["cube"] = count
         self._instance_buffer_revision += 1
 
     def _world_contains(self, position: np.ndarray) -> bool:
-        return world_to_chunk(float(position[0]), float(position[2])) in self._chunks
+        return world_to_chunk(*position) in self._chunks
 
     def spawn_camera(self, camera: Camera) -> None:
-        """Stand the walker on open ground inside this seed's relief.
+        """Float the flier in an open pocket of this seed's volume.
 
-        Resets the footfall memory so the riser check does not compare the new
-        spawn against wherever the walker last stood.
-
-        The landform picks the spot; the forms around it are only known once
-        the chunk exists, so the walker is then pushed out of anything it
-        spawned inside and turned to face the longest open walk.
+        The pocket is picked from the field alone; the forms around it are only
+        known once the chunk exists, so the flier is then pushed out of anything
+        it spawned inside and turned to face the longest clear line in 3D.
         """
         position, yaw, pitch = spawn_pose(self.world_seed)
         camera.position[:] = position
         camera.yaw = yaw
         camera.pitch = pitch
-        self._last_footfall = None
         self._update_world(camera.position)
-        colliders = self._nearby_colliders(float(position[0]), float(position[2]))
         self.constrain_camera(camera, None)
         x, y, z = (float(value) for value in camera.position)
-        open_yaw, distance = open_heading(x, y, z, colliders, world_seed=self.world_seed)
+        open_yaw, open_pitch, distance = open_heading(
+            x, y, z, self._nearby_colliders(x, y, z), pitches=SPAWN_PITCHES
+        )
         if distance > 0.0:
             camera.yaw = open_yaw
+            camera.pitch = open_pitch
 
     def nearby_colliders(self, camera: Camera) -> np.ndarray:
-        """Standing-form footprints around the camera, for autowalk steering."""
-        return self._nearby_colliders(float(camera.position[0]), float(camera.position[2]))
+        """Form boxes around the camera, for autopilot steering."""
+        return self._nearby_colliders(*camera.position)
 
-    def open_heading(self, camera: Camera) -> tuple[float, float]:
-        """Yaw of the longest unobstructed walk from the camera, and its length."""
+    def open_heading(self, camera: Camera) -> tuple[float, float, float]:
+        """(yaw, pitch) of the longest clear line from the camera, and its length."""
         x, y, z = (float(value) for value in camera.position)
-        return open_heading(x, y, z, self._nearby_colliders(x, z), world_seed=self.world_seed)
+        return open_heading(x, y, z, self._nearby_colliders(x, y, z))
 
-    def _nearby_colliders(self, x: float, z: float) -> np.ndarray:
-        """Footprints from the 3x3 chunks around (x, z), stacked for one query."""
-        home = world_to_chunk(x, z)
+    def _nearby_colliders(self, x: float, y: float, z: float) -> np.ndarray:
+        """Boxes from the 3x3x3 chunk neighbourhood, including above and below."""
+        home = world_to_chunk(x, y, z)
         nearby = [
             self._chunk_colliders[coord]
             for coord in (
-                (home[0] + dx, home[1] + dz) for dx in (-1, 0, 1) for dz in (-1, 0, 1)
+                (home[0] + dx, home[1] + dy, home[2] + dz)
+                for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)
             )
             if coord in self._chunk_colliders
         ]
         return np.concatenate(nearby, axis=0) if nearby else np.empty((0, 8))
 
     def constrain_camera(self, camera: Camera, dt: float | None = None) -> None:
-        """Slide the walker out of standing forms, then settle it onto the terrain.
+        """Slide out of solid forms without restricting altitude.
 
-        ``dt`` rate-limits climbs; None snaps straight to the walk height.
+        ``dt`` is unused: with no gravity there is nothing to settle toward, but
+        the signature stays so the caller's per-frame loop is unchanged.
         """
+        if not self._world_contains(camera.position):
+            self._update_world(camera.position)
         x, y, z = (float(value) for value in camera.position)
-        x, z = resolve_collisions(x, y, z, self._nearby_colliders(x, z))
-        # A riser taller than a step is a wall: keep whichever axis of the
-        # move stays on walkable ground, so the walker slides along the edge.
-        # This runs after form collision so a push out of a block can never
-        # land the walker on the far side of a riser; the last footfall is
-        # always a legal spot to fall back to.
-        if self._last_footfall is not None:
-            last_x, last_z = self._last_footfall
-            if step_blocked(last_x, last_z, x, z, self.world_seed):
-                if not step_blocked(last_x, last_z, x, last_z, self.world_seed):
-                    z = last_z
-                elif not step_blocked(last_x, last_z, last_x, z, self.world_seed):
-                    x = last_x
-                else:
-                    x, z = last_x, last_z
-        self._last_footfall = (x, z)
+        x, y, z = resolve_collisions(x, y, z, self._nearby_colliders(x, y, z))
         camera.position[0] = x
+        camera.position[1] = y
         camera.position[2] = z
-        camera.position[1] = settle_height(x, y, z, self.world_seed, dt)
 
     def world_label(self) -> str:
-        """Short biome and palette label for the overlay, at the streamed center."""
-        center = self._stream_center or (0, 0)
-        return world_label(
-            self.world_seed,
-            (center[0] + 0.5) * CHUNK_SIZE,
-            (center[1] + 0.5) * CHUNK_SIZE,
-        )
+        """Short biome and palette label for the overlay, where the flier is."""
+        return world_label(self.world_seed, *self._focus)
 
     def randomize_world(self, world_seed: int | None = None) -> int:
         """Switch to a new (or given) world seed and drop every cached chunk."""
@@ -484,37 +491,55 @@ class ProxyRenderer:
         self.ctx.disable(moderngl.CULL_FACE)
         self.proxy_fbo.clear(*self.sky_color, 1.0, depth=1.0)
         self._draw_sky(camera)
-        self.proxy_program["view"].write(snapshot.view_matrix.T.astype("f4").tobytes())
+        local_view = self._local_view(snapshot.view_matrix)
+        self.proxy_program["view"].write(local_view.T.astype("f4").tobytes())
         self.proxy_program["projection"].write(snapshot.projection_matrix.T.astype("f4").tobytes())
-        self.proxy_program["camera_position"].value = tuple(float(value) for value in camera.position)
+        self.proxy_program["camera_position"].value = tuple(camera.position - self._render_origin)
+        self.proxy_program["pattern_origin"].value = tuple(np.remainder(self._render_origin, 10.0))
         self.proxy_program["fog_color"].value = self.sky_color
+        self.proxy_program["zenith_color"].value = zenith_color(self.world_seed)
+        self.proxy_program["nadir_color"].value = nadir_color(self.world_seed)
         for mesh, count in self._instance_counts.items():
             if count:
                 self.mesh_vaos[mesh].render(instances=count)
         return snapshot
 
-    def _draw_sky(self, camera: Camera) -> None:
-        """Graded sky behind everything: fog tint at the horizon, darker zenith.
+    def _local_view(self, view: np.ndarray) -> np.ndarray:
+        """Express a world camera in the origin used by this GPU instance buffer."""
+        result = view.astype(np.float64).copy()
+        result[:3, 3] += result[:3, :3] @ self._render_origin
+        return result
 
-        Drawn at the far depth so geometry always wins; the horizon line
-        follows the camera pitch so the gradient stays anchored to the world.
+    def _draw_sky(self, camera: Camera) -> None:
+        """Graded background behind everything: sky above, dark below, fog level.
+
+        Drawn at the far depth so geometry always wins. The gradient is a
+        function of the world-space view ray, not of screen height, so it stays
+        anchored however far the flier pitches up or down.
         """
         self.ctx.disable(moderngl.DEPTH_TEST)
-        # Screen-space v of the horizon for this pitch (0 bottom, 1 top).
-        half_fov = radians(camera.fov) * 0.5
-        horizon_v = 0.5 - tan(radians(camera.pitch)) / (2.0 * tan(half_fov))
+        forward = camera.forward
+        right = camera.right
+        up = np.cross(right, forward)
+        self.sky_program["camera_right"].value = tuple(float(value) for value in right)
+        self.sky_program["camera_up"].value = tuple(float(value) for value in up)
+        self.sky_program["camera_forward"].value = tuple(float(value) for value in forward)
+        self.sky_program["tan_half_fov"].value = float(tan(radians(camera.fov) * 0.5))
+        self.sky_program["aspect"].value = self.render_width / self.render_height
         self.sky_program["fog_color"].value = self.sky_color
         self.sky_program["zenith_color"].value = zenith_color(self.world_seed)
-        self.sky_program["horizon_v"].value = float(min(max(horizon_v, -0.5), 1.5))
+        self.sky_program["nadir_color"].value = nadir_color(self.world_seed)
         self.sky_vao.render()
         self.ctx.enable(moderngl.DEPTH_TEST)
 
-    def capture_conditioning(self, snapshot, timestamp: float) -> ConditioningFrame:
+    def capture_conditioning(
+        self, snapshot, timestamp: float, *, include_edges: bool = True
+    ) -> ConditioningFrame:
         rgb = np.frombuffer(self.color_texture.read(alignment=1), dtype=np.uint8)
         rgb = np.flipud(rgb.reshape(self.render_height, self.render_width, 3)).copy()
         depth = np.frombuffer(self.depth_texture.read(alignment=1), dtype=np.float32)
         depth = np.flipud(depth.reshape(self.render_height, self.render_width)).copy()
-        edges = self._edges(rgb, depth)
+        edges = self._edges(rgb, depth) if include_edges else None
         self.sequence += 1
         return ConditioningFrame(rgb, depth, edges, snapshot, timestamp, self.sequence)
 
@@ -545,7 +570,8 @@ class ProxyRenderer:
                 [normalized * 80, normalized * 190, normalized * 255], axis=2
             ).astype(np.uint8)
         if mode == "edges":
-            return np.repeat(frame.edges[:, :, None], 3, axis=2)
+            edges = frame.edges if frame.edges is not None else ProxyRenderer._edges(frame.rgb, frame.depth)
+            return np.repeat(edges[:, :, None], 3, axis=2)
         return frame.rgb
 
     def display(
@@ -650,8 +676,8 @@ class ProxyRenderer:
             (1.0 - base_scale) * 0.5 + pitch_delta / 105.0,
         )
 
-        source_vp = frame.projection_matrix @ frame.view_matrix
-        current_vp = current.projection_matrix @ current.view_matrix
+        source_vp = frame.projection_matrix @ self._local_view(frame.view_matrix)
+        current_vp = current.projection_matrix @ self._local_view(current.view_matrix)
         inverse_current_vp = np.linalg.inv(current_vp).astype("f4")
 
         # render_scene above produces a depth texture from the exact same
