@@ -1,6 +1,6 @@
 # Latent Space
 
-Latent Space is a real-time Windows installation. You move freely through a dense procedural landscape of blocks, curved forms and open wire structures, and a diffusion model continuously rewrites what you see. The 3D render is never shown in the normal AI view: it is a steering signal for a continuous walk through latent space. WASD and mouse movement stay responsive between diffusion updates through GPU depth reprojection.
+Latent Space is a real-time Windows installation. You move freely through a dense procedural landscape of blocks, curved forms and open wire structures, and a diffusion model continuously rewrites what you see. The 3D render is never shown in the normal AI view: it is a steering signal for a continuous walk through latent space. Input and display run independently of AI generation. Depth reprojection is optional and remains disabled in the current exhibition settings.
 
 ## One-click installation
 
@@ -24,6 +24,21 @@ The NVIDIA display driver must already be installed. A separate CUDA Toolkit is 
 
 ## Controls
 
+Open the F1 diagnostics overlay to unlock settings hotkeys. Closing it locks
+them immediately. Movement, mouse look, Space, Enter, Escape and F1 always work.
+Temporary loading or status panels do not unlock settings.
+
+After ten seconds without player input, the Cartography Unseen title fades
+in at the upper left and movement instructions appear at the lower right.
+They use Emergent Play's Space Grotesk and IBM Plex Mono typography. The fade
+takes 1.2 seconds; keyboard or mouse input fades them out in 0.25 seconds.
+Holding a key or mouse button counts as activity. Automatic flight and prompt
+changes leave them visible. Diagnostics, prompt editing and status panels hide
+them, and the instructions sit above the prompt caption when it is enabled.
+The text is cached locally and faded on the GPU; it does not enter AI generation.
+Title and control text are 2.25 times their original size, with proportional
+fitting on smaller windows to preserve the gap between them.
+
 | Key | Action |
 |---|---|
 | W / A / S / D | Fly along your gaze and strafe |
@@ -31,7 +46,8 @@ The NVIDIA display driver must already be installed. A separate CUDA Toolkit is 
 | Mouse | Look |
 | Shift | Fly faster |
 | Escape | Exit |
-| Space | New prompt; preserve current tuning, world, viewpoint and diffusion seed |
+| Space | New prompt and random tuning within the ranges below; keep world, viewpoint and diffusion seed |
+| Enter | Save the displayed AI image as a PNG in `screenshot/` |
 | Shift + R | New diffusion seed |
 | P | Edit prompt |
 | F1 | Diagnostics overlay |
@@ -42,7 +58,7 @@ The NVIDIA display driver must already be installed. A separate CUDA Toolkit is 
 | F6 | Return to generated AI view |
 | F7 | Prompt caption at the bottom |
 | F8 | Toggle feedback reprojection |
-| F9 | Cycle prompt auto-advance: off, 12, 24, 48, 96 s. Each advance chooses a different family and preserves current tuning |
+| F9 | Cycle prompt auto-advance: off, 12, 24, 48, 96 s. Each advance chooses a different family and samples new tuning |
 | F12 | Toggle idle flight (starts after a minute without input) |
 | F10 | Cycle resolution modes |
 | F11 | Fullscreen / windowed |
@@ -50,7 +66,7 @@ The NVIDIA display driver must already be installed. A separate CUDA Toolkit is 
 | - / = | Diffusion steps, 1–4 |
 | , / . | Display sharpening |
 | H / J | Fog distance nearer / farther in steps of 10. Nearer means more fog |
-| V | Toggle the five-second player trail |
+| V | Toggle the ten-second player trail |
 | I / O | Instability down / up |
 | K / L | Guide strength down / up |
 | T / Y | Shift the timestep window down / up by 25 |
@@ -58,9 +74,21 @@ The NVIDIA display driver must already be installed. A separate CUDA Toolkit is 
 | M | Cycle prompt-walk seconds: off, 3, 6, 12, 25, 50 |
 | C | Cycle CFG: 1, 1.25, 1.5, 2, 3 |
 
-While editing a prompt, Enter applies it, Escape cancels, and Ctrl+D restores the default text. Space changes only the prompt and preserves all current settings, including CFG and guide strength. It also keeps your position, world seed, diffusion seed and diagnostic state.
+Screenshots preserve the displayed crop, sharpening and reprojection, excluding
+all text, diagnostics and the player trail. Timestamped filenames avoid replacing
+earlier captures. PNG compression and writing run in the background, with one save
+pending at a time. Capture requires the generated AI view, not proxy/depth/edge mode.
 
-Every accepted setting is written back to `config.json` immediately, so the next launch restores it. Freeze and diagnostic views stay session-only. Editing `config.json` in a text editor while the app runs also works: changes are picked up within half a second.
+While editing a prompt, Enter applies it instead of saving a screenshot, Escape cancels, and Ctrl+D restores the default text. Each new subject independently samples these settings:
+
+- Timestep window: independently sample the lower bound from 80 to 200 and the upper bound from 280 to 400. The window width varies with each draw.
+- Sharpness: 1.00–2.00.
+- Instability: 0–40%.
+- Guide strength: 65–100%.
+
+Space, timed advance, changed text accepted in the prompt editor, and external prompt edits all trigger this variation. CFG, fog, position, world and diffusion seeds, diagnostic state, and other settings stay unchanged. Automatic variation works with F1 closed; manual settings hotkeys still require F1. Regional color changes during travel do not sample new tuning.
+
+Manual settings changes are written back to `config.json` immediately. Space and accepted prompt edits save the prompt and its sampled settings; timed prompt choices and their tuning remain session-only. Startup uses the saved settings until a new subject is chosen. Freeze and diagnostic views stay session-only. Editing `config.json` in a text editor while the app runs also works: changes are picked up within half a second.
 
 `fog_distance` controls how far away structures fully fade into the atmosphere.
 The default, 196 world units, matches the original fog. Its range is 40–300.
@@ -69,12 +97,54 @@ distance. The setting affects the proxy sent to the AI and survives prompt chang
 
 Movement has no gravity, fixed eye height or altitude limit. Look up and hold W to climb, look down to descend, or use Q/E to change height without changing your gaze. The world continues above and below you as well as horizontally. Release the keys to stop. Solid forms still block movement and you slide along them; you can pass above or below them wherever there is space. Idle flight also steers in three dimensions.
 
-The generated image carries the environment. An optional pale filament marks the
-last five seconds of travel, fading oldest-first and disappearing when you stop.
-Press V to toggle it; `player_trail` saves the choice. Turning it off clears the
+The generated image carries the environment. An optional pale, 15-pixel-wide trail marks the
+last ten seconds of travel, fading oldest-first and disappearing when you stop.
+With F1 open, press V to toggle it; `player_trail` saves the choice. Turning it off clears the
 route. It sits slightly below the travelled path so you can see it when looking
 back, and structures hide it where the route passes behind them. The trail is
 drawn after the AI image so its fade stays exact and does not alter generation.
+Its visible end leaves a four-unit gap along your route, measured from the
+displayed frame's capture time so newer marks cannot appear ahead of an older AI view.
+
+## Continuous-run monitoring
+
+Run `runtime/python/python.exe tools/soak_test.py --minutes 30` to monitor the real
+app for thirty minutes after its first AI frame. It uses a copy of your config,
+starts idle flight after two seconds, and exits normally at the end. Escape or
+closing the window ends the run early and marks it incomplete.
+
+Results go in a timestamped folder under `logs/performance/`: `summary.json`,
+per-minute CSV/JSON timings and per-second process memory samples, with NVIDIA
+telemetry every ten seconds. The summary includes frame stalls, generation and
+prompt timing, garbage collection pauses, memory trends, worker errors and
+resolution fallbacks. Timing percentiles have one-millisecond precision.
+`stalls.jsonl` records display intervals above 50 ms with overlapping render,
+navigation, event-polling, frame-wait and worker stages, including garbage
+collections. Its queues are bounded, and disk writes run on the sampler thread.
+Add `--fixed-settings` for comparisons with automatic prompt advance and random
+tuning disabled and the initial AI palette held constant. Rendered world colours
+still vary with location; your saved configuration stays unchanged.
+Normal monitoring preserves the app's input path. On Windows, a separate thread
+owns the window and SDL input; drawing reads buffered input and can continue
+during a native event wait. The monitor still times those native waits
+on the owning thread. `--split-poll` is rejected on Windows because it would pump
+input from the drawing thread. It remains a diagnostic override on other platforms.
+
+For repeatable comparisons, run `runtime/python/python.exe tools/replay_performance.py
+--seconds 120 --max-stall-ms 100`. This uses a saved config copy, fixes generation
+at 384×256 and CFG 1.5, holds the prompt and seed, and follows the same camera route
+from the first AI frame. Collision queries run, but their displacement is overridden
+to keep the route independent of frame timing. Escape and Quit remain available.
+Every display interval, generation duration and new AI image publication interval
+is saved to `timings.csv`. The command also checks `--max-ai-gap-ms 250` by default,
+so repeated presentation of an old image cannot hide an AI freeze. It fails if
+either threshold is exceeded, the run ends early, measurements are lost, or
+generation falls back to lower resolution.
+See [the input-stutter investigation](docs/performance/window-input-stutter-20260905.md).
+
+Use `--minutes 10080` for a full week on the exhibition computer. A thirty-minute
+run can expose early slowdown or memory growth; it cannot establish week-long
+reliability. Launch `run.bat` afterward to return to normal operation.
 
 The dense slabs and layered spaces retain the KOSMA reference direction. Interior clutter thins along existing passages, giving them more room while retaining surrounding panels and denser areas. Free flight changes how you traverse them; it does not add sparse floating islands or an open-sky setting.
 
@@ -110,6 +180,36 @@ across 42 sampled views, including partial loads and distant positive and negati
 altitudes. Resolution, CFG, sampler settings, model precision and world density
 remain unchanged.
 
+Streaming yields after three milliseconds of chunk construction or three chunks,
+whichever comes first. Startup still fills the complete window. The renderer
+retains packed arrays instead of duplicate source objects, and the source-chunk
+cache holds only 128 recent chunks. Revisiting an evicted region regenerates the
+same geometry within that frame budget. The 11x11x11 active window is unchanged.
+
+Only Pygame's display and font subsystems start. Unused joystick and audio
+initialization previously introduced work into Windows event polling; the app
+uses keyboard and mouse input.
+Input polling uses a one-millisecond event wait, which releases Python's shared
+lock during native Windows processing, then drains the queue without pumping
+again. Text composition is enabled only while the prompt editor is open.
+The trail uses screen-space triangles to retain its 15-pixel width even on
+graphics drivers that cap native line width at ten pixels.
+
+Published raw frames now reuse their GPU image until the frame changes. The
+renderer retains the frame itself, avoiding recycled-object-ID errors, and
+restores the correct texture when switching views. In a fixed-image comparison,
+180 repeated refreshes avoided 53 MB of duplicate uploads and reduced presentation
+time from 0.65 to 0.45 ms per refresh, with identical screen pixels.
+
+World streaming caches repeated channel-field samples and the current ordered
+chunk window. Both caches are bounded for endless exploration. A six-boundary
+CPU profile fell from 3.10 to 2.43 seconds, with identical geometry, colors,
+transforms and colliders across 1,331 chunks. Reprojection also skips live-camera
+renders between captures; its interpolated-camera depth still updates every
+display frame. These are reductions in component work, not a measured AI FPS
+increase. Live inference timing remained variable. Same-frame buffered readback
+was slower in testing and was not adopted.
+
 Prompt changes reuse a bounded cache of 64 text embeddings, including the shared
 negative prompt. After model warmup, long-lived startup objects are excluded from
 full garbage-collection scans. New objects still undergo normal collection, and
@@ -127,14 +227,16 @@ AI p95 from 203 to 118 ms and the longest display interval from 99 to 65 ms.
 
 `prompts.json` holds **style families**, not flat prompts. Each family has a `name`, a
 `base` tail shared by its variants, four subject `variants`, and a `settings` block
-of sampler presets for offline style comparisons. Live prompt changes preserve
-your current settings. One library entry is built per variant as
+of sampler presets for offline style comparisons. Live subject changes use the
+random tuning ranges above. One library entry is built per variant as
 `"<variant>, <base>"`, and `master_prefix` ("corrupted 3D render") is prepended to all of
 them.
 
-The eleven shipped families are Topology Unknown, Biophilic City, Mangled Data, Wire
+The twelve shipped families are Topology Unknown, Biophilic City, Mangled Data, Wire
 Field, Washed Strata, Warped Spacetime, Corrupted Bloom, Datamosh Ravines, Cellular
-Karst, Root Networks and Membrane Folds. The three organic families add porous
+Karst, Root Networks, Membrane Folds and Distant Presences. Distant Presences adds
+four views with small human silhouettes and distant figures, partly hidden by
+fog or structures. The three organic families add porous
 formations, branching strands and curved sheets without the voxel wording used
 by the original subjects. There are 44 variants in total. They are
 deliberately abstract: wires, corruption, data, mangled geometry, warped space and time,
@@ -155,7 +257,7 @@ pair. The proxy supplies the new curved and wire forms; there is no shared shape
 phrase appended to every subject. The saved prompt, default prompt and library
 text stay unchanged. Travelling into a different color region updates the hue cue
 through the existing prompt interpolation, without changing the subject or restarting
-the automatic prompt timer.
+the automatic prompt timer or sampling new tuning.
 
 A flat `"prompts": ["...", ...]` list still loads, with each entry treated as its own
 family carrying no settings.
@@ -184,7 +286,7 @@ family carrying no settings.
 | `noise_jitter` | `0.12` | Small variance-preserving jitter mixed into the walk noise |
 | `prompt_walk_seconds` | `6.0` | Seconds to slerp CLIP embeddings to a new prompt. 0 hard-cuts |
 | `prompt_auto_advance_seconds` | `24.0` | Seconds between changes to a different library prompt family. 0 disables |
-| per-family `settings` | — | Sampler presets retained for offline style comparisons. Space and auto-advance preserve the current live settings |
+| per-family `settings` | — | Sampler presets retained for offline style comparisons. Live subject changes use the random tuning ranges above |
 | `feedback_reprojection` | `false` | Use the camera-aligned previous frame as the walk memory in place of `x0_prev`. The proxy still guides every frame. Costs about 39 ms of CPU per frame |
 | `seed` | `12345` | Noise keyframe seed |
 | `world_seed` | — | Landscape seed; preserved when the prompt changes |
@@ -197,7 +299,7 @@ family carrying no settings.
 
 The renderer streams deterministic geometry in 64-unit chunks, in an 11x11x11 window around the camera. Thick panels define walls and openings, and a connected channel field opens routes horizontally and vertically. Reefs, lattice bars, shards, columns and overhangs remain, with curved wire sheets, ribbed arches, open cages and rounded solids added among them. Along the channel field, 5% to 65% of interior object groups are omitted to clear passages while retaining the panels.
 
-The seeded palette varies by region, with stronger color across surfaces and the surrounding atmosphere. Panels retain light and dark value breaks, but their surface checker texture is removed so it cannot become a repeated pattern in the AI image. The new forms and palette preserve the current resolution, CFG, guidance and other sampler settings.
+The seeded palette varies by region, with stronger color across surfaces and the surrounding atmosphere. Broad, soft mottling varies surface brightness at two scales, giving the AI detail to interpret across large faces without a checker pattern. The mottling stays attached to the world through travel and coordinate rebasing, including at remote coordinates. It changes surface color only; geometry, normals and four-step lighting stay the same. The forms, palette and surface variation preserve the current resolution, CFG, guidance and other sampler settings.
 
 Six local palettes combine teal, cobalt, violet, rose, yellow, lime and pale accents
 in 128-unit regions across all three axes. Materials belong to their world positions.
@@ -213,10 +315,19 @@ That render is hidden in the normal AI view. Every conditioning frame is uploade
 - `x0_prev` is the previous predicted clean latent, the memory of the walk.
 - Each frame first re-anchors the memory to the proxy latent (`memory_match`, `memory_match_std`, `memory_leash`) so hue and contrast cannot random-walk, then blends it toward the encoded proxy by `guide_strength`, adds noise at a timestep that breathes between `timestep_min` and `timestep_max`, runs one UNet step, and solves back to a clean latent.
 - The noise is not independent per frame. It slerps between seeded keyframes over `noise_walk_seconds`, which is what makes forms melt and regrow instead of flickering.
-- Prompt changes slerp the CLIP embeddings over `prompt_walk_seconds` rather than cutting. A pair of the local landscape's hues follows the original prompt and changes as the player enters another color region. Space and timed changes avoid recent subject families. Prompt changes preserve the world, camera, noise seed, latent memory and sampler settings.
+- Prompt changes slerp the CLIP embeddings over `prompt_walk_seconds` rather than cutting. A pair of the local landscape's hues follows the original prompt and changes as the player enters another color region. Space and timed changes avoid recent subject families. New subjects sample the tuning ranges above while preserving the world, camera, noise seed and latent memory. Regional hue updates preserve tuning.
 - TAESD decodes the result. The full VAE is never loaded in the realtime path.
 
 `instability` scales both the timestep breathing and the guide wobble; at 0 both are pinned to their configured centres. Everything stays on the GPU as fp16, `channels_last` on the UNet, one uint8 readback per frame.
+
+During startup, the backend prepares CUDA Graphs for the UNet at the current
+resolution, with and without CFG. Each frame supplies the current latent,
+timestep and prompt embeddings to the recorded GPU operations. This reduces
+Python submission delays while preserving the computation and precision.
+Unsupported capture uses ordinary inference at the same quality. Changing
+resolution releases the graphs and uses ordinary inference until the next launch.
+See [the freeze investigation](docs/performance/inference-freezes-20260905.md)
+for measured gaps between new AI images and validation results.
 
 With F5 reprojection enabled, the GPU warps the latest generated frame through the
 live camera between diffusion updates. With it disabled, the display holds the

@@ -64,7 +64,7 @@ def test_collision_does_not_clamp_free_flight_at_large_altitudes():
     renderer._chunk_colliders = {}
     for height in (-1_000_000_000.0, 1_000_000_000.0):
         camera = Camera(position=np.array((0.0, height, 0.0)))
-        renderer._chunks = {world.world_to_chunk(*camera.position): None}
+        renderer._chunk_instances = {world.world_to_chunk(*camera.position): None}
         renderer.constrain_camera(camera)
         assert camera.position[1] == height
 

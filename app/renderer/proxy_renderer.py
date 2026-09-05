@@ -4,6 +4,7 @@ from math import cos, radians, sin, tan
 from pathlib import Path
 from time import perf_counter
 import textwrap
+import sys
 
 import numpy as np
 
@@ -18,6 +19,9 @@ except ImportError as exc:  # pragma: no cover - rendered as a startup error by 
 from app.renderer.camera import Camera
 from app.config import DEFAULT_FOG_DISTANCE
 from app.renderer.form_meshes import form_meshes
+from app.renderer.idle_overlay import IdleOverlay
+from app.screenshots import ScreenshotWriter
+from app.window_loop import WindowLoop
 from app.renderer.player_trail import PlayerTrail
 from app.renderer.trail_renderer import TrailRenderer
 from app.renderer.world import (
@@ -25,7 +29,6 @@ from app.renderer.world import (
     CHUNK_SIZE,
     MAX_ACTIVE_CHUNKS,
     ChunkCoord,
-    WorldChunk,
     WorldCube,
     WorldForm,
     chunk_colliders,
@@ -41,9 +44,10 @@ from app.renderer.world import (
 )
 from app.types import CameraSnapshot, ConditioningFrame, GeneratedFrame
 
-# A boundary crossing adds a plane of small cubic chunks. Load the nearest
-# first; three per frame fills that plane well before it enters the visible fog.
+# A boundary crossing adds a plane of chunks. Load nearest first, yielding
+# after a short construction budget so expensive chunks do not stack up.
 CHUNK_LOAD_BUDGET = 3
+CHUNK_LOAD_SECONDS = .003
 
 
 def _cube_vertices() -> np.ndarray:
@@ -73,8 +77,33 @@ class ProxyRenderer:
         world_seed: int = 12345,
         fog_distance: float = DEFAULT_FOG_DISTANCE,
     ) -> None:
-        pygame.init()
         pygame.font.init()
+        create_window = lambda: self._create_window(window_size, fullscreen, display_monitor)
+        self._window_loop = WindowLoop(create_window) if sys.platform == "win32" else None
+        if self._window_loop is None:
+            create_window()
+        window_size = self._window_size()
+
+        self.ctx = None
+        try:
+            self.ctx = moderngl.create_context(require=330)
+            self._initialize_renderer(project_root, resolution, window_size, world_seed, fog_distance)
+        except BaseException:
+            # main cannot close an object whose constructor did not return.
+            # Destroy the context/window even if shader or asset setup failed.
+            try:
+                if self.ctx is not None:
+                    self.ctx.release()
+            finally:
+                if self._window_loop:
+                    self._window_loop.close()
+                else:
+                    pygame.quit()
+            raise
+
+    @staticmethod
+    def _create_window(window_size, fullscreen, display_monitor):
+        pygame.display.init()
         pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
         pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
         pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE)
@@ -93,13 +122,14 @@ class ProxyRenderer:
             result = pygame.display.toggle_fullscreen()
             if result < 0:
                 raise RuntimeError(f"SDL could not enter fullscreen: {pygame.get_error()}")
-        window_size = pygame.display.get_window_size()
-        pygame.display.set_caption("Latent Space")
+        pygame.display.set_caption("Cartography Unseen")
         pygame.event.set_grab(True)
         pygame.mouse.set_visible(False)
         pygame.mouse.get_rel()
+        # The prompt editor explicitly enables composition when opened.
+        pygame.key.stop_text_input()
 
-        self.ctx = moderngl.create_context(require=330)
+    def _initialize_renderer(self, project_root, resolution, window_size, world_seed, fog_distance):
         self.ctx.enable(moderngl.DEPTH_TEST)
         self.project_root = project_root
         self.fog_distance = fog_distance
@@ -112,6 +142,7 @@ class ProxyRenderer:
 
         shader_root = project_root / "shaders"
         self.trail_renderer = TrailRenderer(self.ctx, shader_root)
+        self.idle_overlay = IdleOverlay(self.ctx, project_root, window_size)
         self.proxy_program = self.ctx.program(
             vertex_shader=(shader_root / "proxy.vert").read_text(encoding="utf-8"),
             fragment_shader=(shader_root / "proxy.frag").read_text(encoding="utf-8"),
@@ -205,13 +236,18 @@ class ProxyRenderer:
         self._overlay_size = window_size
         self._last_overlay_update = 0.0
         self._last_overlay_key = ""
+        self._overlay_surface = pygame.Surface(window_size, pygame.SRCALPHA)
+        self._overlay_regions = [None, None]
+        self._overlay_text_cache = {}
+        self._overlay_texture_initialized = False
         self.loading_image = self._make_loading_image(self.render_width, self.render_height)
-        self._reproject_sequence = -1
+        self._display_frame: ConditioningFrame | GeneratedFrame | None = None
+        self._reproject_frame: GeneratedFrame | None = None
         self.reproject_ms = 0.0
 
         self.world_seed = world_seed
         self.sky_color, self.zenith_color, self.nadir_color = atmosphere_colors(world_seed)
-        self._chunks: dict[ChunkCoord, WorldChunk] = {}
+        # Packed arrays own the active world; do not also retain source objects.
         self._chunk_instances: dict[ChunkCoord, np.ndarray] = {}
         self._chunk_form_instances: dict[ChunkCoord, dict[str, np.ndarray]] = {}
         self._form_instances: dict[str, np.ndarray] = {}
@@ -225,30 +261,56 @@ class ProxyRenderer:
         self.sequence = 0
         self._closed = False
 
+    def _window_size(self):
+        return self._window_loop.size if self._window_loop else pygame.display.get_window_size()
+
+    def _window_call(self, function):
+        return self._window_loop.call(function) if self._window_loop else function()
+
+    def set_prompt_editing(self, editing: bool):
+        def change():
+            if editing:
+                pygame.key.start_text_input()
+            else:
+                pygame.key.stop_text_input()
+            pygame.event.set_grab(not editing)
+            pygame.mouse.set_visible(editing)
+            pygame.mouse.get_rel()
+        self._window_call(change)
+        if self._window_loop:
+            self._window_loop.read_input()
+
+    def read_input(self):
+        if self._window_loop:
+            return self._window_loop.read_input()
+        return pygame.mouse.get_rel(), pygame.key.get_pressed(), pygame.mouse.get_pressed()
+
     def toggle_fullscreen(self) -> bool:
         """Switch display mode without rebuilding the active OpenGL context."""
-        result = pygame.display.toggle_fullscreen()
-        if result < 0:
-            raise RuntimeError(f"SDL could not toggle fullscreen: {pygame.get_error()}")
-        is_fullscreen = bool(pygame.display.is_fullscreen())
+        if self._window_loop:
+            is_fullscreen = self._window_loop.toggle_fullscreen()
+        else:
+            result = pygame.display.toggle_fullscreen()
+            if result < 0:
+                raise RuntimeError(f"SDL could not toggle fullscreen: {pygame.get_error()}")
+            is_fullscreen = bool(pygame.display.is_fullscreen())
         if not is_fullscreen:
             self.resize_window_to_render()
-        self.window_size = pygame.display.get_window_size()
+        self.window_size = self._window_size()
         self._last_overlay_update = 0.0
-        pygame.event.set_grab(True)
-        pygame.mouse.set_visible(False)
-        pygame.mouse.get_rel()
+        self.set_prompt_editing(False)
         return is_fullscreen
 
     def resize_window_to_render(self) -> None:
         """Match a windowed SDL window to the active generation dimensions."""
-        if pygame.display.is_fullscreen():
-            return
-        from pygame._sdl2 import Window
-
-        window = Window.from_display_module()
-        window.size = (self.render_width, self.render_height)
-        self.window_size = pygame.display.get_window_size()
+        def resize():
+            if not pygame.display.is_fullscreen():
+                from pygame._sdl2 import Window
+                Window.from_display_module().size = (self.render_width, self.render_height)
+            if self._window_loop:
+                self._window_loop.size = pygame.display.get_window_size()
+        self._window_call(resize)
+        self.window_size = self._window_size()
         self._last_overlay_update = 0.0
 
     def set_resolution(self, resolution: tuple[int, int]) -> None:
@@ -292,7 +354,8 @@ class ProxyRenderer:
             self.reproject_texture, self.reproject_depth
         )
         self.loading_image = self._make_loading_image(width, height)
-        self._reproject_sequence = -1
+        self._display_frame = None
+        self._reproject_frame = None
         self.resize_window_to_render()
 
     @staticmethod
@@ -345,14 +408,14 @@ class ProxyRenderer:
 
         A cold cache (startup, or a new world seed) is filled in one go because
         a half-built landscape is worse than one hitch. Once the window is
-        populated, boundary crossings load at most CHUNK_LOAD_BUDGET chunks per
-        frame; plan.load is centre-out, so the nearest arrive first.
+        populated, boundary crossings yield after three milliseconds of work or
+        CHUNK_LOAD_BUDGET chunks. The nearest chunks still arrive first.
         """
         self._focus = (float(position[0]), float(position[1]), float(position[2]))
         center = world_to_chunk(*self._focus)
-        if center == self._stream_center and len(self._chunks) == MAX_ACTIVE_CHUNKS:
+        if center == self._stream_center and len(self._chunk_instances) == MAX_ACTIVE_CHUNKS:
             return
-        plan = plan_chunk_cache(self._chunks, *self._focus, ACTIVE_CHUNK_RADIUS)
+        plan = plan_chunk_cache(self._chunk_instances, *self._focus, ACTIVE_CHUNK_RADIUS)
         rebuild = self._stream_center != plan.center or bool(plan.evict)
         self._stream_center = plan.center
         self._render_origin = np.asarray(plan.center, dtype=np.float64) * CHUNK_SIZE
@@ -360,15 +423,15 @@ class ProxyRenderer:
             return
 
         for coord in plan.evict:
-            del self._chunks[coord]
             del self._chunk_instances[coord]
             self._chunk_form_instances.pop(coord, None)
             self._chunk_colliders.pop(coord, None)
-        budget = len(plan.load) if not self._chunks else CHUNK_LOAD_BUDGET
-        loaded = plan.load[:budget]
-        for coord in loaded:
+        cold = not self._chunk_instances
+        budget = len(plan.load) if cold else CHUNK_LOAD_BUDGET
+        started = perf_counter()
+        loaded = []
+        for coord in plan.load[:budget]:
             chunk = generate_chunk(coord, self.world_seed)
-            self._chunks[coord] = chunk
             self._chunk_instances[coord] = self._pack_instances(
                 chunk.objects, origin=np.asarray(coord, dtype=np.float64) * CHUNK_SIZE
             )
@@ -380,6 +443,10 @@ class ProxyRenderer:
                 mesh: self._pack_instances(tuple(forms), origin=np.asarray(coord, dtype=np.float64) * CHUNK_SIZE)
                 for mesh, forms in by_mesh.items()
             }
+            loaded.append(coord)
+            if not cold and perf_counter() - started >= CHUNK_LOAD_SECONDS:
+                break
+        loaded = tuple(loaded)
 
         cube_buffer = self.instance_buffers["cube"]
         count = sum(len(part) for part in self._chunk_instances.values())
@@ -466,7 +533,7 @@ class ProxyRenderer:
         self._form_view_key = key
 
     def _world_contains(self, position: np.ndarray) -> bool:
-        return world_to_chunk(*position) in self._chunks
+        return world_to_chunk(*position) in self._chunk_instances
 
     def spawn_camera(self, camera: Camera) -> None:
         """Float the flier in an open pocket of this seed's volume.
@@ -537,7 +604,6 @@ class ProxyRenderer:
             else int(world_seed)
         )
         self.sky_color, self.zenith_color, self.nadir_color = atmosphere_colors(self.world_seed)
-        self._chunks.clear()
         self._chunk_instances.clear()
         self._chunk_form_instances.clear()
         self._form_instances.clear()
@@ -546,7 +612,8 @@ class ProxyRenderer:
         self._chunk_colliders.clear()
         self._stream_center = None
         self._instance_counts = {name: 0 for name in self.mesh_buffers}
-        self._reproject_sequence = -1
+        self._display_frame = None
+        self._reproject_frame = None
         return self.world_seed
 
     @staticmethod
@@ -581,6 +648,11 @@ class ProxyRenderer:
         self.proxy_program["view"].write(local_view.T.astype("f4").tobytes())
         self.proxy_program["projection"].write(snapshot.projection_matrix.T.astype("f4").tobytes())
         self.proxy_program["camera_position"].value = tuple(camera.position - self._render_origin)
+        # Keep both noise scales attached to the world through origin rebases,
+        # without uploading huge coordinates to the float32 shader. Match the
+        # scales and lattice period in proxy.frag.
+        self.proxy_program["surface_origin_coarse"].value = tuple(np.remainder(self._render_origin * 0.20, 256.0))
+        self.proxy_program["surface_origin_fine"].value = tuple(np.remainder(self._render_origin * 0.53, 256.0))
         self.proxy_program["fog_color"].value = self.sky_color
         self.proxy_program["fog_distance"].value = self.fog_distance
         self.proxy_program["zenith_color"].value = self.zenith_color
@@ -660,6 +732,28 @@ class ProxyRenderer:
             return np.repeat(edges[:, :, None], 3, axis=2)
         return frame.rgb
 
+    def _upload_display_image(
+        self, image: np.ndarray, frame: ConditioningFrame | GeneratedFrame | None = None,
+    ) -> None:
+        """Retain the published frame, so recycled IDs cannot freeze the image.
+
+        Unversioned or diagnostic arrays still upload every time because callers
+        may mutate them. Raw and reprojected views share this texture and cache.
+        """
+        if frame is not None:
+            source = frame.rgb if isinstance(frame, ConditioningFrame) else frame.image
+            if image is not source:
+                frame = None
+        if frame is not None and self._display_frame is frame:
+            return
+        target_shape = (self.render_height, self.render_width)
+        if image.shape[:2] != target_shape:
+            surface = pygame.surfarray.make_surface(np.swapaxes(image, 0, 1))
+            surface = pygame.transform.smoothscale(surface, (self.render_width, self.render_height))
+            image = np.swapaxes(pygame.surfarray.array3d(surface), 0, 1)
+        self.display_texture.write(np.ascontiguousarray(np.flipud(image)).tobytes())
+        self._display_frame = frame
+
     def display(
         self,
         image: np.ndarray,
@@ -670,18 +764,10 @@ class ProxyRenderer:
         trail: PlayerTrail | None = None,
         trail_frame: ConditioningFrame | GeneratedFrame | None = None,
         trail_time: float = 0.0,
+        idle_opacity: float = 0.0,
+        screenshot: ScreenshotWriter | None = None,
     ) -> None:
-        target_shape = (self.render_height, self.render_width)
-        if image.shape[:2] != target_shape:
-            surface = pygame.surfarray.make_surface(np.swapaxes(image, 0, 1))
-            surface = pygame.transform.smoothscale(
-                surface, (self.render_width, self.render_height)
-            )
-            image = np.swapaxes(pygame.surfarray.array3d(surface), 0, 1)
-        # Always upload the selected presentation image. Python can recycle an
-        # ndarray object's identity, so identity-based caching occasionally left
-        # the proxy texture visually frozen even though the camera was moving.
-        self.display_texture.write(np.ascontiguousarray(np.flipud(image)).tobytes())
+        self._upload_display_image(image, trail_frame)
 
         self._present_texture(
             self.display_texture, overlay_lines, sharpen, prompt_caption,
@@ -689,7 +775,14 @@ class ProxyRenderer:
             trail_camera=self._frame_camera(trail_frame) if trail_frame is not None else None,
             trail_depth=trail_frame.depth if trail_frame is not None else None,
             trail_time=trail_time,
+            trail_until=self._frame_time(trail_frame) if trail_frame is not None else None,
+            idle_opacity=idle_opacity,
+            screenshot=screenshot,
         )
+
+    @staticmethod
+    def _frame_time(frame: ConditioningFrame | GeneratedFrame) -> float:
+        return frame.timestamp if isinstance(frame, ConditioningFrame) else frame.conditioning_timestamp
 
     @staticmethod
     def _frame_camera(frame: ConditioningFrame | GeneratedFrame) -> CameraSnapshot:
@@ -713,18 +806,13 @@ class ProxyRenderer:
         *,
         trail: PlayerTrail | None = None,
         trail_time: float = 0.0,
+        idle_opacity: float = 0.0,
+        screenshot: ScreenshotWriter | None = None,
     ) -> None:
         started = perf_counter()
-        if frame.sequence != self._reproject_sequence:
-            image = frame.image
+        self._upload_display_image(frame.image, frame)
+        if self._reproject_frame is not frame:
             target_shape = (self.render_height, self.render_width)
-            if image.shape[:2] != target_shape:
-                surface = pygame.surfarray.make_surface(np.swapaxes(image, 0, 1))
-                surface = pygame.transform.smoothscale(
-                    surface, (self.render_width, self.render_height)
-                )
-                image = np.swapaxes(pygame.surfarray.array3d(surface), 0, 1)
-            self.display_texture.write(np.ascontiguousarray(np.flipud(image)).tobytes())
             depth = frame.depth
             if depth.shape != target_shape:
                 depth_surface = pygame.surfarray.make_surface(
@@ -737,7 +825,7 @@ class ProxyRenderer:
             self.reproject_source_depth.write(
                 np.ascontiguousarray(np.flipud(depth).astype("f4")).tobytes()
             )
-            self._reproject_sequence = frame.sequence
+            self._reproject_frame = frame
 
         live = camera.snapshot(aspect=self.render_width / self.render_height)
         raw_delta = live.position - frame.camera_position
@@ -769,6 +857,9 @@ class ProxyRenderer:
                 self.display_texture, overlay_lines, sharpen, prompt_caption,
                 trail=trail, trail_camera=self._frame_camera(frame),
                 trail_depth=frame.depth, trail_time=trail_time,
+                trail_until=frame.conditioning_timestamp,
+                idle_opacity=idle_opacity,
+                screenshot=screenshot,
             )
             return
         current = self.render_scene(warped_camera, manage_chunks=False)
@@ -820,6 +911,9 @@ class ProxyRenderer:
             self.reproject_texture, overlay_lines, sharpen, prompt_caption,
             trail=trail, trail_camera=current, trail_depth=self.depth_texture,
             trail_time=trail_time,
+            trail_until=frame.conditioning_timestamp,
+            idle_opacity=idle_opacity,
+            screenshot=screenshot,
         )
 
     def _present_texture(
@@ -833,8 +927,11 @@ class ProxyRenderer:
         trail_camera: CameraSnapshot | None = None,
         trail_depth: np.ndarray | moderngl.Texture | None = None,
         trail_time: float = 0.0,
+        trail_until: float | None = None,
+        idle_opacity: float = 0.0,
+        screenshot: ScreenshotWriter | None = None,
     ) -> None:
-        current_size = pygame.display.get_window_size()
+        current_size = self._window_size()
         if current_size != self.window_size:
             self.window_size = current_size
 
@@ -857,14 +954,27 @@ class ProxyRenderer:
         self.screen_program["image_texture"].value = 0
         self.quad_vao.render()
 
+        if screenshot is not None:
+            # Read the displayed crop, sharpening and warp before any text/trail.
+            screenshot.submit(self.ctx.screen.read(
+                viewport=(0, 0, *self.window_size), components=3, alignment=1,
+            ), self.window_size)
+
         if trail is not None and trail_camera is not None and trail_depth is not None:
             self.trail_renderer.draw(
                 trail, trail_time, trail_camera, trail_depth,
                 self.window_size, uv_scale, uv_offset,
+                trail_until,
             )
         if overlay_lines or prompt_caption:
             self._draw_overlay(overlay_lines or [], prompt_caption)
+        caption_height = 18 + 23 * len(self._caption_lines(prompt_caption)) if prompt_caption else 0
+        self.idle_overlay.draw(self.window_size, idle_opacity, caption_height)
         pygame.display.flip()
+
+    def _caption_lines(self, prompt: str) -> list[str]:
+        characters = max(24, max(24, self.window_size[0] - 48) // 10)
+        return textwrap.wrap(f"PROMPT  {prompt}", width=characters)[:3]
 
     def _draw_overlay(self, lines: list[str], prompt_caption: str | None = None) -> None:
         now = perf_counter()
@@ -875,8 +985,30 @@ class ProxyRenderer:
             self.overlay_texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
             self._overlay_size = self.window_size
             self._last_overlay_update = 0.0
+            self._last_overlay_key = ""
+            self._overlay_surface = pygame.Surface(self.window_size, pygame.SRCALPHA)
+            self._overlay_regions = [None, None]
+            self._overlay_texture_initialized = False
         if key != self._last_overlay_key and now - self._last_overlay_update >= 0.1:
-            surface = pygame.Surface(self.window_size, pygame.SRCALPHA)
+            surface = self._overlay_surface
+            previous_regions = self._overlay_regions
+            for region in previous_regions:
+                if region is not None:
+                    surface.fill((0, 0, 0, 0), region)
+            regions = [None, None]
+            text_cache = {}
+
+            def text_surface(line, caption=False):
+                text_key = (line, caption)
+                rendered = self._overlay_text_cache.get(text_key)
+                if rendered is None:
+                    color = (240, 245, 248) if caption else (230, 240, 245)
+                    rendered = self.small_font.render(line, True, color)
+                    if caption:
+                        rendered.set_alpha(77)
+                text_cache[text_key] = rendered
+                return rendered
+
             if lines:
                 panel_height = min(self.window_size[1] - 12, 18 + len(lines) * 23)
                 longest = max((len(line) for line in lines), default=0)
@@ -884,7 +1016,7 @@ class ProxyRenderer:
                     self.window_size[0] - 24,
                     max(490, min(840, 42 + longest * 9)),
                 )
-                pygame.draw.rect(
+                region = pygame.draw.rect(
                     surface,
                     (4, 8, 12, 51),
                     (12, 12, panel_width, panel_height),
@@ -892,18 +1024,16 @@ class ProxyRenderer:
                 )
                 y = 21
                 for line in lines:
-                    text_surface = self.small_font.render(line, True, (230, 240, 245))
-                    surface.blit(text_surface, (24, y))
+                    written = surface.blit(text_surface(line), (24, y))
+                    if written.width and written.height:
+                        region = region.union(written)
                     y += 23
+                regions[0] = region
             if prompt_caption:
-                caption_width = max(24, self.window_size[0] - 48)
-                characters = max(24, caption_width // 10)
-                caption_lines = textwrap.wrap(
-                    f"PROMPT  {prompt_caption}", width=characters
-                )[:3]
+                caption_lines = self._caption_lines(prompt_caption)
                 caption_height = 18 + len(caption_lines) * 23
                 caption_y = self.window_size[1] - caption_height - 12
-                pygame.draw.rect(
+                region = pygame.draw.rect(
                     surface,
                     (0, 0, 0, 77),
                     (12, caption_y, self.window_size[0] - 24, caption_height),
@@ -911,14 +1041,28 @@ class ProxyRenderer:
                 )
                 text_y = caption_y + 9
                 for line in caption_lines:
-                    text_surface = self.small_font.render(
-                        line, True, (240, 245, 248)
-                    )
-                    text_surface.set_alpha(77)
-                    surface.blit(text_surface, (24, text_y))
+                    written = surface.blit(text_surface(line, caption=True), (24, text_y))
+                    if written.width and written.height:
+                        region = region.union(written)
                     text_y += 23
-            data = pygame.image.tostring(surface, "RGBA", True)
-            self.overlay_texture.write(data)
+                regions[1] = region
+            if not self._overlay_texture_initialized:
+                # Initialize transparent pixels outside the panels once per size.
+                self.overlay_texture.write(pygame.image.tostring(surface, "RGBA", True))
+                self._overlay_texture_initialized = True
+            else:
+                for previous, current in zip(previous_regions, regions):
+                    dirty = previous or current
+                    if previous is not None and current is not None:
+                        dirty = previous.union(current)
+                    if dirty is not None and dirty.width and dirty.height:
+                        data = pygame.image.tostring(surface.subsurface(dirty), "RGBA", True)
+                        self.overlay_texture.write(data, viewport=(dirty.x, self.window_size[1] - dirty.bottom,
+                                                                   dirty.width, dirty.height))
+            self._overlay_regions = regions
+            # Keep only the current panel/caption text; changing statistics never
+            # grow a session-long cache of old values.
+            self._overlay_text_cache = text_cache
             self._last_overlay_key = key
             self._last_overlay_update = now
         self.ctx.enable(moderngl.BLEND)
@@ -942,15 +1086,22 @@ class ProxyRenderer:
 
     @staticmethod
     def poll_events() -> list[pygame.event.Event]:
-        return pygame.event.get()
+        if WindowLoop.active:
+            return WindowLoop.active.poll_events()
+        # Unlike get()/pump(), wait() releases the GIL during Windows event
+        # processing, so a native input wait cannot also starve AI submissions.
+        first = pygame.event.wait(1)
+        events = pygame.event.get(pump=False)
+        if first.type != pygame.NOEVENT:
+            events.insert(0, first)
+        return events
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        pygame.event.set_grab(False)
-        pygame.mouse.set_visible(True)
         self.trail_renderer.close()
+        self.idle_overlay.close()
         resources = (
             *self.mesh_vaos.values(),
             *self.instance_buffers.values(),
@@ -976,4 +1127,7 @@ class ProxyRenderer:
         for resource in resources:
             resource.release()
         self.ctx.release()
-        pygame.quit()
+        if self._window_loop:
+            self._window_loop.close()
+        else:
+            pygame.quit()

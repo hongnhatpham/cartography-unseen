@@ -57,8 +57,30 @@ Mouse            Look around
 Shift            Fly faster while held
 Escape           Exit
 
-Space            New prompt; keep current tuning, world, viewpoint and
-                 diffusion seed
+Space            New prompt and random tuning within the ranges below;
+                 keep world, viewpoint and diffusion seed
+Enter            Save the displayed AI image as PNG in the project screenshot
+                 folder. Excludes all text, diagnostics and the player trail
+Settings hotkeys below require the F1 diagnostics overlay to be open.
+Closing F1 locks them immediately. Movement, mouse look, Space, Enter, Escape and F1
+remain available. Loading and temporary status panels do not unlock settings.
+
+After ten seconds without player input, the Cartography Unseen title fades
+in at the upper left and controls appear at the lower right. They use Space
+Grotesk and IBM Plex Mono, matching Emergent Play. The fade takes 1.2 seconds;
+keyboard or mouse input fades them out in 0.25 seconds. Held keys and mouse
+buttons count as activity. Automatic flight and prompt changes do not hide
+them. Diagnostics, prompt editing and status panels hide them. The controls
+sit above the prompt caption. Fonts are bundled for offline use; cached text
+fades on the GPU without changing the generated image.
+Title and control text are 2.25 times their original size, fitted proportionally
+on smaller windows. Enter appears in the visitor instructions.
+
+Screenshots retain the current crop, sharpening and reprojection. Each gets a
+timestamped filename. PNG compression and disk writing run in the background,
+with one save pending at a time. Switch to the generated AI view before saving.
+Inside the prompt editor, Enter applies text instead of taking a screenshot.
+
 Shift + R        Choose a new diffusion seed
 P                Edit the prompt
 Enter            Apply a prompt while editing
@@ -76,11 +98,12 @@ F8               Toggle feedback reprojection: the previous frame, aligned
                  to the camera, becomes the walk memory (slower, stickier)
 F9               Cycle prompt auto-advance: off, 12, 24, 48, 96 s. Advancing
                  changes family and avoids the last three families when possible,
-                 sharing history with Space. Current tuning stays fixed
+                 sharing history with Space. Each advance samples new tuning
 H / J            Fog distance nearer / farther, 10 units per press. Nearer
                  means more fog; farther means less. F1 shows the distance
-V                Toggle the player trail. The last five seconds of travel
-                 fade oldest-first; turning it off clears the route
+V                Toggle the player trail. The last ten seconds of travel
+                 fade oldest-first; turning it off clears the route.
+                 The trail is 15 pixels wide, ten times its original width
 F12              Toggle idle flight. With no input for a minute the camera
                  flies on its own; any key or mouse movement takes over
 F10              Cycle generation resolution/aspect modes
@@ -109,14 +132,26 @@ thins along existing passages, giving them more room while retaining
 surrounding panels and denser areas. New geometry streams in as you fly
 up or down, keeping the environment around you at every height.
 
-Space changes only the prompt. CFG, guide strength and all other current
-settings stay as you set them. Your position, world seed, diffusion seed and
-diagnostic state also stay unchanged. The picture transitions using the current
-prompt-walk duration. Automatic prompt changes also preserve your tuning.
+Each new subject independently samples these settings:
 
-Every accepted setting is written to config.json immediately and restored on the
-next launch. Freeze and diagnostic views remain session-only so the artwork does
-not reopen paused or in a troubleshooting view.
+  Timestep       Lower bound 80-200; upper bound 280-400.
+                 Both bounds are sampled independently; the window width varies.
+  Sharpness      1.00-2.00
+  Instability    0-40%
+  Guide strength 65-100%
+
+Space, timed advance, changed text accepted in the prompt editor, and external
+prompt edits all trigger this variation. CFG, fog, position, world and diffusion
+seeds, diagnostic state, and other settings stay unchanged. Automatic variation
+works with F1 closed; manual settings hotkeys still require F1. Regional color
+changes during travel do not sample new tuning. The picture transitions using
+the current prompt-walk duration.
+
+Manual settings changes save to config.json immediately. Space and accepted
+prompt edits save the prompt and its sampled settings. Timed prompt choices
+and their tuning remain session-only. Startup uses the saved settings until
+a new subject is chosen. Freeze and diagnostic views remain session-only so
+the artwork does not reopen paused or in a troubleshooting view.
 
 
 RESOLUTION MODES
@@ -153,14 +188,16 @@ list of prompts. Each family has:
   base       the tail shared by the family's variants
   variants   four subjects; one library prompt is built per variant as
              "<variant>, <base>"
-  settings   sampler presets for offline style comparisons; live prompt
-             changes preserve your current tuning
+  settings   sampler presets for offline style comparisons; live subject
+             changes use the random tuning ranges above
 
 master_prefix ("corrupted 3D render") is prepended to every prompt.
 
-The eleven shipped families are Topology Unknown, Biophilic City, Mangled Data,
+The twelve shipped families are Topology Unknown, Biophilic City, Mangled Data,
 Wire Field, Washed Strata, Warped Spacetime, Corrupted Bloom and Datamosh
-Ravines, plus Cellular Karst, Root Networks and Membrane Folds. The three
+Ravines, plus Cellular Karst, Root Networks, Membrane Folds and Distant Presences.
+Distant Presences adds four views with small human silhouettes and distant
+figures, partly hidden by fog or structures. The three
 organic families add porous formations, branching strands and curved sheets
 without the voxel wording of the original subjects. There are 44 variants.
 They are abstract on purpose: wires, corruption, data, warped space
@@ -199,8 +236,8 @@ Four keys control how unstable the picture is. All of them are live and saved.
                             flickering. Off means unrelated noise every frame.
 
 prompt_walk_seconds (M) is how long the picture takes to morph from the current
-prompt to a new one; F9 sets how often a new library prompt is chosen. Space
-and automatic prompt changes keep the current sampler settings. Set
+prompt to a new one; F9 sets how often a new library prompt is chosen. New
+subjects sample the tuning ranges above. Set
 prompt_walk_seconds to 0 for an immediate transition, or the auto-advance
 interval to 0 to stop automatic changes. F7 provides a subtle prompt caption
 without the full F1 diagnostics.
@@ -210,9 +247,11 @@ HOW THE IMAGE IS MADE
 ---------------------
 An optional pale filament marks your recent route. Look back to see it just
 below the path you travelled. Older sections fade first; the route disappears
-after five seconds, including when you stand still. Structures hide the trail
-where it passes behind them. V toggles it and saves your choice. It is drawn
+after ten seconds, including when you stand still. Structures hide the trail
+where it passes behind them. With F1 open, V toggles it and saves your choice. It is drawn
 after the AI image, so it fades on time without changing the generation.
+The visible end stays four units back along your route, measured from the
+displayed frame's capture time so it cannot extend ahead of an older AI view.
 
 Fog distance controls where structures fully fade into the atmosphere. The
 default is 196 world units, matching the original fog, with a range of 40–300.
@@ -235,10 +274,11 @@ The effective prompt keeps your original wording and adds the local landscape's
 hue pair. Curved and wire forms come from the proxy, without appending the same
 shape phrase to every prompt. As you travel, colors change with the landscape
 in any direction, including upward and downward. Color cues use the existing
-prompt interpolation and do not restart the automatic prompt timer.
-Your saved prompt, default prompt and library text stay unchanged. Resolution,
-CFG, guide strength and the other sampler settings remain as you set them.
-Space still changes only the prompt.
+prompt interpolation and do not restart the automatic prompt timer or sample
+new tuning.
+Your saved prompt, default prompt and library text stay unchanged. Regional hue
+updates keep the current resolution, CFG, guide strength and other sampler settings.
+Space changes the subject and samples the tuning ranges above.
 
 That render is hidden in the normal AI view. TAESD encodes it on the GPU into
 a latent, which steers a continuous walk: the
@@ -259,7 +299,7 @@ what keeps text, gamepads and interiors out of the picture.
 
 DISPLAY AND MONITORS
 --------------------
-The default launch is fullscreen. Press F11 for a window.
+The default launch is fullscreen. Open F1, then press F11 for a window.
 
 Set display_monitor in config.json to a zero-based monitor index, or launch from
 a Command Prompt with:
@@ -277,6 +317,24 @@ Launch directly in a particular generation mode with:
 
 TROUBLESHOOTING
 ---------------
+Raw AI frames reuse their GPU image between updates, avoiding repeated uploads.
+Reprojection skips unused live-camera renders while retaining its display-rate
+interpolated depth. Bounded caches reuse exact world-field samples and chunk
+ordering. Geometry, colors, collision data and rendering settings are unchanged.
+Fixed-image presentation measured 0.65 to 0.45 ms per refresh with identical
+pixels; a six-boundary CPU streaming profile fell from 3.10 to 2.43 seconds.
+These component savings do not establish a higher AI frame rate.
+
+Chunk construction now yields after three milliseconds or three chunks. Startup
+still fills the whole 11x11x11 window. Packed geometry and collision arrays own
+the loaded world; redundant source objects are released, with only 128 recent
+source chunks cached. Revisits regenerate identical geometry. Pygame starts
+only display and font support, avoiding unused joystick and audio device work
+inside Windows event polling. Keyboard and mouse controls are unchanged.
+Input polling releases Python's shared lock while waiting on Windows, so the
+AI worker can continue. Text composition starts only in the prompt editor.
+The 15-pixel trail uses triangles, avoiding driver-specific line-width caps.
+
 The normal AI view draws the proxy at the conditioning rate, while movement and
 world streaming keep updating at the display rate. Chunk loading uploads new
 geometry incrementally. These optimizations preserve the resolution, image
@@ -304,6 +362,69 @@ also attempts an automatic lower-resolution fallback after a CUDA OOM.
 To confirm an offline install without launching the artwork:
 
   runtime\python\python.exe tools\verify_offline.py
+
+
+CONTINUOUS-RUN PERFORMANCE CHECK
+--------------------------------
+From the project folder, run:
+
+  runtime\python\python.exe tools\soak_test.py --minutes 30
+
+The thirty-minute timer starts at the first generated image. A private copy of
+your config enables idle flight after two seconds; your saved settings remain
+unchanged. The app exits normally when the timer finishes. Escape or closing
+the window ends the run early and records an incomplete result.
+
+Find summary.json, minutes.csv, minutes.jsonl and resources.jsonl in the new
+timestamped folder under logs\performance. These record display and generation
+timings, stalls, prompt work, garbage collection, process memory, NVIDIA GPU
+telemetry, worker errors and automatic resolution fallbacks.
+AI publication gaps measure how long the same generated image remains current,
+including the final gap if generation stops. Inner display timings separate
+image uploads, text overlays, trail drawing and the display swap.
+Diagnostics reuse unchanged text and update only the affected texture regions;
+their appearance and ten-updates-per-second limit remain the same.
+stalls.jsonl adds timestamped events for display pauses above 50 ms, including
+overlapping render, navigation, event-polling, frame-wait, AI and GC activity.
+Add --fixed-settings to disable automatic prompt changes and tuning variation
+and hold the initial AI palette constant for a controlled comparison. The
+rendered world still changes colour with location. Your saved config is kept.
+Normal monitoring preserves production input handling. On Windows, a separate
+thread owns the window and SDL input. Drawing reads buffered input and can
+continue during a native event wait. Monitoring still times native waits on
+their owning thread. --split-poll is rejected on Windows because it would pump
+input from the drawing thread; it remains available on other platforms.
+
+For repeatable comparisons, run:
+
+  runtime\python\python.exe tools\replay_performance.py --seconds 120 --max-stall-ms 100
+
+This keeps a private config copy at 384x256, CFG 1.5, with the prompt and seed
+held constant. The same camera route starts at the first AI image. Collision
+queries run, but their displacement is overridden to keep the route independent
+of frame timing. Escape and closing the window still end the run.
+timings.csv records every display interval, generation duration and new AI image
+publication interval. --max-ai-gap-ms 250 is checked by default, so repeating an
+old image cannot hide an AI freeze. The command fails on either threshold, an
+incomplete run, lost measurements or a generation resolution fallback.
+For normal play with automatic prompts and your current diagnostics settings,
+use the lightweight recorder:
+
+  runtime\python\python.exe tools\replay_performance.py --normal --seconds 600
+
+This changes only idle-flight activation to two seconds in a private config.
+It records display, new-image publication and generation intervals without the
+detailed stage, garbage-collection or GPU telemetry probes of soak_test.py.
+Use it to check visible pauses; use the detailed soak tool to investigate them.
+Detailed stall formatting runs on the sampler rather than the display thread.
+Investigation and results:
+
+  docs\performance\window-input-stutter-20260905.md
+  docs\performance\inference-freezes-20260905.md
+
+Thirty minutes can reveal early slowdown or memory growth. It does not prove
+a week of unattended operation. Use --minutes 10080 for a full week on the
+exhibition computer. After monitoring, run run.bat for normal operation.
 
 
 OFFLINE USE AFTER INSTALLATION

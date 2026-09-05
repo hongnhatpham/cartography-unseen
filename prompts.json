@@ -177,6 +177,17 @@
         "pleated mineral ribbons, soft sweeping curves unfolding around deep valleys, mangled terrain",
         "perforated shell formations, thin curved sheets peeling into wire nets, layered distant folds"
       ]
+    },
+    {
+      "name": "Distant Presences",
+      "base": "wide view across a vast abstract outdoor landscape, open passages, deep perspective, hard black shadows, foggy, haunted",
+      "settings": {},
+      "variants": [
+        "a tiny human silhouette standing motionless on a far terrace, almost lost in the mist, eroded structures towering above it",
+        "a solitary distant figure partly hidden behind a curved lattice, an indistinct outline beyond an empty clearing",
+        "a few small human silhouettes far apart along a remote ridge, half erased by fog, silent mineral folds",
+        "a distant figure seen from behind at the far end of an open passage, a faint human shape between immense ribbed arches"
+      ]
     }
   ]
 }

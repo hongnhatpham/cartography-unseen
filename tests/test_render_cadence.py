@@ -15,7 +15,7 @@ from app.types import ConditioningFrame, GeneratedFrame
 @pytest.mark.parametrize("backend", ["proxy_passthrough", "latent_walk"])
 @pytest.mark.parametrize("view_key, key_presses", [
     (None, 0), (pygame.K_F2, 1), (pygame.K_F3, 1),
-    (pygame.K_F3, 2), (pygame.K_F5, 1), (pygame.K_v, 1),
+    (pygame.K_F3, 2), (pygame.K_F5, 1), (pygame.K_v, 1), (pygame.K_RETURN, 1),
 ])
 def test_proxy_work_follows_consumers_without_slowing_flight(
     monkeypatch, tmp_path, backend, view_key, key_presses,
@@ -40,6 +40,7 @@ def test_proxy_work_follows_consumers_without_slowing_flight(
     collisions = []
     renders = []
     warps = []
+    screenshot_ticks = []
 
     class Clock:
         def get_time(self):
@@ -59,6 +60,9 @@ def test_proxy_work_follows_consumers_without_slowing_flight(
         def loading_screen(self, *args):
             pass
 
+        def read_input(self):
+            return (0, 0), defaultdict(bool, {pygame.K_e: True}), (False, False, False)
+
         def spawn_camera(self, camera):
             camera.position[:] = 0
 
@@ -66,8 +70,11 @@ def test_proxy_work_follows_consumers_without_slowing_flight(
             if tick == 63:
                 return [pygame.event.Event(pygame.QUIT)]
             if tick == 1 and view_key is not None:
-                return [pygame.event.Event(pygame.KEYDOWN, key=view_key, mod=0)
-                        for _ in range(key_presses)]
+                unlock = [] if view_key == pygame.K_RETURN else [pygame.event.Event(pygame.KEYDOWN, key=pygame.K_F1, mod=0)]
+                return unlock + [
+                    pygame.event.Event(pygame.KEYDOWN, key=view_key, mod=0)
+                    for _ in range(key_presses)
+                ]
             return []
 
         def constrain_camera(self, camera, dt):
@@ -105,6 +112,8 @@ def test_proxy_work_follows_consumers_without_slowing_flight(
 
         def display(self, image, *args, **kwargs):
             displayed.append((tick, image.copy()))
+            if kwargs.get("screenshot") is not None:
+                screenshot_ticks.append(tick)
             displayed_trails.append(kwargs.get("trail"))
 
         def display_reprojected(self, frame, camera, *args, **kwargs):
@@ -129,8 +138,6 @@ def test_proxy_work_follows_consumers_without_slowing_flight(
     monkeypatch.setattr(proxy_renderer, "ProxyRenderer", Renderer)
     monkeypatch.setattr(main, "perf_counter", lambda: 1 + tick / 64)
     monkeypatch.setattr(pygame.time, "Clock", Clock)
-    monkeypatch.setattr(pygame.mouse, "get_rel", lambda: (0, 0))
-    monkeypatch.setattr(pygame.key, "get_pressed", lambda: defaultdict(bool, {pygame.K_e: True}))
     monkeypatch.setattr(DiffusionWorker, "start", lambda self: None)
     monkeypatch.setattr(DiffusionWorker, "stop", lambda self: None)
     monkeypatch.setattr(DiffusionWorker, "publish", publish)
@@ -138,9 +145,10 @@ def test_proxy_work_follows_consumers_without_slowing_flight(
     assert main.run() == 0
     expected_ticks = list(range(64)) if view_key in (pygame.K_F2, pygame.K_F3) else list(range(0, 64, 4))
     assert [at for at, _ in captures] == expected_ticks
-    assert renders == (list(range(64)) if view_key == pygame.K_F5 else expected_ticks)
+    assert renders == expected_ticks
     assert [at for at, _ in streamed] == list(range(64))
     assert len(collisions) == len(displayed) == 64
+    assert screenshot_ticks == ([1] if view_key == pygame.K_RETURN else [])
     if view_key == pygame.K_v:
         assert displayed_trails[0] is not None
         assert all(trail is None for trail in displayed_trails[1:])

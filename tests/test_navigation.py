@@ -11,12 +11,13 @@ import pytest
 
 from app import main
 from app.renderer.camera import Camera
+from app.renderer.proxy_renderer import ProxyRenderer
 from app.renderer.world import Autowalk
 
 
 @pytest.mark.parametrize("trigger, view_key", [
     ("space", None), ("space", pygame.K_F2), ("space", pygame.K_F3),
-    ("auto", None),
+    ("auto", None), ("editor", None), ("external", None),
 ])
 def test_prompt_selection_preserves_live_experience(monkeypatch, tmp_path, trigger, view_key):
     """Run real key handling and rendering with one deliberately slow AI frame."""
@@ -32,9 +33,12 @@ def test_prompt_selection_preserves_live_experience(monkeypatch, tmp_path, trigg
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config), encoding="utf-8")
     monkeypatch.setattr(sys, "argv", ["app", "--config", str(path), "--windowed"])
-    monkeypatch.setattr(pygame.mouse, "get_rel", lambda: (0, 0))
-    monkeypatch.setattr(pygame.key, "get_pressed", lambda: defaultdict(bool))
-    chosen = main.PromptEntry("Next", "a different imagined passage", {
+    monkeypatch.setattr(ProxyRenderer, "read_input", lambda self:
+                        ((0, 0), defaultdict(bool), (False, False, False)))
+    variation = {"timestep_min": 120, "timestep_max": 240, "display_sharpen": 1.7,
+                 "instability": .23, "guide_strength": .91}
+    monkeypatch.setattr(main, "random_prompt_settings", lambda: variation.copy())
+    chosen = main.PromptEntry("Next", "corrupted 3D render, a different imagined passage", {
         "guidance_scale": 3.0, "guide_strength": 0.1, "timestep_min": 1,
     })
     initial_prompt = main.apply_master_prefix(
@@ -55,7 +59,7 @@ def test_prompt_selection_preserves_live_experience(monkeypatch, tmp_path, trigg
     reseeds = []
     prompts = []
     clock = main.perf_counter
-    monkeypatch.setattr(main, "perf_counter", lambda: clock() + (60 if trigger == "auto" and frame >= 3 else 0))
+    monkeypatch.setattr(main, "perf_counter", lambda: clock() + (60 if trigger in ("auto", "external") and frame >= 3 else 0))
 
     def publish_once(self, conditioning):
         nonlocal worker
@@ -85,9 +89,9 @@ def test_prompt_selection_preserves_live_experience(monkeypatch, tmp_path, trigg
         reseeds.append(frame)
         return request_reseed(self, seed)
 
-    def record_prompt(self, prompt, negative=""):
+    def record_prompt(self, prompt, negative="", **kwargs):
         prompts.append((frame, prompt, negative))
-        return request_prompt(self, prompt, negative)
+        return request_prompt(self, prompt, negative, **kwargs)
 
     def record_pose(self, camera, dt=None):
         result = constrain_camera(self, camera, dt)
@@ -115,6 +119,14 @@ def test_prompt_selection_preserves_live_experience(monkeypatch, tmp_path, trigg
             keys = [view_key]
         elif frame == 3 and trigger == "space":
             keys = [pygame.K_SPACE]
+        elif frame == 3 and trigger == "editor":
+            return [pygame.event.Event(pygame.KEYDOWN, key=pygame.K_p, mod=0)] + [
+                pygame.event.Event(pygame.KEYDOWN, key=pygame.K_BACKSPACE, mod=0)
+                for _ in initial_prompt
+            ] + [pygame.event.Event(pygame.TEXTINPUT, text=chosen.prompt),
+                 pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN, mod=0)]
+        elif frame == 3 and trigger == "external":
+            main.persist_prompt(path, chosen.prompt)
         elif frame >= 5:
             return [pygame.event.Event(pygame.QUIT)]
         return [pygame.event.Event(pygame.KEYDOWN, key=key, mod=0) for key in keys]
@@ -126,24 +138,30 @@ def test_prompt_selection_preserves_live_experience(monkeypatch, tmp_path, trigg
     monkeypatch.setattr(ProxyRenderer, "constrain_camera", record_pose)
     monkeypatch.setattr(ProxyRenderer, "display", record_display)
     monkeypatch.setattr(main, "build_overlay", record_overlay)
-    monkeypatch.setattr(pygame.event, "get", events)
+    monkeypatch.setattr(ProxyRenderer, "poll_events", staticmethod(events))
     assert main.run() == 0
     before, view, hue = states[2]
     after, next_view, next_hue = states[4]
     assert before["prompt"] != chosen.prompt
-    assert after == {**before, "prompt": chosen.prompt}
+    assert after == {**before, **variation, "prompt": chosen.prompt}
     assert before["fog_distance"] == config["fog_distance"] - 10
     assert all(distance == before["fog_distance"] for distance in fog_distances)
     assert settings and all(at == 0 for at, _ in settings)
     assert reseeds == []
     assert prompts == [(3, main.compose_prompt(chosen.prompt, poses[2][3], hue), config["negative_prompt"])]
     assert worker._requested_seed == config["seed"]
+    assert all(worker._pending_settings[key] == value for key, value in variation.items()
+               if key in main.BACKEND_SETTING_KEYS)
     assert np.array_equal(poses[2][0], poses[4][0])
     assert poses[2][1:] == poses[4][1:]
-    assert (next_view, next_hue) == (view, hue)
-    assert np.array_equal(images[2], images[4])
+    assert next_hue == hue
+    if trigger != "editor":
+        assert next_view == view
+    if trigger != "editor":
+        assert np.array_equal(images[2], images[4])
     persisted = json.loads(path.read_text(encoding="utf-8"))
-    expected = {**before, "prompt": chosen.prompt if trigger == "space" else before["prompt"]}
+    expected = ({**before, **variation, "prompt": chosen.prompt} if trigger in ("space", "editor")
+                else {**before, "prompt": chosen.prompt} if trigger == "external" else before)
     assert all(persisted[key] == expected[key] for key in config)
 
 
@@ -155,7 +173,6 @@ def test_application_accepts_manual_and_idle_flight(monkeypatch, tmp_path, idle)
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config), encoding="utf-8")
     monkeypatch.setattr(sys, "argv", ["app", "--config", str(path), "--windowed"])
-    monkeypatch.setattr(pygame.mouse, "get_rel", lambda: (0, 0))
     frame = -1
     calls = []
     progress = []
@@ -194,8 +211,10 @@ def test_application_accepts_manual_and_idle_flight(monkeypatch, tmp_path, idle)
 
     monkeypatch.setattr(Camera, "fly", record_flight)
     monkeypatch.setattr(Autowalk, "step", record_drift)
-    monkeypatch.setattr(pygame.key, "get_pressed", keys)
-    monkeypatch.setattr(pygame.event, "get", lambda: [pygame.event.Event(pygame.QUIT)] if frame >= 35 else [])
+    monkeypatch.setattr(ProxyRenderer, "read_input", lambda self:
+                        ((0, 0), keys(), (False, False, False)))
+    monkeypatch.setattr(ProxyRenderer, "poll_events", staticmethod(
+        lambda: [pygame.event.Event(pygame.QUIT)] if frame >= 35 else []))
     assert main.run() == 0
     assert calls
     if idle:

@@ -38,6 +38,10 @@ foreach ($dir in $requiredDirs) {
     if (-not (Test-Path -LiteralPath $source)) { throw "Missing required directory: $source" }
     Copy-Item -LiteralPath $source -Destination $Target -Recurse
 }
+$reportTarget = Join-Path $Target "docs\performance"
+New-Item -ItemType Directory -Path $reportTarget -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $Root "docs\performance\window-input-stutter-20260905.md") -Destination $reportTarget
+Copy-Item -LiteralPath (Join-Path $Root "docs\performance\inference-freezes-20260905.md") -Destination $reportTarget
 New-Item -ItemType Directory -Path `
     (Join-Path $Target "cache"), `
     (Join-Path $Target "logs"), `
@@ -47,6 +51,8 @@ New-Item -ItemType Directory -Path `
     (Join-Path $Target "wheelhouse") -Force | Out-Null
 $toolFiles = @(
     "benchmark.py",
+    "soak_test.py",
+    "replay_performance.py",
     "bootstrap_first_run.ps1",
     "download_models.py",
     "prepare_models.ps1",

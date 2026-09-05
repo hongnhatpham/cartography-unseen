@@ -1,0 +1,10 @@
+{
+  "projectId": "cartography-unseen",
+  "reportId": "cartography-broad-surface-variation",
+  "publicId": "e1af59ef7ddd07d8adb4",
+  "revision": 3,
+  "fileCount": 1,
+  "url": "https://reports.bynhat.com/r/e1af59ef7ddd07d8adb4/",
+  "localFile": "broad-surface-variation.html",
+  "verification": "Authenticated HTTP 200 text/html; hosted bytes match local HTML; 8 embedded images decoded; HTML safety and size checks passed; comparison image visually inspected."
+}

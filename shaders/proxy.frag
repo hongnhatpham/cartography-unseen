@@ -9,12 +9,32 @@ uniform vec3 fog_color;
 uniform vec3 zenith_color;
 uniform vec3 nadir_color;
 uniform float fog_distance;
+// Per-octave origin phases, calculated in CPU double precision before wrapping.
+uniform vec3 surface_origin_coarse;
+uniform vec3 surface_origin_fine;
 
 out vec4 frag_color;
 
 // Atmospheric depth. Full fade well inside the far plane, so the ends of the
 // moving chunk window remain hidden while more geometry streams in.
 const float FOG_START = 20.0;
+
+// Wrap lattice coordinates, including each neighboring corner, to keep the
+// pattern continuous when the local render origin moves during endless flight.
+float surface_hash(vec3 p) {
+    p = fract(mod(p, 256.0) * 0.1031);
+    p += dot(p, p.yzx + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+
+float surface_field(vec3 p) {
+    vec3 cell = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(mix(surface_hash(cell), surface_hash(cell + vec3(1,0,0)), f.x),
+                   mix(surface_hash(cell + vec3(0,1,0)), surface_hash(cell + vec3(1,1,0)), f.x), f.y),
+               mix(mix(surface_hash(cell + vec3(0,0,1)), surface_hash(cell + vec3(1,0,1)), f.x),
+                   mix(surface_hash(cell + vec3(0,1,1)), surface_hash(cell + vec3(1,1,1)), f.x), f.y), f.z);
+}
 
 // Background as a function of look direction. Kept identical to the copy in
 // sky.frag so a form fading out lands exactly on the sky behind it.
@@ -39,6 +59,11 @@ void main() {
     float key = 0.24 + 0.72 * bands;
     float sky = normal.y * 0.5 + 0.5;
     vec3 albedo = material_color;
+    // A: broad soft mottling, with a weaker second scale and no animated noise.
+    float broad = surface_field(world_position * 0.20 + surface_origin_coarse);
+    float secondary = surface_field(world_position * 0.53 + surface_origin_fine + vec3(17.0));
+    float tone = smoothstep(0.20, 0.80, broad * 0.78 + secondary * 0.22);
+    albedo *= mix(0.48, 1.20, tone);
     vec3 lit = albedo * (key + 0.08 + 0.16 * sky);
 
     vec3 view_ray = world_position - camera_position;

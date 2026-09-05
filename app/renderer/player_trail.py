@@ -4,9 +4,10 @@ from collections import deque
 import numpy as np
 
 
-TRAIL_SECONDS = 5.0
+TRAIL_SECONDS = 10.0
 TRAIL_SAMPLE_SECONDS = 1.0 / 30.0
-MAX_TRAIL_SAMPLES = 160
+MAX_TRAIL_SAMPLES = 320
+TRAIL_HEAD_GAP = 4.0
 
 
 class PlayerTrail:
@@ -34,9 +35,24 @@ class PlayerTrail:
                 return
         self._samples.append((now, position.copy()))
 
-    def vertices(self, origin: np.ndarray, now: float) -> np.ndarray:
+    def vertices(self, origin: np.ndarray, now: float, until: float | None = None) -> np.ndarray:
         """Camera-relative segment pairs, XYZ plus opacity, for a small GL draw."""
-        samples = [(at, point) for at, point in self._samples if 0.0 <= now - at < TRAIL_SECONDS]
+        until = now if until is None else min(now, until)
+        samples = [(at, point) for at, point in self._samples
+                   if now - TRAIL_SECONDS < at <= until]
+        # Withhold the newest few units along the actual route, in any flight
+        # direction. Never move old marks when the player turns their head.
+        gap = TRAIL_HEAD_GAP
+        while len(samples) >= 2 and gap > 0.0:
+            at, point = samples.pop()
+            previous_at, previous = samples[-1]
+            length = float(np.linalg.norm(point - previous))
+            if length > gap:
+                share = (length - gap) / length
+                samples.append((previous_at + share * (at - previous_at),
+                                previous + share * (point - previous)))
+                break
+            gap -= length
         if len(samples) < 2:
             return np.empty((0, 4), dtype="f4")
         at, points = zip(*samples)

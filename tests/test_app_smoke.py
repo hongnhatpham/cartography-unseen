@@ -48,10 +48,11 @@ def test_shipped_library_is_abstract_and_varied() -> None:
     # space and time, warped, lattice, biophilic cityscape.
     for term in ("wire", "abstraction", "corrupted", "data", "mangled", "space and time", "warped", "lattice", "biophilic"):
         assert term in joined, term
-    # Every entry is anchored as an outdoor eye-level landscape so the sampler
+    # Every entry is anchored as an outdoor landscape so the sampler
     # never resolves a furnished interior, and material nouns that summon
     # product shots (chrome, glass, foil) stay out.
-    assert all("eye level view" in entry.prompt and "outdoor" in entry.prompt for entry in entries)
+    assert all(("eye level view" in entry.prompt or "wide view" in entry.prompt)
+               and "outdoor" in entry.prompt for entry in entries)
     for term in ("chrome", "glass", "foil", "neon", "glitch art", "screenshot"):
         assert term not in joined, term
 

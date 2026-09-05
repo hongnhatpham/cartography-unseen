@@ -23,6 +23,7 @@ from typing import Any
 import numpy as np
 
 from app.diffusion.base import DiffusionBackend
+from app.diffusion.cuda_graph import UNetGraphs
 from app.types import ConditioningFrame
 from app.utils.timing import ExponentialAverage
 
@@ -579,6 +580,7 @@ class LatentWalkBackend(DiffusionBackend):
     def __init__(self) -> None:
         self.torch: Any = None
         self.unet: Any = None
+        self._unet_graphs: UNetGraphs | None = None
         self.taesd: Any = None
         self.text_encoder: Any = None
         self.tokenizer: Any = None
@@ -719,6 +721,9 @@ class LatentWalkBackend(DiffusionBackend):
         self.load_ms = (perf_counter() - started) * 1000.0
 
     def unload(self) -> None:
+        if self._unet_graphs is not None:
+            self._unet_graphs.close()
+            self._unet_graphs = None
         self._prompt_embeddings.clear()
         self.unet = None
         self.taesd = None
@@ -785,6 +790,12 @@ class LatentWalkBackend(DiffusionBackend):
         self._origin = clock()
 
     def set_resolution(self, width: int, height: int | None = None) -> None:
+        size = (int(width), int(height if height is not None else width))
+        if size != (self.width, self.height) and self._unet_graphs is not None:
+            # Resolution changes already restart memory. Release old graph
+            # pools and use eager inference without a live capture pause.
+            self._unet_graphs.close()
+            self._unet_graphs = None
         self.width = int(width)
         self.height = int(height if height is not None else width)
         self.x0_prev = None
@@ -812,6 +823,7 @@ class LatentWalkBackend(DiffusionBackend):
         rgb[:, :, 2] = 110
         for _ in range(max(0, self.warmup_passes)):
             self._render(rgb)
+        self._prepare_unet_graphs()
         self.x0_prev = None
         self._warm_frames = RESET_WARMUP_FRAMES
         self.noise_walk.reset()
@@ -825,6 +837,31 @@ class LatentWalkBackend(DiffusionBackend):
             gc.collect()
             gc.freeze()
             self._owns_gc_freeze = True
+
+    def _prepare_unet_graphs(self) -> None:
+        """Capture only startup shapes; unsupported capture keeps eager quality."""
+        if self._unet_graphs is not None or self.torch is None or self.unet is None:
+            return
+        graphs = UNetGraphs(self.unet, self.torch)
+        try:
+            with self.torch.inference_mode():
+                for batch in (1, 2):
+                    sample = self.torch.zeros(
+                        (batch, self.unet.config.in_channels, self.height // 8, self.width // 8),
+                        device=self.device, dtype=self.dtype,
+                    ).contiguous(memory_format=self.torch.channels_last)
+                    timestep = self.torch.full((batch,), self.timestep_max,
+                                               device=self.device, dtype=self.torch.long)
+                    positive, negative = self.prompt_walk.positive, self.prompt_walk.negative
+                    embedding = self.torch.cat((negative, positive)) if batch == 2 else positive
+                    graphs.prepare(sample, timestep, embedding)
+        except (RuntimeError, NotImplementedError) as exc:
+            graphs.close()
+            self.torch.cuda.empty_cache()
+            logging.warning("UNet CUDA graph unavailable; continuing eager inference: %s", exc)
+            return
+        self._unet_graphs = graphs
+        logging.info("Prepared %s UNet CUDA graphs for %sx%s", graphs.count, self.width, self.height)
 
     def generate(
         self,
@@ -951,7 +988,11 @@ class LatentWalkBackend(DiffusionBackend):
             timesteps = torch.full(
                 (model_input.shape[0],), t, device=self.device, dtype=torch.long
             )
-            output = self.unet(model_input, timesteps, encoder_hidden_states=embeds).sample
+            output = (
+                self._unet_graphs.predict(model_input, timesteps, embeds)
+                if self._unet_graphs is not None
+                else self.unet(model_input, timesteps, encoder_hidden_states=embeds).sample
+            )
             if do_cfg:
                 uncond, cond = output.chunk(2)
                 output = uncond + self.guidance_scale * (cond - uncond)
@@ -1042,6 +1083,8 @@ class LatentWalkBackend(DiffusionBackend):
             peak = self.torch.cuda.max_memory_allocated() / scale
         return {
             "backend": "latent_walk",
+            "unet_graphs": self._unet_graphs.count if self._unet_graphs is not None else 0,
+            "unet_graph_replays": self._unet_graphs.replay_calls if self._unet_graphs is not None else 0,
             "inference_ms": self.inference_average.value,
             "sampler": self.sampler,
             "resolution": f"{self.width}x{self.height}",

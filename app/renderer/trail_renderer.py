@@ -18,9 +18,10 @@ class TrailRenderer:
         self.ctx = ctx
         self.program = ctx.program(
             vertex_shader=(shader_root / "trail.vert").read_text(encoding="utf-8"),
+            geometry_shader=(shader_root / "trail.geom").read_text(encoding="utf-8"),
             fragment_shader=(shader_root / "trail.frag").read_text(encoding="utf-8"),
         )
-        self.buffer = ctx.buffer(reserve=320 * 4 * 4)
+        self.buffer = ctx.buffer(reserve=640 * 4 * 4)
         self.vao = ctx.vertex_array(
             self.program, [(self.buffer, "3f 1f", "in_position", "in_opacity")]
         )
@@ -55,8 +56,9 @@ class TrailRenderer:
         window_size: tuple[int, int],
         uv_scale: tuple[float, float],
         uv_offset: tuple[float, float],
+        until: float | None = None,
     ) -> None:
-        vertices = trail.vertices(camera.position, now)
+        vertices = trail.vertices(camera.position, now, until)
         if not len(vertices):
             return
         if vertices.nbytes > self.buffer.size:
@@ -77,9 +79,7 @@ class TrailRenderer:
         self.ctx.disable(moderngl.DEPTH_TEST | moderngl.CULL_FACE)
         self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
-        self.ctx.line_width = 1.5
         self.vao.render(mode=moderngl.LINES, vertices=len(vertices))
-        self.ctx.line_width = 1.0
         self.ctx.disable(moderngl.BLEND)
 
     def close(self) -> None:

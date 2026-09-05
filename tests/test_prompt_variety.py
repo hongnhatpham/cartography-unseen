@@ -3,7 +3,7 @@ from app import main
 from app.renderer.world import world_label
 
 
-def test_timed_space_and_travel_changes_share_history_without_resetting_settings(monkeypatch, tmp_path):
+def test_subject_changes_vary_tuning_while_travel_only_changes_color(monkeypatch, tmp_path):
     from collections import defaultdict
     import json
     import sys
@@ -23,6 +23,15 @@ def test_timed_space_and_travel_changes_share_history_without_resetting_settings
     path.write_text(json.dumps(config))
     monkeypatch.setattr(sys, "argv", ["app", "--config", str(path)])
     monkeypatch.setattr(main.secrets, "choice", lambda values: values[0])
+    variation = {"timestep_min": 120, "timestep_max": 240, "display_sharpen": 1.7,
+                 "instability": .23, "guide_strength": .91}
+    samples = []
+
+    def sample():
+        samples.append(tick)
+        return variation.copy()
+
+    monkeypatch.setattr(main, "random_prompt_settings", sample)
     tick = 0
     prompts, settings, reseeds = [], [], []
 
@@ -47,6 +56,9 @@ def test_timed_space_and_travel_changes_share_history_without_resetting_settings
         def display(self, *args, **kwargs): pass
         def close(self): pass
 
+        def read_input(self):
+            return (0, 0), defaultdict(bool), (False, False, False)
+
         def poll_events(self):
             if tick == 10:
                 return [pygame.event.Event(pygame.QUIT)]
@@ -68,16 +80,16 @@ def test_timed_space_and_travel_changes_share_history_without_resetting_settings
     monkeypatch.setattr(proxy_renderer, "ProxyRenderer", Renderer)
     monkeypatch.setattr(main, "perf_counter", lambda: 1 + tick * 8)
     monkeypatch.setattr(pygame.time, "Clock", Clock)
-    monkeypatch.setattr(pygame.mouse, "get_rel", lambda: (0, 0))
-    monkeypatch.setattr(pygame.key, "get_pressed", lambda: defaultdict(bool))
     monkeypatch.setattr(DiffusionWorker, "start", lambda self: None)
     monkeypatch.setattr(DiffusionWorker, "stop", lambda self: None)
     monkeypatch.setattr(DiffusionWorker, "publish", lambda *args: None)
     monkeypatch.setattr(DiffusionWorker, "request_settings", lambda self, **values: settings.append(values))
     monkeypatch.setattr(DiffusionWorker, "request_reseed", lambda *args: reseeds.append(True))
 
-    def request_prompt(self, prompt, negative):
+    def request_prompt(self, prompt, negative, *, settings=None):
         prompts.append((tick, prompt))
+        if settings is not None:
+            assert settings == {key: value for key, value in variation.items() if key != "display_sharpen"}
         return len(prompts)
 
     monkeypatch.setattr(DiffusionWorker, "request_prompt", request_prompt)
@@ -93,9 +105,10 @@ def test_timed_space_and_travel_changes_share_history_without_resetting_settings
     for index, family in enumerate(subjects):
         assert family not in subjects[max(0, index - main.RECENT_FAMILY_MEMORY):index]
     assert settings == reseeds == []
+    assert samples == [2, 5, 6, 9]
     persisted = json.loads(path.read_text())
     assert {key: value for key, value in persisted.items() if key != "prompt"} == {
-        key: value for key, value in config.items() if key != "prompt"}
+        key: value for key, value in {**config, **variation}.items() if key != "prompt"}
 
 
 def test_auto_advance_changes_family_even_when_random_choice_favors_siblings(monkeypatch):

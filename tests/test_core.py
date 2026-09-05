@@ -419,7 +419,6 @@ def test_renderer_chunk_cache_stays_bounded_and_regenerates_evicted_chunks() -> 
 
     renderer = ProxyRenderer.__new__(ProxyRenderer)
     renderer.world_seed = 12345
-    renderer._chunks = {}
     renderer._chunk_instances = {}
     renderer._chunk_form_instances = {}
     renderer._form_instances = {}
@@ -432,7 +431,7 @@ def test_renderer_chunk_cache_stays_bounded_and_regenerates_evicted_chunks() -> 
 
     origin = np.array([0.0, 1.65, 0.0], dtype=np.float32)
     renderer._update_world(origin)
-    original_chunk = renderer._chunks[(0, 0, 0)]
+    original_chunk = renderer._chunk_instances[(0, 0, 0)].copy()
     initial_revision = renderer._instance_buffer_revision
     renderer._update_world(origin)
     assert renderer._instance_buffer_revision == initial_revision
@@ -441,12 +440,12 @@ def test_renderer_chunk_cache_stays_bounded_and_regenerates_evicted_chunks() -> 
         renderer._update_world(
             np.array([0.0, CHUNK_SIZE * step, 0.0], dtype=np.float64)
         )
-        assert len(renderer._chunks) <= MAX_ACTIVE_CHUNKS
-        assert renderer._chunks.keys() == renderer._chunk_instances.keys()
+        assert len(renderer._chunk_instances) <= MAX_ACTIVE_CHUNKS
+        assert renderer._chunk_colliders.keys() == renderer._chunk_instances.keys()
         assert renderer._instance_counts["cube"] <= (
             MAX_ACTIVE_CHUNKS * MAX_OBJECTS_PER_CHUNK
         )
 
-    assert (0, 0, 0) not in renderer._chunks
+    assert (0, 0, 0) not in renderer._chunk_instances
     renderer._update_world(origin)
-    assert renderer._chunks[(0, 0, 0)] == original_chunk
+    np.testing.assert_array_equal(renderer._chunk_instances[(0, 0, 0)], original_chunk)

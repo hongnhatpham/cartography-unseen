@@ -22,6 +22,8 @@ from app.config import (
     configure_local_environment,
 )
 from app.utils.timing import ExponentialAverage, RateMeter
+from app.idle_instructions import IdleInstructions
+from app.screenshots import ScreenshotWriter
 
 # Smoke mode also waits for the first generated frame; the model load alone is
 # longer than the display-frame budget. This caps that extra wait.
@@ -89,12 +91,23 @@ def persist_prompt(config_path: Path, prompt: str) -> float:
     return persist_config_value(config_path, "prompt", prompt)
 
 
+def random_prompt_settings() -> dict[str, float | int]:
+    """Independently combine visitor-selected ranges for each new subject."""
+    return {
+        "timestep_min": 80 + secrets.randbelow(121),
+        "timestep_max": 280 + secrets.randbelow(121),
+        "display_sharpen": (100 + secrets.randbelow(101)) / 100,
+        "instability": secrets.randbelow(41) / 100,
+        "guide_strength": (65 + secrets.randbelow(36)) / 100,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class PromptEntry:
     """One variant of a style family with optional tuning metadata.
 
-    Live prompt selection preserves the operator's current settings. Family
-    settings remain available to offline comparison tools.
+    Family settings remain available to offline comparison tools. Live prompt
+    selection uses the independently sampled visitor ranges instead.
     """
 
     family: str
@@ -335,6 +348,7 @@ def _run() -> int:
 
     renderer: ProxyRenderer | None = None
     worker: DiffusionWorker | None = None
+    screenshots = ScreenshotWriter(root / "screenshot")
     try:
         renderer = ProxyRenderer(
             root,
@@ -385,6 +399,7 @@ def _run() -> int:
         last_palette_update = perf_counter()
         recent_families: list[str] = [current_entry.family]
         last_input = perf_counter()
+        idle_instructions = IdleInstructions(last_input)
         autowalk = Autowalk(config.world_seed)
         autowalking = False
         config_mtime = config_path.stat().st_mtime
@@ -434,12 +449,29 @@ def _run() -> int:
             """Set, persist and (optionally) forward one runtime setting."""
             commit_many({key: value}, live)
 
-        def send_prompt(prompt: str, negative: str | None = None) -> int:
+        def send_prompt(
+            prompt: str, negative: str | None = None, *,
+            vary_settings: bool = False, persist: bool = False,
+        ) -> int:
             """Forward the original subject with the current region's colors."""
             nonlocal effective_prompt, sent_hues, last_palette_update
+            values = random_prompt_settings() if vary_settings else {}
+            if persist:
+                commit_many({"prompt": prompt, **values}, live=False)
+            else:
+                for key, value in values.items():
+                    setattr(config, key, value)
             effective_prompt = compose_prompt(prompt, renderer.world_label(), hue_offset)
             sent_hues = hue_words(renderer.world_label(), hue_offset)
             last_palette_update = perf_counter()
+            if values:
+                logging.info("Prompt variation: timestep %s-%s, sharpness %.2f, instability %.0f%%, guide %.0f%%",
+                             config.timestep_min, config.timestep_max, config.display_sharpen,
+                             config.instability * 100, config.guide_strength * 100)
+                return worker.request_prompt(
+                    effective_prompt, config.negative_prompt if negative is None else negative,
+                    settings={key: value for key, value in values.items() if key in BACKEND_SETTING_KEYS},
+                )
             return worker.request_prompt(
                 effective_prompt,
                 config.negative_prompt if negative is None else negative,
@@ -447,7 +479,18 @@ def _run() -> int:
 
         while running:
             frame_started = perf_counter()
+            screenshot_requested = False
+            screenshot_notice = screenshots.poll()
+            if screenshot_notice:
+                notice, notice_until = screenshot_notice, frame_started + 3.0
+            input_event = False
             for event in renderer.poll_events():
+                if event.type in (
+                    pygame.KEYDOWN, pygame.KEYUP, pygame.TEXTINPUT, pygame.TEXTEDITING,
+                    pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP,
+                    pygame.MOUSEWHEEL,
+                ):
+                    input_event = True
                 if event.type == pygame.QUIT:
                     running = False
                 elif prompt_editing and event.type == pygame.TEXTINPUT:
@@ -464,12 +507,13 @@ def _run() -> int:
                                 accepted = apply_master_prefix(
                                     load_master_prefix(prompt_library_path), accepted
                                 )
-                                config.prompt = accepted
+                                prompt_changed = accepted != config.prompt
                                 current_entry = PromptEntry(
                                     family="Custom", prompt=accepted, settings={}
                                 )
-                                required_prompt_revision = send_prompt(accepted)
-                                config_mtime = persist_prompt(config_path, accepted)
+                                required_prompt_revision = send_prompt(
+                                    accepted, vary_settings=prompt_changed, persist=True,
+                                )
                                 # Restart the auto-advance countdown so a manual
                                 # prompt is not overwritten moments after entry.
                                 last_prompt_advance = frame_started
@@ -482,16 +526,10 @@ def _run() -> int:
                                 notice = "EMPTY PROMPT IGNORED"
                                 notice_until = frame_started + 3.0
                             prompt_editing = False
-                            pygame.key.stop_text_input()
-                            pygame.event.set_grab(True)
-                            pygame.mouse.set_visible(False)
-                            pygame.mouse.get_rel()
+                            renderer.set_prompt_editing(False)
                         elif event.key == pygame.K_ESCAPE:
                             prompt_editing = False
-                            pygame.key.stop_text_input()
-                            pygame.event.set_grab(True)
-                            pygame.mouse.set_visible(False)
-                            pygame.mouse.get_rel()
+                            renderer.set_prompt_editing(False)
                             notice = "PROMPT EDIT CANCELLED"
                             notice_until = frame_started + 2.0
                         elif event.key == pygame.K_BACKSPACE:
@@ -499,8 +537,18 @@ def _run() -> int:
                         elif event.key == pygame.K_d and event.mod & pygame.KMOD_CTRL:
                             prompt_buffer = config.default_prompt
                         continue
+                    # Temporary status/notice panels do not unlock settings.
+                    # Movement is polled separately below, so flight stays live.
+                    if not overlay_enabled and event.key not in (
+                        pygame.K_ESCAPE, pygame.K_F1, pygame.K_SPACE,
+                        pygame.K_RETURN, pygame.K_KP_ENTER,
+                    ):
+                        continue
                     if event.key == pygame.K_ESCAPE:
                         running = False
+                    elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        if not screenshots.busy:
+                            screenshot_requested = True
                     elif event.key == pygame.K_F11:
                         try:
                             is_fullscreen = renderer.toggle_fullscreen()
@@ -648,7 +696,7 @@ def _run() -> int:
                         notice_until = frame_started + 3.0
                     elif event.key == pygame.K_v:
                         commit("player_trail", not config.player_trail, live=False)
-                        notice = "PLAYER TRAIL ON: fades in 5s" if config.player_trail else "PLAYER TRAIL OFF"
+                        notice = "PLAYER TRAIL ON: fades in 10s" if config.player_trail else "PLAYER TRAIL OFF"
                         notice_until = frame_started + 3.0
                     elif event.key in (pygame.K_k, pygame.K_l):
                         direction = -0.05 if event.key == pygame.K_k else 0.05
@@ -707,8 +755,9 @@ def _run() -> int:
                             )
                             recent_families.append(current_entry.family)
                             del recent_families[:-RECENT_FAMILY_MEMORY]
-                            commit("prompt", current_entry.prompt)
-                            required_prompt_revision = send_prompt(current_entry.prompt)
+                            required_prompt_revision = send_prompt(
+                                current_entry.prompt, vary_settings=True, persist=True,
+                            )
                             last_prompt_advance = frame_started
                             notice = f"NEW PROMPT: {current_entry.family}"
                             notice_until = frame_started + 4.0
@@ -719,15 +768,12 @@ def _run() -> int:
                         prompt_editing = True
                         prompt_buffer = config.prompt
                         ignore_prompt_hotkey_text = True
-                        pygame.key.start_text_input()
-                        pygame.event.set_grab(False)
-                        pygame.mouse.set_visible(True)
+                        renderer.set_prompt_editing(True)
                         notice = ""
 
-            mouse_x, mouse_y = pygame.mouse.get_rel()
+            (mouse_x, mouse_y), keys, mouse_buttons = renderer.read_input()
             if not prompt_editing:
                 camera.rotate(mouse_x, mouse_y, config.mouse_sensitivity)
-            keys = pygame.key.get_pressed()
             speed = config.movement_speed
             if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]:
                 speed *= config.sprint_multiplier
@@ -735,7 +781,11 @@ def _run() -> int:
             strafe = float(keys[pygame.K_d]) - float(keys[pygame.K_a])
             ahead = float(keys[pygame.K_w]) - float(keys[pygame.K_s])
             rise = float(keys[pygame.K_e]) - float(keys[pygame.K_q])
-            if mouse_x or mouse_y or strafe or ahead or any(keys):
+            physical_input = bool(
+                input_event or mouse_x or mouse_y or strafe or ahead or rise
+                or any(keys) or any(mouse_buttons)
+            )
+            if physical_input:
                 last_input = frame_started
                 if autowalking:
                     autowalking = False
@@ -774,15 +824,15 @@ def _run() -> int:
                 or frame_started - last_conditioning_capture >= 1.0 / config.conditioning_fps
             )
             renderer.fog_distance = config.fog_distance
-            if capture_due or config.reprojection:
+            if capture_due:
                 proxy_started = perf_counter()
                 snapshot = renderer.render_scene(camera)
                 proxy_ms.update((perf_counter() - proxy_started) * 1000.0)
                 proxy_rate.tick()
             else:
-                # Raw AI holds its last image between conditioning captures.
-                # Keep streaming and the location palette current without
-                # drawing a proxy frame that neither AI nor display will use.
+                # Reprojection draws its own interpolated camera later. Between
+                # captures, neither view consumes a render from this live camera.
+                # Streaming and the location palette still follow every tick.
                 renderer.update_world(camera.position)
             # Let the existing prompt interpolation finish before retargeting
             # colors. Crossing a region changes no subject or sampler setting.
@@ -888,6 +938,17 @@ def _run() -> int:
                     effective_prompt=effective_prompt,
                     hue_offset=hue_offset,
                 )
+            idle_opacity = idle_instructions.update(
+                now, active=physical_input,
+                suppressed=overlay is not None or hide_proxy_until_ai,
+            )
+            screenshot = None
+            if screenshot_requested:
+                if latest_ai is not None and not force_proxy and diagnostic_mode == "none":
+                    screenshot = screenshots
+                else:
+                    notice = "SCREENSHOT: wait for the generated AI view"
+                    notice_until = now + 3.0
             if reproject_frame is not None:
                 renderer.display_reprojected(
                     reproject_frame,
@@ -900,6 +961,8 @@ def _run() -> int:
                     prompt_caption=config.prompt if prompt_caption_enabled else None,
                     trail=trail if config.player_trail else None,
                     trail_time=now,
+                    idle_opacity=idle_opacity,
+                    screenshot=screenshot,
                 )
             else:
                 # Match the camera and depth of the image actually on screen,
@@ -915,12 +978,14 @@ def _run() -> int:
                     trail=trail if config.player_trail else None,
                     trail_frame=trail_frame,
                     trail_time=now,
+                    idle_opacity=idle_opacity,
+                    screenshot=screenshot,
                 )
             display_rate.tick()
             displayed_frames += 1
 
             # Automatic prompt walking keeps the world it is walking through
-            # intact; only the prompt target moves.
+            # intact while sampling a fresh prompt and tuning combination.
             if (
                 config.prompt_auto_advance_seconds > 0.0
                 and not prompt_editing
@@ -936,7 +1001,7 @@ def _run() -> int:
                     # Ephemeral: persisting would move config_mtime past an
                     # external edit and overwrite the configured startup prompt.
                     apply_live({"prompt": current_entry.prompt})
-                    required_prompt_revision = send_prompt(current_entry.prompt)
+                    required_prompt_revision = send_prompt(current_entry.prompt, vary_settings=True)
                     logging.info("Prompt auto-advanced to: %s", current_entry.family)
                 except RuntimeError as exc:
                     logging.error("Prompt auto-advance skipped: %s", exc)
@@ -960,13 +1025,12 @@ def _run() -> int:
                         updated.prompt = apply_master_prefix(
                             load_master_prefix(prompt_library_path), updated.prompt
                         )
-                        if (updated.prompt, updated.negative_prompt) != (
+                        prompt_changed = updated.prompt != config.prompt
+                        prompt_request_changed = (updated.prompt, updated.negative_prompt) != (
                             config.prompt,
                             config.negative_prompt,
-                        ):
-                            required_prompt_revision = send_prompt(
-                                updated.prompt, updated.negative_prompt
-                            )
+                        )
+                        if prompt_request_changed:
                             current_entry = PromptEntry(
                                 family=current_entry.family
                                 if updated.prompt == current_entry.prompt
@@ -1001,6 +1065,10 @@ def _run() -> int:
                             "prompt_auto_advance_seconds",
                         ):
                             setattr(config, key, getattr(updated, key))
+                        if prompt_request_changed:
+                            required_prompt_revision = send_prompt(
+                                config.prompt, vary_settings=prompt_changed,
+                            )
                         overlay_enabled = bool(config.debug_overlay or debug_requested)
                         prompt_caption_enabled = config.prompt_caption
                         config_mtime = current_mtime
@@ -1030,6 +1098,7 @@ def _run() -> int:
         print(f"Fatal application error: {exc}", file=sys.stderr)
         return 4
     finally:
+        screenshots.close()
         if worker is not None:
             worker.stop()
         if renderer is not None:
@@ -1078,7 +1147,7 @@ def build_overlay(
         f"CFG           {float(stats.get('guidance_scale', config.guidance_scale)):4.2g}                  C cycle",
         f"SHARPNESS     {config.display_sharpen:4.1f}                  , / . adjust",
         f"FOG DISTANCE  {config.fog_distance:4.0f}                   H nearer / J farther",
-        f"PLAYER TRAIL  {'ON' if config.player_trail else 'OFF'}                     V toggle   fades in 5s",
+        f"PLAYER TRAIL  {'ON' if config.player_trail else 'OFF'}                     V toggle   fades in 10s",
         f"TIMESTEP      {config.timestep_min}-{config.timestep_max} now {float(stats.get('timestep_now', 0.0)):5.0f}    T / Y shift",
         f"INSTABILITY   {config.instability:4.0%}                  I less / O more",
         f"GUIDE         {config.guide_strength:4.0%} now {float(stats.get('guide_strength_now', 0.0)):4.0%}         K less / L more",

@@ -91,8 +91,19 @@ class DiffusionWorker:
             # The reprojection itself runs here, not in the backend.
             self._feedback_reprojection = bool(kwargs["feedback_reprojection"])
 
-    def request_prompt(self, prompt: str, negative_prompt: str = "") -> int:
+    def request_prompt(
+        self,
+        prompt: str,
+        negative_prompt: str = "",
+        *,
+        settings: dict[str, Any] | None = None,
+    ) -> int:
+        """Queue a prompt and its optional settings together for the next frame."""
         with self._request_lock:
+            if settings:
+                self._pending_settings.update(settings)
+                if "feedback_reprojection" in settings:
+                    self._feedback_reprojection = bool(settings["feedback_reprojection"])
             self._requested_prompt = (prompt, negative_prompt)
             self._prompt_revision += 1
             return self._prompt_revision

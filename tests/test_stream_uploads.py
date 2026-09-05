@@ -27,7 +27,6 @@ class RecordingBuffer:
 def make_renderer():
     r = ProxyRenderer.__new__(ProxyRenderer)
     r.world_seed = 934943880
-    r._chunks = {}
     r._chunk_instances = {}
     r._chunk_form_instances = {}
     r._form_instances = {}
@@ -72,9 +71,9 @@ def test_partial_load_uploads_only_new_geometry_and_preserves_retained_chunks():
         buffer.transferred = 0
         for _ in range(450):
             r._update_world(np.array(position))
-            if len(r._chunks) == MAX_ACTIVE_CHUNKS:
+            if len(r._chunk_instances) == MAX_ACTIVE_CHUNKS:
                 break
-        assert len(r._chunks) == MAX_ACTIVE_CHUNKS
+        assert len(r._chunk_instances) == MAX_ACTIVE_CHUNKS
         assert_complete_geometry(r)
         # A boundary exposes one 11x11 chunk face. Refilling it should transfer
         # far less than even two complete worlds, including a buffer resize.

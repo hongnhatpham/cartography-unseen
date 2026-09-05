@@ -204,6 +204,7 @@ def ridge(x: float, y: float, z: float, cell: float, world_seed: int, salt: int)
     return 1.0 - abs(2.0 * value_noise(x, y, z, cell, world_seed, salt) - 1.0)
 
 
+@lru_cache(maxsize=1 << 15)
 def channel_weight(x: float, y: float, z: float, world_seed: int) -> float:
     """1 inside an open channel, 0 in the plain cell shell, smooth in between.
 
@@ -211,6 +212,9 @@ def channel_weight(x: float, y: float, z: float, world_seed: int) -> float:
     peak is a curved sheet rather than a line, so the channels are wide, they
     branch and meet, and the open space they carve is connected by construction.
     Thresholded plain noise gives isolated bubbles instead.
+
+    Adjacent faces repeatedly sample the same cell centres. Reuse their exact
+    field values, with a bounded cache so endless exploration cannot grow it.
     """
 
     best = 0.0
@@ -234,13 +238,22 @@ def _chunk_offsets(radius: int) -> tuple[ChunkCoord, ...]:
     return tuple(sorted(coords, key=lambda c: (max(map(abs, c)), sum(map(abs, c)), c)))
 
 
+@lru_cache(maxsize=8)
+def _chunk_window(
+    center: ChunkCoord, radius: int
+) -> tuple[tuple[ChunkCoord, ...], frozenset[ChunkCoord]]:
+    """Reuse the immutable target window while its small batches stream in."""
+    cx, cy, cz = center
+    desired = tuple((cx + dx, cy + dy, cz + dz) for dx, dy, dz in _chunk_offsets(radius))
+    return desired, frozenset(desired)
+
+
 def active_chunk_coords(
     x: float, y: float, z: float, radius: int = ACTIVE_CHUNK_RADIUS
 ) -> tuple[ChunkCoord, ...]:
     """Return the finite chunk window around a world-space position."""
 
-    cx, cy, cz = world_to_chunk(x, y, z)
-    return tuple((cx + dx, cy + dy, cz + dz) for dx, dy, dz in _chunk_offsets(radius))
+    return _chunk_window(world_to_chunk(x, y, z), radius)[0]
 
 
 def plan_chunk_cache(
@@ -252,15 +265,14 @@ def plan_chunk_cache(
 ) -> ChunkCachePlan:
     """Plan loads and evictions without retaining generated chunks here."""
 
-    desired = active_chunk_coords(x, y, z, radius)
-    desired_set = set(desired)
+    center = world_to_chunk(x, y, z)
+    desired, desired_set = _chunk_window(center, radius)
     existing_set = set(existing)
-    order = {coord: index for index, coord in enumerate(desired)}
     return ChunkCachePlan(
-        center=world_to_chunk(x, y, z),
+        center=center,
         desired=desired,
         load=tuple(coord for coord in desired if coord not in existing_set),
-        keep=tuple(sorted(existing_set & desired_set, key=order.__getitem__)),
+        keep=tuple(coord for coord in desired if coord in existing_set),
         evict=tuple(sorted(existing_set - desired_set)),
     )
 
@@ -759,7 +771,7 @@ def _companion_forms(cubes: list[WorldCube], coord: ChunkCoord, seed: int) -> tu
     return tuple(forms)
 
 
-@lru_cache(maxsize=MAX_ACTIVE_CHUNKS * 2)
+@lru_cache(maxsize=128)
 def generate_chunk(coord: ChunkCoord, world_seed: int) -> WorldChunk:
     """Generate one chunk independently of cache state or generation order.
 
@@ -767,9 +779,9 @@ def generate_chunk(coord: ChunkCoord, world_seed: int) -> WorldChunk:
     face in the world is emitted exactly once. Panels come first because the
     per-chunk cap truncates the tail and the shell is what has to survive.
 
-    Memoised because the spawn search and the renderer's cold fill ask for
-    overlapping windows of the same seed, and a chunk costs several
-    milliseconds to build. The result is frozen, so sharing one is safe.
+    A small cache shares recent spawn and collision queries. The renderer keeps
+    packed arrays, so retaining entire windows of source objects here would
+    add a large Python object graph to every full garbage collection.
     """
 
     panels: list[WorldCube] = []
