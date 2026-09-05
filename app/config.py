@@ -127,6 +127,7 @@ class AppConfig:
     # World distance where structures fully fade into the atmosphere. Keep the
     # maximum inside the streamed window so distant chunk edges stay hidden.
     fog_distance: float = DEFAULT_FOG_DISTANCE
+    player_trail: bool = True
     target_display_fps: int = 60
     conditioning_fps: int = 15
     debug_overlay: bool = False

@@ -144,6 +144,39 @@
         "corrupted, ravine floor of mangled blocks, wires strung overhead",
         "corrupted, fog between the blocks, terraces stepping down into a datamoshed channel"
       ]
+    },
+    {
+      "name": "Cellular Karst",
+      "base": "eye level view across a vast abstract outdoor landscape, wide open passages, hard black shadows, high contrast, foggy, haunted",
+      "settings": {},
+      "variants": [
+        "porous coral ridges, eroded cellular towers pierced by deep openings, warped mineral growth",
+        "hollow sponge cliffs, rounded chambers opening into broad valleys, corrupted cellular terrain",
+        "honeycomb arches dissolving into pitted stone, soft eroded contours, distant cavities",
+        "branching coral terraces, swollen mineral folds around open ravines, mangled porous surfaces"
+      ]
+    },
+    {
+      "name": "Root Networks",
+      "base": "eye level view across a vast abstract outdoor landscape, broad clearings, hard black shadows, high contrast, foggy, haunted",
+      "settings": {},
+      "variants": [
+        "giant exposed root networks, curved strands bridging distant ridges, corrupted branching geometry",
+        "mycelial cable webs, thin tendrils spanning deep ravines, tangled neural growth",
+        "ribbed skeletal arches, branching sinews stretched between eroded pillars, warped organic structure",
+        "bundled roots unraveling into fine wire lattices, looping connections above open terrain"
+      ]
+    },
+    {
+      "name": "Membrane Folds",
+      "base": "eye level view across a vast abstract outdoor landscape, deep open corridors, hard black shadows, high contrast, foggy, haunted",
+      "settings": {},
+      "variants": [
+        "folded membranes rising from eroded terrain, saddle shaped sheets with torn openings, corrupted geometry",
+        "biomorphic arches curling into funnels, taut translucent skins stretched across ribs, warped surfaces",
+        "pleated mineral ribbons, soft sweeping curves unfolding around deep valleys, mangled terrain",
+        "perforated shell formations, thin curved sheets peeling into wire nets, layered distant folds"
+      ]
     }
   ]
 }

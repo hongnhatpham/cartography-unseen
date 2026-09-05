@@ -34,6 +34,7 @@
   "reprojection_max_rotation": 10.0,
   "display_sharpen": 1.0,
   "fog_distance": 150.0,
+  "player_trail": true,
   "target_display_fps": 60,
   "conditioning_fps": 15,
   "debug_overlay": false,

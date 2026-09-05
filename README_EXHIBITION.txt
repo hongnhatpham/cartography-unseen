@@ -79,6 +79,8 @@ F9               Cycle prompt auto-advance: off, 12, 24, 48, 96 s. Advancing
                  sharing history with Space. Current tuning stays fixed
 H / J            Fog distance nearer / farther, 10 units per press. Nearer
                  means more fog; farther means less. F1 shows the distance
+V                Toggle the player trail. The last five seconds of travel
+                 fade oldest-first; turning it off clears the route
 F12              Toggle idle flight. With no input for a minute the camera
                  flies on its own; any key or mouse movement takes over
 F10              Cycle generation resolution/aspect modes
@@ -156,16 +158,19 @@ list of prompts. Each family has:
 
 master_prefix ("corrupted 3D render") is prepended to every prompt.
 
-The eight shipped families are Topology Unknown, Biophilic City, Mangled Data,
+The eleven shipped families are Topology Unknown, Biophilic City, Mangled Data,
 Wire Field, Washed Strata, Warped Spacetime, Corrupted Bloom and Datamosh
-Ravines. They are abstract on purpose: wires, corruption, data, warped space
+Ravines, plus Cellular Karst, Root Networks and Membrane Folds. The three
+organic families add porous formations, branching strands and curved sheets
+without the voxel wording of the original subjects. There are 44 variants.
+They are abstract on purpose: wires, corruption, data, warped space
 and time, lattice, and the blocky biophilic cityscape of the original piece.
 Material nouns such as chrome or glass are kept out because they resolve into
 product shots and furnished rooms.
 
-Space chooses a prompt from another family, avoiding recently used families
-when possible. Automatic advance usually picks another variant of the same
-family. Neither action applies the family's sampler presets.
+Space and automatic advance choose a prompt from another family, avoiding
+the last three families when possible. Neither action applies the family's
+sampler presets.
 
 Families and variants can be added, removed or rewritten. Changes are read on the
 next Space press or automatic prompt change. A family's settings block may only
@@ -203,6 +208,12 @@ without the full F1 diagnostics.
 
 HOW THE IMAGE IS MADE
 ---------------------
+An optional pale filament marks your recent route. Look back to see it just
+below the path you travelled. Older sections fade first; the route disappears
+after five seconds, including when you stand still. Structures hide the trail
+where it passes behind them. V toggles it and saves your choice. It is drawn
+after the AI image, so it fades on time without changing the generation.
+
 Fog distance controls where structures fully fade into the atmosphere. The
 default is 196 world units, matching the original fog, with a range of 40–300.
 H brings the fog closer to soften distant colors; J pushes it farther away.

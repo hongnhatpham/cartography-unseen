@@ -15,7 +15,7 @@ from app.types import ConditioningFrame, GeneratedFrame
 @pytest.mark.parametrize("backend", ["proxy_passthrough", "latent_walk"])
 @pytest.mark.parametrize("view_key, key_presses", [
     (None, 0), (pygame.K_F2, 1), (pygame.K_F3, 1),
-    (pygame.K_F3, 2), (pygame.K_F5, 1),
+    (pygame.K_F3, 2), (pygame.K_F5, 1), (pygame.K_v, 1),
 ])
 def test_proxy_work_follows_consumers_without_slowing_flight(
     monkeypatch, tmp_path, backend, view_key, key_presses,
@@ -28,13 +28,14 @@ def test_proxy_work_follows_consumers_without_slowing_flight(
     config.update(backend=backend, fullscreen=False, reprojection=False,
                   target_display_fps=64, conditioning_fps=16, debug_overlay=False,
                   prompt_caption=False, prompt_auto_advance_seconds=0,
-                  autowalk_idle_seconds=0)
+                  autowalk_idle_seconds=0, player_trail=True)
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config), encoding="utf-8")
     monkeypatch.setattr(sys, "argv", ["app", "--config", str(path)])
     tick = 0
     captures = []
     displayed = []
+    displayed_trails = []
     streamed = []
     collisions = []
     renders = []
@@ -104,6 +105,7 @@ def test_proxy_work_follows_consumers_without_slowing_flight(
 
         def display(self, image, *args, **kwargs):
             displayed.append((tick, image.copy()))
+            displayed_trails.append(kwargs.get("trail"))
 
         def display_reprojected(self, frame, camera, *args, **kwargs):
             # The real renderer draws its own warped camera each display tick.
@@ -139,6 +141,10 @@ def test_proxy_work_follows_consumers_without_slowing_flight(
     assert renders == (list(range(64)) if view_key == pygame.K_F5 else expected_ticks)
     assert [at for at, _ in streamed] == list(range(64))
     assert len(collisions) == len(displayed) == 64
+    if view_key == pygame.K_v:
+        assert displayed_trails[0] is not None
+        assert all(trail is None for trail in displayed_trails[1:])
+        assert json.loads(path.read_text())["player_trail"] is False
     assert np.all(np.diff([position[1] for position in collisions]) > 0)
     for at, frame in captures:
         assert np.array_equal(frame.camera.position, collisions[at])

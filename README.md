@@ -50,6 +50,7 @@ The NVIDIA display driver must already be installed. A separate CUDA Toolkit is 
 | - / = | Diffusion steps, 1–4 |
 | , / . | Display sharpening |
 | H / J | Fog distance nearer / farther in steps of 10. Nearer means more fog |
+| V | Toggle the five-second player trail |
 | I / O | Instability down / up |
 | K / L | Guide strength down / up |
 | T / Y | Shift the timestep window down / up by 25 |
@@ -68,7 +69,14 @@ distance. The setting affects the proxy sent to the AI and survives prompt chang
 
 Movement has no gravity, fixed eye height or altitude limit. Look up and hold W to climb, look down to descend, or use Q/E to change height without changing your gaze. The world continues above and below you as well as horizontally. Release the keys to stop. Solid forms still block movement and you slide along them; you can pass above or below them wherever there is space. Idle flight also steers in three dimensions.
 
-The generated image carries the environment, with no navigation contours or proximity reveals. The dense slabs and layered spaces retain the KOSMA reference direction. Interior clutter thins along existing passages, giving them more room while retaining surrounding panels and denser areas. Free flight changes how you traverse them; it does not add sparse floating islands or an open-sky setting.
+The generated image carries the environment. An optional pale filament marks the
+last five seconds of travel, fading oldest-first and disappearing when you stop.
+Press V to toggle it; `player_trail` saves the choice. Turning it off clears the
+route. It sits slightly below the travelled path so you can see it when looking
+back, and structures hide it where the route passes behind them. The trail is
+drawn after the AI image so its fade stays exact and does not alter generation.
+
+The dense slabs and layered spaces retain the KOSMA reference direction. Interior clutter thins along existing passages, giving them more room while retaining surrounding panels and denser areas. Free flight changes how you traverse them; it does not add sparse floating islands or an open-sky setting.
 
 ## Resolution modes
 
@@ -102,6 +110,19 @@ across 42 sampled views, including partial loads and distant positive and negati
 altitudes. Resolution, CFG, sampler settings, model precision and world density
 remain unchanged.
 
+Prompt changes reuse a bounded cache of 64 text embeddings, including the shared
+negative prompt. After model warmup, long-lived startup objects are excluded from
+full garbage-collection scans. New objects still undergo normal collection, and
+unloading the backend restores the previous collection behavior. These changes
+reduce prompt work and periodic pauses without changing the model or its settings.
+In a same-backend comparison, full collection fell from 170 ms to under 0.1 ms;
+revisiting a prompt fell from 26–46 ms to 1–3 ms. A previously unseen prompt still
+needs text encoding. These measurements do not imply constant AI frame times.
+The interactive app also uses a 1 ms Python thread interval so world updates and
+AI kernel submission share execution more frequently, restoring the host's value
+on exit. With the cache and collection changes active, a moving replay improved
+AI p95 from 203 to 118 ms and the longest display interval from 99 to 65 ms.
+
 ## Prompts
 
 `prompts.json` holds **style families**, not flat prompts. Each family has a `name`, a
@@ -111,8 +132,11 @@ your current settings. One library entry is built per variant as
 `"<variant>, <base>"`, and `master_prefix` ("corrupted 3D render") is prepended to all of
 them.
 
-The eight shipped families are Topology Unknown, Biophilic City, Mangled Data, Wire
-Field, Washed Strata, Warped Spacetime, Corrupted Bloom and Datamosh Ravines. They are
+The eleven shipped families are Topology Unknown, Biophilic City, Mangled Data, Wire
+Field, Washed Strata, Warped Spacetime, Corrupted Bloom, Datamosh Ravines, Cellular
+Karst, Root Networks and Membrane Folds. The three organic families add porous
+formations, branching strands and curved sheets without the voxel wording used
+by the original subjects. There are 44 variants in total. They are
 deliberately abstract: wires, corruption, data, mangled geometry, warped space and time,
 lattice, and the blocky biophilic cityscape of the original ComfyUI sequence. Every entry
 is anchored as an eye-level view inside a vast outdoor landscape, and material nouns that

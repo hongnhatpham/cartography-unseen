@@ -276,6 +276,16 @@ def next_level(levels: tuple[float, ...], current: float) -> float:
 
 
 def run() -> int:
+    """Let UI and AI threads share Python without long kernel-submission gaps."""
+    previous_interval = sys.getswitchinterval()
+    sys.setswitchinterval(min(previous_interval, .001))
+    try:
+        return _run()
+    finally:
+        sys.setswitchinterval(previous_interval)
+
+
+def _run() -> int:
     args = parse_args()
     root = project_root()
     configure_local_environment(root, offline=True)
@@ -305,6 +315,7 @@ def run() -> int:
 
         from app.diffusion.worker import DiffusionWorker
         from app.renderer.camera import Camera
+        from app.renderer.player_trail import PlayerTrail
         from app.renderer.proxy_renderer import ProxyRenderer
         from app.renderer.world import Autowalk
     except Exception as exc:
@@ -337,6 +348,7 @@ def run() -> int:
         renderer.loading_screen("INITIALIZING", "Starting renderer and diffusion worker")
         camera = Camera.create_default()
         renderer.spawn_camera(camera)
+        trail = PlayerTrail()
         try:
             current_entry = entry_for_prompt(
                 load_prompt_library(prompt_library_path), config.prompt
@@ -634,6 +646,10 @@ def run() -> int:
                         )
                         notice = f"FOG DISTANCE: {config.fog_distance:g}   H nearer / J farther"
                         notice_until = frame_started + 3.0
+                    elif event.key == pygame.K_v:
+                        commit("player_trail", not config.player_trail, live=False)
+                        notice = "PLAYER TRAIL ON: fades in 5s" if config.player_trail else "PLAYER TRAIL OFF"
+                        notice_until = frame_started + 3.0
                     elif event.key in (pygame.K_k, pygame.K_l):
                         direction = -0.05 if event.key == pygame.K_k else 0.05
                         commit(
@@ -750,6 +766,7 @@ def run() -> int:
                     camera.fly(strafe, rise, ahead, speed * dt)
                 renderer.constrain_camera(camera, dt)
 
+            trail.update(camera.position, frame_started, config.player_trail)
             capture_due = (
                 conditioning is None
                 or force_proxy
@@ -881,13 +898,23 @@ def run() -> int:
                     max_rotation=config.reprojection_max_rotation,
                     sharpen=config.display_sharpen,
                     prompt_caption=config.prompt if prompt_caption_enabled else None,
+                    trail=trail if config.player_trail else None,
+                    trail_time=now,
                 )
             else:
+                # Match the camera and depth of the image actually on screen,
+                # including raw AI frames held between generation updates.
+                trail_frame = None
+                if diagnostic_mode == "none" and (force_proxy or latest_ai is not None):
+                    trail_frame = conditioning if force_proxy else latest_ai
                 renderer.display(
                     display_image,
                     overlay,
                     sharpen=config.display_sharpen,
                     prompt_caption=config.prompt if prompt_caption_enabled else None,
+                    trail=trail if config.player_trail else None,
+                    trail_frame=trail_frame,
+                    trail_time=now,
                 )
             display_rate.tick()
             displayed_frames += 1
@@ -968,6 +995,7 @@ def run() -> int:
                             "reprojection_max_rotation",
                             "display_sharpen",
                             "fog_distance",
+                            "player_trail",
                             "debug_overlay",
                             "prompt_caption",
                             "prompt_auto_advance_seconds",
@@ -1050,6 +1078,7 @@ def build_overlay(
         f"CFG           {float(stats.get('guidance_scale', config.guidance_scale)):4.2g}                  C cycle",
         f"SHARPNESS     {config.display_sharpen:4.1f}                  , / . adjust",
         f"FOG DISTANCE  {config.fog_distance:4.0f}                   H nearer / J farther",
+        f"PLAYER TRAIL  {'ON' if config.player_trail else 'OFF'}                     V toggle   fades in 5s",
         f"TIMESTEP      {config.timestep_min}-{config.timestep_max} now {float(stats.get('timestep_now', 0.0)):5.0f}    T / Y shift",
         f"INSTABILITY   {config.instability:4.0%}                  I less / O more",
         f"GUIDE         {config.guide_strength:4.0%} now {float(stats.get('guide_strength_now', 0.0)):4.0%}         K less / L more",

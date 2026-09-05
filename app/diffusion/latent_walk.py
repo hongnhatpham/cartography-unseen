@@ -9,9 +9,11 @@ only host transfer per frame is the proxy upload and one uint8 readback.
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import math
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -605,6 +607,8 @@ class LatentWalkBackend(DiffusionBackend):
         self.alphas_cumprod: np.ndarray = np.ones(1000, dtype=np.float64)
         self.prompt = ""
         self.negative_prompt = ""
+        self._prompt_embeddings: OrderedDict[str, Any] = OrderedDict()
+        self._owns_gc_freeze = False
         self.x0_prev: Any = None
         self._warm_frames = RESET_WARMUP_FRAMES
         self._noise_generator: Any = None
@@ -625,6 +629,7 @@ class LatentWalkBackend(DiffusionBackend):
 
     def load(self, config: dict[str, Any]) -> None:
         """Load the UNet, CLIP text encoder and TAESD as raw fp16 modules."""
+        self._prompt_embeddings.clear()
         started = perf_counter()
         try:
             import torch
@@ -714,12 +719,16 @@ class LatentWalkBackend(DiffusionBackend):
         self.load_ms = (perf_counter() - started) * 1000.0
 
     def unload(self) -> None:
+        self._prompt_embeddings.clear()
         self.unet = None
         self.taesd = None
         self.text_encoder = None
         self.tokenizer = None
         self.x0_prev = None
         self.noise_walk.reset()
+        if self._owns_gc_freeze:
+            gc.unfreeze()
+            self._owns_gc_freeze = False
         if self.torch is not None and self.torch.cuda.is_available():
             self.torch.cuda.empty_cache()
 
@@ -808,6 +817,14 @@ class LatentWalkBackend(DiffusionBackend):
         self.noise_walk.reset()
         self.frames = 0
         self.inference_average = ExponentialAverage(alpha=0.2)
+        # Full GC scanning the imported model graph paused both threads for
+        # 137 ms during a live replay. Keep startup objects out of those scans;
+        # new frame objects still undergo ordinary cyclic collection. Respect
+        # a host that already owns a frozen generation, and restore on unload.
+        if not self._owns_gc_freeze and gc.get_freeze_count() == 0:
+            gc.collect()
+            gc.freeze()
+            self._owns_gc_freeze = True
 
     def generate(
         self,
@@ -981,6 +998,12 @@ class LatentWalkBackend(DiffusionBackend):
         )
 
     def _encode_prompt(self, text: str) -> Any:
+        # Palette changes reuse the negative prompt and often revisit positive
+        # text. Bound the cache for installations that accept unlimited edits.
+        cached = self._prompt_embeddings.get(text)
+        if cached is not None:
+            self._prompt_embeddings.move_to_end(text)
+            return cached
         tokens = self.tokenizer(
             text,
             padding="max_length",
@@ -989,7 +1012,11 @@ class LatentWalkBackend(DiffusionBackend):
             return_tensors="pt",
         )
         ids = tokens.input_ids.to(self.device)
-        return self.text_encoder(ids)[0].to(self.dtype)
+        embedding = self.text_encoder(ids)[0].to(self.dtype)
+        self._prompt_embeddings[text] = embedding
+        if len(self._prompt_embeddings) > 64:
+            self._prompt_embeddings.popitem(last=False)
+        return embedding
 
     def _sample_noise(self) -> Any:
         """Fresh unit-variance latent noise for a walk keyframe."""

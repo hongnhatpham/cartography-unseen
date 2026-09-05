@@ -18,6 +18,8 @@ except ImportError as exc:  # pragma: no cover - rendered as a startup error by 
 from app.renderer.camera import Camera
 from app.config import DEFAULT_FOG_DISTANCE
 from app.renderer.form_meshes import form_meshes
+from app.renderer.player_trail import PlayerTrail
+from app.renderer.trail_renderer import TrailRenderer
 from app.renderer.world import (
     ACTIVE_CHUNK_RADIUS,
     CHUNK_SIZE,
@@ -37,7 +39,7 @@ from app.renderer.world import (
     world_label,
     world_to_chunk,
 )
-from app.types import ConditioningFrame, GeneratedFrame
+from app.types import CameraSnapshot, ConditioningFrame, GeneratedFrame
 
 # A boundary crossing adds a plane of small cubic chunks. Load the nearest
 # first; three per frame fills that plane well before it enters the visible fog.
@@ -109,6 +111,7 @@ class ProxyRenderer:
         self.small_font = pygame.font.Font(None, 20)
 
         shader_root = project_root / "shaders"
+        self.trail_renderer = TrailRenderer(self.ctx, shader_root)
         self.proxy_program = self.ctx.program(
             vertex_shader=(shader_root / "proxy.vert").read_text(encoding="utf-8"),
             fragment_shader=(shader_root / "proxy.frag").read_text(encoding="utf-8"),
@@ -663,6 +666,10 @@ class ProxyRenderer:
         overlay_lines: list[str] | None = None,
         sharpen: float = 0.3,
         prompt_caption: str | None = None,
+        *,
+        trail: PlayerTrail | None = None,
+        trail_frame: ConditioningFrame | GeneratedFrame | None = None,
+        trail_time: float = 0.0,
     ) -> None:
         target_shape = (self.render_height, self.render_width)
         if image.shape[:2] != target_shape:
@@ -677,7 +684,20 @@ class ProxyRenderer:
         self.display_texture.write(np.ascontiguousarray(np.flipud(image)).tobytes())
 
         self._present_texture(
-            self.display_texture, overlay_lines, sharpen, prompt_caption
+            self.display_texture, overlay_lines, sharpen, prompt_caption,
+            trail=trail,
+            trail_camera=self._frame_camera(trail_frame) if trail_frame is not None else None,
+            trail_depth=trail_frame.depth if trail_frame is not None else None,
+            trail_time=trail_time,
+        )
+
+    @staticmethod
+    def _frame_camera(frame: ConditioningFrame | GeneratedFrame) -> CameraSnapshot:
+        if isinstance(frame, ConditioningFrame):
+            return frame.camera
+        return CameraSnapshot(
+            frame.view_matrix, frame.projection_matrix,
+            frame.camera_position, frame.camera_rotation,
         )
 
     def display_reprojected(
@@ -690,6 +710,9 @@ class ProxyRenderer:
         max_rotation: float = 12.0,
         sharpen: float = 0.3,
         prompt_caption: str | None = None,
+        *,
+        trail: PlayerTrail | None = None,
+        trail_time: float = 0.0,
     ) -> None:
         started = perf_counter()
         if frame.sequence != self._reproject_sequence:
@@ -743,7 +766,9 @@ class ProxyRenderer:
         if not self._world_contains(warped_camera.position):
             self.reproject_ms += 0.15 * ((perf_counter() - started) * 1000.0 - self.reproject_ms)
             self._present_texture(
-                self.display_texture, overlay_lines, sharpen, prompt_caption
+                self.display_texture, overlay_lines, sharpen, prompt_caption,
+                trail=trail, trail_camera=self._frame_camera(frame),
+                trail_depth=frame.depth, trail_time=trail_time,
             )
             return
         current = self.render_scene(warped_camera, manage_chunks=False)
@@ -792,7 +817,9 @@ class ProxyRenderer:
         elapsed_ms = (perf_counter() - started) * 1000.0
         self.reproject_ms += 0.15 * (elapsed_ms - self.reproject_ms)
         self._present_texture(
-            self.reproject_texture, overlay_lines, sharpen, prompt_caption
+            self.reproject_texture, overlay_lines, sharpen, prompt_caption,
+            trail=trail, trail_camera=current, trail_depth=self.depth_texture,
+            trail_time=trail_time,
         )
 
     def _present_texture(
@@ -801,6 +828,11 @@ class ProxyRenderer:
         overlay_lines: list[str] | None = None,
         sharpen: float = 0.3,
         prompt_caption: str | None = None,
+        *,
+        trail: PlayerTrail | None = None,
+        trail_camera: CameraSnapshot | None = None,
+        trail_depth: np.ndarray | moderngl.Texture | None = None,
+        trail_time: float = 0.0,
     ) -> None:
         current_size = pygame.display.get_window_size()
         if current_size != self.window_size:
@@ -825,6 +857,11 @@ class ProxyRenderer:
         self.screen_program["image_texture"].value = 0
         self.quad_vao.render()
 
+        if trail is not None and trail_camera is not None and trail_depth is not None:
+            self.trail_renderer.draw(
+                trail, trail_time, trail_camera, trail_depth,
+                self.window_size, uv_scale, uv_offset,
+            )
         if overlay_lines or prompt_caption:
             self._draw_overlay(overlay_lines or [], prompt_caption)
         pygame.display.flip()
@@ -913,6 +950,7 @@ class ProxyRenderer:
         self._closed = True
         pygame.event.set_grab(False)
         pygame.mouse.set_visible(True)
+        self.trail_renderer.close()
         resources = (
             *self.mesh_vaos.values(),
             *self.instance_buffers.values(),
