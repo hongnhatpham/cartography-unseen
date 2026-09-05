@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from app.diffusion.latent_walk import (
+    RESET_WARMUP_FRAMES,
     LatentWalkBackend,
     NoiseWalk,
     PromptWalk,
@@ -117,17 +118,31 @@ def test_lcm_scalings_move_from_skip_to_output() -> None:
 
 def test_instability_scales_the_timestep_breathing_range() -> None:
     steady = {breathing_timestep(t * 0.5, 650, 900, 0.0) for t in range(40)}
-    breathing = [breathing_timestep(t * 0.25, 650, 900, 1.0) for t in range(120)]
+    breathing = [breathing_timestep(t * 0.25, 650, 900, 1.0) for t in range(400)]
+    mild = [breathing_timestep(t * 0.25, 650, 900, 0.35) for t in range(400)]
 
     assert steady == {775}
-    assert min(breathing) <= 651 and max(breathing) >= 899
+    assert min(breathing) == 650 and max(breathing) == 900
+    # The band is a hard limit; the extra reach only makes the walk dwell at
+    # the ends rather than push past them.
+    assert all(650 <= value <= 900 for value in breathing)
+    assert min(mild) > 650 and max(mild) < 900
     # Swapped bounds must not invert the range.
     assert breathing_timestep(0.0, 900, 650, 1.0) == 775
 
 
+def test_the_slow_breath_tone_carries_a_long_loop_between_regimes() -> None:
+    """One 13 s sine returned to the same timestep every cycle, so a 300-frame
+    loop kept re-running the same look; the slow tone shifts each cycle."""
+    first = [breathing_timestep(t * 0.5, 600, 800, 0.8) for t in range(26)]
+    later = [breathing_timestep(60.0 + t * 0.5, 600, 800, 0.8) for t in range(26)]
+
+    assert max(abs(a - b) for a, b in zip(first, later)) > 20
+
+
 def test_guide_wobble_only_ever_tightens_the_anchor() -> None:
     steady = {wobbled_guide_strength(t * 0.5, 0.65, 0.0) for t in range(20)}
-    wobbled = [wobbled_guide_strength(t * 0.25, 0.65, 1.0) for t in range(80)]
+    wobbled = [wobbled_guide_strength(t * 0.5, 0.65, 1.0) for t in range(120)]
 
     assert steady == {0.65}
     # guide_strength is a floor: a trough below it is where the walk let go of
@@ -135,7 +150,9 @@ def test_guide_wobble_only_ever_tightens_the_anchor() -> None:
     assert min(wobbled) >= 0.65 - 1e-9
     assert max(wobbled) > 0.65
     assert all(0.0 <= value <= 1.0 for value in wobbled)
-    assert wobbled_guide_strength(1.75, 0.95, 1.0) == 1.0
+    assert wobbled_guide_strength(7.25, 0.95, 1.0) == 1.0
+    # The wobble is slow on purpose: a look has to hold long enough to settle.
+    assert max(wobbled) - min(wobbled) > 0.2
 
 
 # -- memory statistics ------------------------------------------------------
@@ -542,6 +559,29 @@ def cuda_models_available() -> bool:
         and (ROOT / "models" / "sd_turbo" / "unet").exists()
         and (ROOT / "models" / "taesd" / "config.json").exists()
     )
+
+
+def test_dropping_the_memory_arms_a_discarded_warmup() -> None:
+    """The first frame after a reset must not be conditioned on the raw proxy.
+
+    A large flat pale plane in the proxy is completed as a game controller on a
+    desk whatever the negative prompt says, so the memory is seeded from
+    hallucination at ``timestep_max`` before anything is published.
+    """
+    backend = LatentWalkBackend()
+    backend.timestep_max = 900
+    backend._warm_frames = 0
+    backend.reseed(7)
+    assert backend._warm_frames == RESET_WARMUP_FRAMES
+
+    timesteps: list[int] = []
+    backend._denoise = lambda base, noise, t, positive, negative: timesteps.append(t) or base
+    backend.noise_walk.value = lambda: None
+    backend._seed_memory("guide", None, None)
+
+    assert timesteps == [900] * RESET_WARMUP_FRAMES
+    assert backend.x0_prev == "guide"
+    assert backend._warm_frames == 0
 
 
 @pytest.mark.skipif(not cuda_models_available(), reason="CUDA or local models unavailable")

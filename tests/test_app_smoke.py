@@ -3,13 +3,12 @@ app.config, the worker and the latent-walk backend."""
 
 from __future__ import annotations
 
-import re
 from dataclasses import fields
 from pathlib import Path
 
 from app.config import BACKEND_SETTING_KEYS, RESOLUTION_MODES, AppConfig
 from app.diffusion.latent_walk import SETTING_KEYS, normalise_settings
-from app.main import compose_prompt, load_master_prefix, load_prompt_library
+from app.main import compose_prompt, load_prompt_library
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -33,89 +32,59 @@ def test_shipped_config_loads_and_meets_the_realtime_resolution_policy() -> None
     assert config.steps == 1
 
 
-def test_shipped_prompt_library_uses_the_reference_vocabulary() -> None:
-    prefix = load_master_prefix(ROOT / "prompts.json")
+def test_shipped_library_is_abstract_and_varied() -> None:
+    """Round 7: abstract vocabulary Hong asked for, nothing that can land concrete."""
     entries = load_prompt_library(ROOT / "prompts.json")
-    assert prefix == "corrupted 3D render"
-    assert 12 <= len(entries) <= 16
-    assert len({entry["prompt"] for entry in entries}) == len(entries)
-    assert all(entry["prompt"].startswith(prefix) for entry in entries)
-    joined = " ".join(entry["prompt"] for entry in entries).lower()
-    assert all(
-        term in joined
-        for term in ("neural network highway", "blocky biophilia", "corrupted", "eye level")
-    )
-    # "glitch art" and "screenshot of a video game" are the two tokens that made
-    # the 96-frame walk resolve into lettering, controllers and circuit boards
-    # once the memory latent had drifted; they stay out of the library.
-    assert all(term not in joined for term in ("glitch art", "screenshot"))
-    # Run 2 rendered every seed icy blue: the palette lived in the prompt as one
-    # fixed phrase instead of coming from the world. The hue now arrives at
-    # runtime from world_label, so no entry may hard-code a base colour.
-    assert "pale grey base" not in joined
-    assert "saturated burst" not in joined
-    # Pale/white vocabulary in at most a third of the library; the rest carry
-    # dark or two-hue vocabulary so the walk has a contrast range to travel.
-    pale = [
-        entry
-        for entry in entries
-        if re.search(r"(pale|white|washed out)", entry["prompt"].lower())
-    ]
-    assert len(pale) <= len(entries) // 3
-    dark = [
-        entry
-        for entry in entries
-        if any(
-            word in entry["prompt"].lower()
-            for word in ("hard black shadows", "deep shadow", "high contrast", "hard shadows")
-        )
-    ]
-    assert len(dark) >= len(entries) * 2 // 3
+    families = {entry.family: entry for entry in entries}
+
+    assert 6 <= len(families) <= 12
+    assert len({entry.prompt for entry in entries}) == len(entries)
+    assert all(len([e for e in entries if e.family == name]) >= 3 for name in families)
+    joined = " ".join(entry.prompt for entry in entries).lower()
+    # The vocabulary Hong named: wires, abstraction, corruption, data, mangled,
+    # space and time, warped, lattice, biophilic cityscape.
+    for term in ("wire", "abstraction", "corrupted", "data", "mangled", "space and time", "warped", "lattice", "biophilic"):
+        assert term in joined, term
+    # Every entry is anchored as an outdoor eye-level landscape so the sampler
+    # never resolves a furnished interior, and material nouns that summon
+    # product shots (chrome, glass, foil) stay out.
+    assert all("eye level view inside a vast outdoor" in entry.prompt for entry in entries)
+    for term in ("chrome", "glass", "foil", "honeycomb", "coral", "neon", "glitch art", "screenshot"):
+        assert term not in joined, term
 
 
-def test_negative_prompt_lists_only_observed_failure_modes() -> None:
-    """Every clause must name something a 96-frame walk actually produced.
+def test_every_family_ships_its_own_sampler_regime() -> None:
+    """A family only changes the look if it changes the settings with it."""
+    entries = load_prompt_library(ROOT / "prompts.json")
+    families = {entry.family: entry.settings for entry in entries}
+    required = {"timestep_min", "timestep_max", "guide_strength", "guidance_scale", "instability"}
 
-    A long speculative negative (pattern, tidy, isometric, tilemap, grass,
-    furniture) was steering the sampler on every frame for failures that never
-    happened, and cost contrast doing it.
+    for name, settings in families.items():
+        assert required <= set(settings), name
+        assert set(settings) <= set(BACKEND_SETTING_KEYS), name
+        AppConfig(**settings).validate()
+        # The band Hong liked in round 5: below about 600 SD-Turbo redraws the
+        # proxy as blocks, above about 780 the memory lets go and drifts.
+        assert 600 <= settings["timestep_min"] < settings["timestep_max"] <= 780, name
+        assert 0.6 <= settings["guide_strength"] <= 0.8, name
+
+
+def test_negative_prompt_names_the_concrete_attractors() -> None:
+    """Gamepads, desks, interiors and furniture are the residues Hong ruled out.
+
+    People are deliberately absent: an occasional human residue is welcome.
     """
     negative = AppConfig.load(ROOT / "config.json").negative_prompt.lower()
-    for term in (
-        "text",
-        "lettering",
-        "logo",
-        "ui",
-        "hud",
-        "game controller",
-        "gamepad",
-        "circuit board",
-        "interior",
-        "room",
-        "person",
-        "joystick",
-        "cars",
-        "road markings",
-        "street lights",
-    ):
-        assert term in negative
-    for term in (
-        "pattern",
-        "tidy",
-        "isometric",
-        "tilemap",
-        "grass",
-        "lawn",
-        "furniture",
-        "houseplant",
-    ):
-        assert term not in negative
+    for term in ("gamepad", "game controller", "desk", "interior", "room", "furniture", "bed", "text", "ui"):
+        assert term in negative, term
+    for term in ("person", "figure"):
+        assert term not in negative, term
 
 
 def test_shipped_prompts_fit_the_clip_context() -> None:
     """CLIP truncates at 77 tokens and drops the tail of a longer prompt silently."""
     config = AppConfig.load(ROOT / "config.json")
-    texts = [entry["prompt"] for entry in load_prompt_library(ROOT / "prompts.json")]
+    texts = [entry.prompt for entry in load_prompt_library(ROOT / "prompts.json")]
     texts += [config.prompt, config.default_prompt, config.negative_prompt]
     # The world's hue words are appended at runtime, so the budget has to hold
     # for the longest suffix compose_prompt can produce.

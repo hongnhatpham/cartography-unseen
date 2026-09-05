@@ -56,7 +56,8 @@ Mouse            Look around
 Shift            Run while held
 Escape           Exit
 
-Space            New world, new spawn viewpoint and a new prompt
+Space            New world: landscape seed, spawn viewpoint, style family
+                 (with its own sampler settings), prompt and diffusion seed
 Shift + R        Choose a new diffusion seed
 P                Edit the prompt
 Enter            Apply a prompt while editing
@@ -72,7 +73,9 @@ F6               Return directly to generated AI view
 F7               Toggle the current prompt at the bottom at 30% opacity
 F8               Toggle feedback reprojection: the previous frame, aligned
                  to the camera, becomes the walk memory (slower, stickier)
-F9               Cycle prompt auto-advance: off, 20, 40, 80, 160 s
+F9               Cycle prompt auto-advance: off, 12, 24, 48, 96 s. Advancing
+                 usually stays inside the current family and changes family
+                 about one time in three, and rotates the world's hue pair
 F12              Toggle autowalk. With no input for a minute the walker
                  strolls on its own; any key or mouse movement takes over
 F10              Cycle generation resolution/aspect modes
@@ -128,14 +131,33 @@ to a window matching the selected mode. The chosen mode is saved in config.json.
 
 PROMPTS
 -------
-prompts.json is editable in Notepad. Its top-level master_prefix is prepended to
-every library prompt, including randomized prompts and the startup prompt in
-config.json. It is set to "screenshot of a video game" so every prompt shares
-one visual language.
+prompts.json is editable in Notepad. It holds STYLE FAMILIES rather than a flat
+list of prompts. Each family has:
 
-Individual entries under prompts can be added, removed, or rewritten. Changes are
-read on the next Space press or automatic prompt change. The app avoids selecting
-the exact prompt already in use.
+  name       what the F1 overlay shows, e.g. "Warped Spacetime"
+  base       the tail shared by the family's variants
+  variants   four subjects; one library prompt is built per variant as
+             "<variant>, <base>"
+  settings   sampler overrides that apply while that family is selected
+             (timestep window, guide strength, CFG, depth guide, instability)
+
+master_prefix ("corrupted 3D render") is prepended to every prompt.
+
+The eight shipped families are Topology Unknown, Biophilic City, Mangled Data,
+Wire Field, Washed Strata, Warped Spacetime, Corrupted Bloom and Datamosh
+Ravines. They are abstract on purpose: wires, corruption, data, warped space
+and time, lattice, and the blocky biophilic cityscape of the original piece.
+Material nouns such as chrome or glass are kept out because they resolve into
+product shots and furnished rooms.
+
+Space always leaves the current family, so every reset changes the look
+completely rather than shuffling within one style. Automatic advance usually
+picks another variant of the same family.
+
+Families and variants can be added, removed or rewritten. Changes are read on the
+next Space press or automatic prompt change. A family's settings block may only
+name tunable sampler keys; anything else makes the library fail to load, and the
+app logs the reason and keeps the prompt it already has.
 
 
 WALKING THE LATENT SPACE
@@ -159,7 +181,9 @@ Four keys control how unstable the picture is. All of them are live and saved.
                             flickering. Off means unrelated noise every frame.
 
 prompt_walk_seconds (M) is how long the picture takes to morph from the current
-prompt to a new one; F9 sets how often a new library prompt is chosen. Set either
+prompt to a new one; F9 sets how often a new library prompt is chosen. A style
+family's own settings are applied underneath, so a Space press changes the
+sampler regime as well as the words. Set either
 to 0 to turn it off. F7 provides a subtle prompt caption without the full F1
 diagnostics.
 

@@ -1,61 +1,93 @@
 {
   "master_prefix": "corrupted 3D render",
-  "prompts": [
+  "families": [
     {
       "name": "Topology Unknown",
-      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, topology unknown, shattered strata melting and regrowing, floating fragments, hard black shadows, high contrast, foggy, haunted"
+      "base": "eye level view inside a vast outdoor voxel landscape, hard black shadows, high contrast, foggy, haunted",
+      "settings": {"timestep_min": 640, "timestep_max": 720, "guide_strength": 0.7, "guidance_scale": 2.0, "depth_guide": 0.5, "instability": 0.7},
+      "variants": [
+        "corrupted, topology unknown, shattered strata melting and regrowing, floating fragments",
+        "corrupted, warped space and time, terraces folding through themselves, fragments drifting loose",
+        "corrupted terrain data, collapsing slabs, overhanging cliffs, mangled geometry",
+        "corrupted, unstable voxels tearing apart, chunks flying loose, deep perspective"
+      ]
     },
     {
-      "name": "Broken LOD",
-      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, broken LOD, untextured geometry popping through, z-fighting slabs, towering slabs overhead, washed out white ground, fog between the blocks, haunted"
+      "name": "Biophilic City",
+      "base": "eye level view inside a vast outdoor blocky biophilic cityscape, neural network highway, foggy, haunted, hard black shadows, high contrast",
+      "settings": {"timestep_min": 640, "timestep_max": 720, "guide_strength": 0.7, "guidance_scale": 2.0, "depth_guide": 0.5, "instability": 0.7},
+      "variants": [
+        "corrupted, overgrown datablocks and collapsed slab terraces, blocky biophilia growth",
+        "corrupted, ridges of small saturated cubes reading as vegetation, blocky biophilia",
+        "corrupted, a neural network highway dissolved into shattered floating slabs, no roads left",
+        "corrupted, blocky biophilia clumped on ledges, slabs intersecting and flickering"
+      ]
     },
     {
-      "name": "Shard Field",
-      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, tilted shards jutting from two-tone ground, floating fragments, blocky biophilia growth, deep perspective, deep shadow, high contrast"
+      "name": "Mangled Data",
+      "base": "eye level view inside a vast outdoor voxel landscape, corrupted data, deep shadow, high contrast, foggy, haunted",
+      "settings": {"timestep_min": 660, "timestep_max": 740, "guide_strength": 0.68, "guidance_scale": 2.0, "depth_guide": 0.55, "instability": 0.7},
+      "variants": [
+        "mangled data lattice, datamoshed ground tearing into long stretched smears, warped through space and time",
+        "broken level of detail, untextured geometry popping through, z-fighting slabs, time smeared into fog",
+        "clipping geometry, surfaces flickering inside out, abstraction bleeding through the blocks",
+        "corrupted terrain melting through itself, edges smearing into fog, mangled space"
+      ]
     },
     {
-      "name": "Corrupted Terrain Data",
-      "prompt": "corrupted terrain data, eye level view inside a vast outdoor voxel landscape, collapsing terraces of flat slabs, overhanging cliffs, hard black shadows, bold two-tone palette, haunted, topology unknown"
+      "name": "Wire Field",
+      "base": "eye level view inside a vast outdoor voxel landscape, hard black shadows, high contrast, foggy, haunted",
+      "settings": {"timestep_min": 640, "timestep_max": 740, "guide_strength": 0.68, "guidance_scale": 2.0, "depth_guide": 0.55, "instability": 0.7},
+      "variants": [
+        "corrupted, mangled wires strung between the blocks, taut cables warped through space",
+        "corrupted, a lattice of thin wires dissolving into abstraction over the slabs",
+        "corrupted, sagging cable nets layered between monoliths, moire interference",
+        "corrupted, wires and lattice tangled through a blocky biophilic cityscape"
+      ]
+    },
+    {
+      "name": "Washed Strata",
+      "base": "eye level view inside a vast outdoor voxel landscape, thick fog, pale grey and white, deep shadow, haunted",
+      "settings": {"timestep_min": 620, "timestep_max": 700, "guide_strength": 0.72, "guidance_scale": 2.0, "depth_guide": 0.5, "instability": 0.6},
+      "variants": [
+        "corrupted, eroded layered strata as flat untextured blocks, melting and regrowing",
+        "corrupted, a wide washed out canyon of stacked pale slabs, overhangs and cliffs, deep vanishing lines",
+        "corrupted, tall thin monoliths jutting from broken terraces, overexposed white sky",
+        "corrupted, washed out terraces dissolving into fog, warped space"
+      ]
+    },
+    {
+      "name": "Warped Spacetime",
+      "base": "eye level view inside a vast outdoor voxel landscape, abstraction, hard black shadows, high contrast, foggy, haunted",
+      "settings": {"timestep_min": 660, "timestep_max": 760, "guide_strength": 0.66, "guidance_scale": 2.0, "depth_guide": 0.55, "instability": 0.75},
+      "variants": [
+        "corrupted, space and time folding, the landscape warped around a vanishing point",
+        "corrupted, slabs stretched and bent through warped space, time smeared into streaks",
+        "corrupted, a blocky biophilic cityscape twisted through a fold in spacetime",
+        "corrupted, geometry unravelling into abstract lattice, data and fog"
+      ]
+    },
+    {
+      "name": "Corrupted Bloom",
+      "base": "eye level view inside a vast outdoor blocky biophilic cityscape, bleeding corrupted colour, foggy, haunted, hard black shadows",
+      "settings": {"timestep_min": 640, "timestep_max": 740, "guide_strength": 0.68, "guidance_scale": 2.0, "depth_guide": 0.55, "instability": 0.7},
+      "variants": [
+        "corrupted, biophilia blooming over the slabs, growth reading as data",
+        "corrupted, saturated growth clumped on ledges and terraces, colour bleeding into fog",
+        "corrupted, a neural network garden of blocks and tangled wires",
+        "corrupted, overgrown datablocks, mangled growth, warped space"
+      ]
     },
     {
       "name": "Datamosh Ravines",
-      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, datamoshed ravine network carved through blocky ground, hard vanishing lines, walls of blocks on every side, deep shadow, haunted"
-    },
-    {
-      "name": "Clipping Geometry",
-      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, clipping geometry, slabs intersecting and flickering, blocky biophilia clumped on ledges, towering slabs overhead, high contrast, hard shadows"
-    },
-    {
-      "name": "Floating Fragments",
-      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, floating blocks suspended over an eroded plateau, tilted frame, deep perspective, thin fog bank, hard black shadows, haunted"
-    },
-    {
-      "name": "Voxel Ridge",
-      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, ridges of small saturated cubes reading as vegetation, blocky biophilia, eye level view, deep shadow, high contrast, foggy"
-    },
-    {
-      "name": "Monolith Field",
-      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, tall thin monoliths jutting from broken terraces, hard black shadows, fog between the blocks, overexposed white sky, haunted"
-    },
-    {
-      "name": "Melting Strata",
-      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, eroded layered strata as flat untextured blocks, melting and regrowing, thick fog, pale grey and white, deep shadow"
-    },
-    {
-      "name": "Overgrown Datablocks",
-      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, overgrown datablocks and collapsed slab terraces, blocky biophilia, bold two-tone palette, hard shadows, haunted, topology unknown"
-    },
-    {
-      "name": "Washed Out Canyon",
-      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, wide washed out canyon of stacked pale slabs, overhangs and cliffs, towering slabs overhead, deep vanishing lines, hard black shadows"
-    },
-    {
-      "name": "Neural Network Highway",
-      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, neural network highway dissolved into shattered floating slabs, no roads left, deep shadow, high contrast, foggy, haunted"
-    },
-    {
-      "name": "Unstable Voxels",
-      "prompt": "corrupted, eye level view inside a vast outdoor voxel landscape, unstable voxels tearing apart, chunks flying loose, fog between the blocks, hard black shadows, bold two-tone palette, deep perspective"
+      "base": "eye level view inside a vast outdoor voxel landscape, deep shadow, high contrast, haunted, foggy",
+      "settings": {"timestep_min": 640, "timestep_max": 720, "guide_strength": 0.7, "guidance_scale": 2.0, "depth_guide": 0.5, "instability": 0.7},
+      "variants": [
+        "corrupted, datamoshed ravine network carved through blocky ground, hard vanishing lines, walls of blocks on every side",
+        "corrupted, a canyon of stacked slabs smeared by data corruption, walls warped through time",
+        "corrupted, ravine floor of mangled blocks, wires strung overhead",
+        "corrupted, fog between the blocks, terraces stepping down into a datamoshed channel"
+      ]
     }
   ]
 }

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from math import cos, pi, radians, sin
+from math import cos, pi, radians, sin, tan
 from pathlib import Path
 from time import perf_counter
 import textwrap
@@ -29,6 +29,7 @@ from app.renderer.world import (
     generate_chunk,
     plan_chunk_cache,
     sky_color,
+    zenith_color,
     spawn_pose,
     world_label,
     world_to_chunk,
@@ -112,6 +113,10 @@ class ProxyRenderer:
             vertex_shader=(shader_root / "screen.vert").read_text(encoding="utf-8"),
             fragment_shader=(shader_root / "screen.frag").read_text(encoding="utf-8"),
         )
+        self.sky_program = self.ctx.program(
+            vertex_shader=(shader_root / "sky.vert").read_text(encoding="utf-8"),
+            fragment_shader=(shader_root / "sky.frag").read_text(encoding="utf-8"),
+        )
         self.reproject_program = self.ctx.program(
             vertex_shader=(shader_root / "reproject.vert").read_text(encoding="utf-8"),
             fragment_shader=(shader_root / "reproject.frag").read_text(encoding="utf-8"),
@@ -158,6 +163,10 @@ class ProxyRenderer:
         )
         self.reproject_vao = self.ctx.vertex_array(
             self.reproject_program,
+            [(self.quad_buffer, "2f 2f", "in_position", "in_uv")],
+        )
+        self.sky_vao = self.ctx.vertex_array(
+            self.sky_program,
             [(self.quad_buffer, "2f 2f", "in_position", "in_uv")],
         )
         render_size = (self.render_width, self.render_height)
@@ -474,6 +483,7 @@ class ProxyRenderer:
         # and back faces are what makes that readable instead of empty.
         self.ctx.disable(moderngl.CULL_FACE)
         self.proxy_fbo.clear(*self.sky_color, 1.0, depth=1.0)
+        self._draw_sky(camera)
         self.proxy_program["view"].write(snapshot.view_matrix.T.astype("f4").tobytes())
         self.proxy_program["projection"].write(snapshot.projection_matrix.T.astype("f4").tobytes())
         self.proxy_program["camera_position"].value = tuple(float(value) for value in camera.position)
@@ -482,6 +492,22 @@ class ProxyRenderer:
             if count:
                 self.mesh_vaos[mesh].render(instances=count)
         return snapshot
+
+    def _draw_sky(self, camera: Camera) -> None:
+        """Graded sky behind everything: fog tint at the horizon, darker zenith.
+
+        Drawn at the far depth so geometry always wins; the horizon line
+        follows the camera pitch so the gradient stays anchored to the world.
+        """
+        self.ctx.disable(moderngl.DEPTH_TEST)
+        # Screen-space v of the horizon for this pitch (0 bottom, 1 top).
+        half_fov = radians(camera.fov) * 0.5
+        horizon_v = 0.5 - tan(radians(camera.pitch)) / (2.0 * tan(half_fov))
+        self.sky_program["fog_color"].value = self.sky_color
+        self.sky_program["zenith_color"].value = zenith_color(self.world_seed)
+        self.sky_program["horizon_v"].value = float(min(max(horizon_v, -0.5), 1.5))
+        self.sky_vao.render()
+        self.ctx.enable(moderngl.DEPTH_TEST)
 
     def capture_conditioning(self, snapshot, timestamp: float) -> ConditioningFrame:
         rgb = np.frombuffer(self.color_texture.read(alignment=1), dtype=np.uint8)

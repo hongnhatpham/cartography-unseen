@@ -43,9 +43,9 @@ BACKEND_SETTING_KEYS = (
 class AppConfig:
     """Runtime settings for the app, the renderer and the latent-walk backend."""
 
-    prompt: str = "corrupted 3D render, corrupted, eye level view inside a vast outdoor voxel landscape, topology unknown, shattered strata melting and regrowing, floating fragments, hard black shadows, high contrast, foggy, haunted"
-    default_prompt: str = "corrupted 3D render, corrupted, eye level view inside a vast outdoor voxel landscape, topology unknown, shattered strata melting and regrowing, floating fragments, hard black shadows, high contrast, foggy, haunted"
-    negative_prompt: str = "(worst quality, low quality: 1.4), text, lettering, logo, ui, hud, game controller, gamepad, joystick, toy, product photo, desk, table, monitor, keyboard, circuit board, interior, room, person, figure, cars, road markings, street lights"
+    prompt: str = "corrupted 3D render, corrupted, topology unknown, shattered strata melting and regrowing, floating fragments, eye level view inside a vast outdoor voxel landscape, hard black shadows, high contrast, foggy, haunted"
+    default_prompt: str = "corrupted 3D render, corrupted, topology unknown, shattered strata melting and regrowing, floating fragments, eye level view inside a vast outdoor voxel landscape, hard black shadows, high contrast, foggy, haunted"
+    negative_prompt: str = "(worst quality, low quality: 1.4), text, lettering, logo, ui, hud, game controller, gamepad, joystick, toy, product photo, desk, table, monitor, keyboard, interior, room, furniture, bedroom, bed, showroom, window, houseplant"
     backend: str = "latent_walk"
     diffusion_resolution: str = "512x512"
     # Diffusion
@@ -68,11 +68,15 @@ class AppConfig:
     memory_leash: float = 1.1
     # How much weaker the proxy pulls at the far plane than up close, 0..1.
     depth_guide: float = 0.5
+    # Short keyframes plus a lively jitter. A slow noise walk let SD-Turbo lock
+    # onto whatever object it first read in a noise blob (reliably a gamepad)
+    # and hold it for the whole keyframe; refreshing the field every couple of
+    # seconds breaks that lock and is the main source of within-walk variety.
     noise_walk_seconds: float = 5.0
-    noise_jitter: float = 0.06
+    noise_jitter: float = 0.12
     prompt_walk_seconds: float = 6.0
     # Seconds between automatic library prompt changes. 0 disables auto-advance.
-    prompt_auto_advance_seconds: float = 40.0
+    prompt_auto_advance_seconds: float = 24.0
     feedback_reprojection: bool = False
     seed: int = 12345
     random_seed_on_launch: bool = False

@@ -24,17 +24,30 @@ from app.diffusion.base import DiffusionBackend
 from app.types import ConditioningFrame
 from app.utils.timing import ExponentialAverage
 
-# Wall-clock periods of the two instability oscillators. Deliberately unequal so
-# the timestep and the guide strength never breathe in lockstep.
+# Wall-clock periods of the instability oscillators. All three are mutually
+# prime-ish so the timestep and the guide strength never breathe in lockstep,
+# and the slow timestep tone is what carries a long loop through several looks
+# instead of shuttling it back and forth on one 13 s cycle.
 _BREATH_SECONDS = 13.0
-_WOBBLE_SECONDS = 7.0
+_SLOW_BREATH_SECONDS = 47.0
+_WOBBLE_SECONDS = 29.0
 # Peak one-sided guide-strength excursion at instability 1.0.
-_GUIDE_WOBBLE = 0.2
+_GUIDE_WOBBLE = 0.28
+# Extra breathing amplitude at instability 1.0, as a fraction of the half-range.
+# The result is still clamped into [timestep_min, timestep_max]; the overshoot
+# only makes the walk dwell at the hot and cool ends rather than sweep past them.
+_BREATH_REACH = 0.6
 # AR(1) coefficient of the jitter field, so the jitter itself drifts instead of
 # flickering independently every frame.
 _JITTER_PERSISTENCE = 0.9
 # Consistency-model data scale used by the LCM scheduler boundary conditions.
 _SIGMA_DATA = 0.5
+# Frames discarded after the memory latent is dropped (a Space reset, a reseed,
+# a prompt hard cut). Without them the first published frame is conditioned on
+# the raw proxy alone, and a large flat pale plane in it is completed as a game
+# controller on a desk however the negative prompt is worded. These passes run
+# at timestep_max so the memory the walk resumes from is hallucination.
+RESET_WARMUP_FRAMES = 2
 
 
 def classifier_free_guidance_enabled(guidance_scale: float) -> bool:
@@ -275,12 +288,22 @@ def lcm_scalings(timestep: float, timestep_scaling: float = 10.0) -> tuple[float
 def breathing_timestep(
     elapsed: float, minimum: int, maximum: int, instability: float
 ) -> int:
-    """Sine-breathe the sampling timestep across the configured range."""
+    """Breathe the sampling timestep across the configured range.
+
+    Two tones, a fast one and a slow one, so the walk wanders between the hot
+    and cool ends of the range over a minute rather than oscillating on a fixed
+    13 s beat. Instability scales both the amplitude and how long the walk
+    dwells at each end; the value never leaves ``[minimum, maximum]``.
+    """
     low, high = (minimum, maximum) if minimum <= maximum else (maximum, minimum)
     middle = (low + high) * 0.5
-    amplitude = (high - low) * 0.5 * clamp01(instability)
-    phase = math.sin(2.0 * math.pi * elapsed / _BREATH_SECONDS)
-    return int(round(min(max(middle + amplitude * phase, 1.0), 999.0)))
+    reach = clamp01(instability)
+    amplitude = (high - low) * 0.5 * reach * (1.0 + _BREATH_REACH * reach)
+    phase = 0.65 * math.sin(2.0 * math.pi * elapsed / _BREATH_SECONDS) + 0.35 * math.sin(
+        2.0 * math.pi * elapsed / _SLOW_BREATH_SECONDS
+    )
+    value = min(max(middle + amplitude * phase, float(low)), float(high))
+    return int(round(min(max(value, 1.0), 999.0)))
 
 
 def wobbled_guide_strength(
@@ -293,6 +316,10 @@ def wobbled_guide_strength(
     part of every cycle below the configured anchor, and those troughs were
     where the walk let go of the proxy and drifted into interiors and glyphs.
     Instability still buys chaos through the breathing timestep.
+
+    The period is long (29 s) on purpose: each anchoring level has to hold long
+    enough for a look to settle, so a several-hundred-frame loop drifts through
+    distinct states instead of shimmering between them.
     """
     phase = 0.5 + 0.5 * math.sin(2.0 * math.pi * elapsed / _WOBBLE_SECONDS)
     return clamp01(guide_strength + _GUIDE_WOBBLE * clamp01(instability) * phase)
@@ -521,6 +548,7 @@ class LatentWalkBackend(DiffusionBackend):
         self.prompt = ""
         self.negative_prompt = ""
         self.x0_prev: Any = None
+        self._warm_frames = RESET_WARMUP_FRAMES
         self._noise_generator: Any = None
         # Wall-clock source for both walks and the instability oscillators, so
         # their speed is independent of diffusion FPS. Tests swap in a fake.
@@ -676,6 +704,7 @@ class LatentWalkBackend(DiffusionBackend):
             # A hard cut restarts the look; stale memory would only carry the
             # previous prompt's structure into the new one.
             self.x0_prev = None
+            self._warm_frames = RESET_WARMUP_FRAMES
 
     def set_clock(self, clock: Callable[[], float]) -> None:
         """Replace the wall clock driving both walks and the oscillators.
@@ -690,6 +719,7 @@ class LatentWalkBackend(DiffusionBackend):
         self.width = int(width)
         self.height = int(height if height is not None else width)
         self.x0_prev = None
+        self._warm_frames = RESET_WARMUP_FRAMES
         self.noise_walk.reset()
 
     def reseed(self, seed: int) -> None:
@@ -699,6 +729,7 @@ class LatentWalkBackend(DiffusionBackend):
                 self.seed
             )
         self.x0_prev = None
+        self._warm_frames = RESET_WARMUP_FRAMES
         self.noise_walk.reset()
 
     # -- hot path -----------------------------------------------------------
@@ -713,6 +744,7 @@ class LatentWalkBackend(DiffusionBackend):
         for _ in range(max(0, self.warmup_passes)):
             self._render(rgb)
         self.x0_prev = None
+        self._warm_frames = RESET_WARMUP_FRAMES
         self.noise_walk.reset()
         self.frames = 0
         self.inference_average = ExponentialAverage(alpha=0.2)
@@ -767,6 +799,8 @@ class LatentWalkBackend(DiffusionBackend):
             )
             positive, negative = self.prompt_walk.advance()
             guide = self._encode_image(rgb)
+            if aligned is None and self.x0_prev is None and self._warm_frames > 0:
+                self._seed_memory(guide, positive, negative)
             memory = self._encode_image(aligned) if aligned is not None else self.x0_prev
             if memory is None or memory.shape != guide.shape:
                 base = guide
@@ -789,6 +823,21 @@ class LatentWalkBackend(DiffusionBackend):
             self.first_frame_ms = inference_ms
         self.frames += 1
         return output
+
+    def _seed_memory(self, guide: Any, positive: Any, negative: Any) -> None:
+        """Fill the empty memory latent with hallucination, not with the proxy.
+
+        Runs ``RESET_WARMUP_FRAMES`` discarded passes at ``timestep_max`` from
+        the guide, so the first frame the walk publishes after a reset is
+        conditioned on an already-hallucinated memory. See RESET_WARMUP_FRAMES.
+        """
+        base = guide
+        for _ in range(self._warm_frames):
+            base = self._denoise(
+                base, self.noise_walk.value(), self.timestep_max, positive, negative
+            )
+        self.x0_prev = base
+        self._warm_frames = 0
 
     def _denoise(
         self, base: Any, noise: Any, timestep: int, positive: Any, negative: Any

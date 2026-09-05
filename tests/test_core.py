@@ -10,9 +10,12 @@ import pytest
 from app.config import RESOLUTION_MODES, AppConfig
 from app.diffusion.latent_walk import classifier_free_guidance_enabled
 from app.main import (
+    PromptEntry,
+    advance_prompt,
     apply_master_prefix,
-    choose_different_prompt,
+    choose_family_prompt,
     compose_prompt,
+    entry_for_prompt,
     hue_words,
     load_prompt_library,
     next_level,
@@ -56,7 +59,7 @@ def test_latent_walk_keys_are_validated_and_forwarded() -> None:
         "memory_leash": 1.1,
         "depth_guide": 0.5,
         "noise_walk_seconds": 5.0,
-        "noise_jitter": 0.06,
+        "noise_jitter": 0.12,
         "prompt_walk_seconds": 6.0,
         "feedback_reprojection": False,
     }
@@ -237,24 +240,96 @@ def test_persist_runtime_setting(tmp_path: Path) -> None:
     assert updated == {"reprojection_strength": 0.3, "steps": 1}
 
 
-def test_prompt_library_is_editable_and_avoids_current_prompt(tmp_path: Path) -> None:
+def _library(tmp_path: Path) -> Path:
     path = tmp_path / "prompts.json"
     path.write_text(
         json.dumps(
             {
-                "prompts": [
-                    {"name": "First", "prompt": "first prompt"},
-                    {"name": "Second", "prompt": "second prompt"},
+                "master_prefix": "studio",
+                "families": [
+                    {
+                        "name": "Alpha",
+                        "base": "matte stone",
+                        "variants": ["a ridge", "a cliff"],
+                        "settings": {"timestep_min": 500, "timestep_max": 600},
+                    },
+                    {
+                        "name": "Beta",
+                        "base": "wet chrome",
+                        "variants": ["a tube", "a coil"],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_families_expand_into_variants_carrying_their_settings(tmp_path: Path) -> None:
+    entries = load_prompt_library(_library(tmp_path))
+
+    assert [entry.family for entry in entries] == ["Alpha", "Alpha", "Beta", "Beta"]
+    assert entries[0].prompt == "studio, a ridge, matte stone"
+    assert entries[0].settings == {"timestep_min": 500, "timestep_max": 600}
+    # A family without an override must not inherit the previous family's.
+    assert entries[2].settings == {}
+
+
+def test_a_legacy_flat_prompt_list_still_loads(tmp_path: Path) -> None:
+    path = tmp_path / "prompts.json"
+    path.write_text(
+        json.dumps({"prompts": [{"name": "First", "prompt": "first prompt"}]}), encoding="utf-8"
+    )
+    entries = load_prompt_library(path)
+
+    assert entries == [PromptEntry(family="First", prompt="first prompt", settings={})]
+
+
+def test_unknown_family_settings_are_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "prompts.json"
+    path.write_text(
+        json.dumps(
+            {
+                "families": [
+                    {"name": "A", "base": "b", "variants": ["v"], "settings": {"nope": 1}}
                 ]
             }
         ),
         encoding="utf-8",
     )
-    entries = load_prompt_library(path)
-    assert choose_different_prompt(entries, "first prompt") == {
-        "name": "Second",
-        "prompt": "second prompt",
-    }
+    with pytest.raises(RuntimeError, match="nope"):
+        load_prompt_library(path)
+
+
+def test_space_leaves_the_current_family_and_auto_advance_usually_stays(tmp_path: Path) -> None:
+    """Space has to change the whole look, so it may never return a sibling."""
+    entries = load_prompt_library(_library(tmp_path))
+    alpha = entries[0]
+
+    assert all(
+        choose_family_prompt(entries, "Alpha").family == "Beta" for _ in range(20)
+    )
+    # A list of recent families is excluded as a whole; falling back to the
+    # full library beats returning nothing when everything is recent.
+    assert all(
+        choose_family_prompt(entries, ["Beta"]).family == "Alpha" for _ in range(20)
+    )
+    assert choose_family_prompt(entries, ["Alpha", "Beta"]) in entries
+    families = [advance_prompt(entries, alpha, jump_in_one_of=4).family for _ in range(200)]
+    assert "Alpha" in families and "Beta" in families
+    assert families.count("Beta") < families.count("Alpha")
+    # jump_in_one_of=1 is the always-jump case used to prove the branch exists.
+    assert advance_prompt(entries, alpha, jump_in_one_of=1).family == "Beta"
+
+
+def test_entry_for_prompt_falls_back_to_a_settings_free_custom_entry(tmp_path: Path) -> None:
+    entries = load_prompt_library(_library(tmp_path))
+
+    assert entry_for_prompt(entries, entries[1].prompt) is entries[1]
+    assert entry_for_prompt(entries, "hand typed") == PromptEntry(
+        family="Custom", prompt="hand typed", settings={}
+    )
 
 
 def test_master_prefix_is_applied_once() -> None:
@@ -271,14 +346,24 @@ def test_hue_words_come_from_the_world_label() -> None:
     assert hue_words("") == ""
 
 
+def test_hue_words_rotate_through_the_world_accents() -> None:
+    """A long walk has to change colour, and each world carries three accents."""
+    label = "shards+voxels / violet-lime-cyan"
+    pairs = [hue_words(label, offset) for offset in range(4)]
+    assert pairs == ["violet and lime", "lime and cyan", "cyan and violet", "violet and lime"]
+    assert hue_words("dunes / amber", 3) == "amber"
+
+
 def test_compose_prompt_appends_the_world_hue_once() -> None:
-    """Without this the proxy's chroma is discarded and every seed renders icy blue."""
-    prompt = "corrupted 3D render, aerial view of a voxel landscape"
-    composed = compose_prompt(prompt, "shards+voxels / violet-lime-cyan")
-    assert composed == f"{prompt}, violet and lime"
+    """Hues trail the prompt so they tint rather than steer; never stacked."""
+    composed = compose_prompt(
+        "a voxel landscape, corrupted 3D render", "shards+voxels / violet-lime-cyan"
+    )
+    assert composed == "a voxel landscape, corrupted 3D render, violet and lime"
     # Idempotent, so auto-advance and Space cannot stack hues onto one prompt.
     assert compose_prompt(composed, "shards+voxels / violet-lime-cyan") == composed
-    assert compose_prompt(prompt, "shards+voxels") == prompt
+    assert compose_prompt("a voxel landscape", "shards+voxels") == "a voxel landscape"
+    assert compose_prompt("a voxel landscape", "shards / amber") == "a voxel landscape, amber"
 
 
 def test_world_instance_packing_preserves_transform_columns_and_color() -> None:

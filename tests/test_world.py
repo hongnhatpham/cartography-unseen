@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from colorsys import rgb_to_hsv
+from math import hypot
 from random import Random
 
 import pytest
 
 from app.renderer.world import (
     _BIOME_GENERATOR,
+    _blocks_walker,
+    MIN_FORM_GAP,
+    WALKER_RADIUS,
+    walkable_components,
     BIOME_NAMES,
     BIOME_CELL,
     CLIMB_RATE,
@@ -211,6 +216,76 @@ def test_the_accent_forms_contiguous_regions_not_scattered_cubes() -> None:
         coverage = sum(here for here, _ in samples) / len(samples)
         assert agreement > 0.85
         assert 0.03 < coverage < 0.55
+
+
+def test_every_seed_is_walkable_end_to_end_without_backtracking() -> None:
+    """A walker must reach nearly all of a seed's ground and meet few pockets.
+
+    The probe floods an 8-unit grid over a 640-unit window around the spawn,
+    treating risers and standing forms exactly as the walker does. Before the
+    corridor mesh and the form spacing this measured 0.00-0.58 reachable with
+    5.6-9.8 per cent dead ends.
+    """
+
+    for seed in SEEDS:
+        survey = walkable_components(seed)
+        assert survey.open_cells
+        assert survey.reachable_fraction >= 0.9, (seed, survey.reachable_fraction)
+        assert survey.dead_end_fraction <= 0.03, (seed, survey.dead_end_fraction)
+
+
+def test_standing_forms_leave_a_gap_wide_enough_to_walk_between() -> None:
+    """Forms that span the eye line keep MIN_FORM_GAP clear of one another."""
+
+    clearance = MIN_FORM_GAP + 2.0 * WALKER_RADIUS
+    for seed in SEEDS[:3]:
+        for coord in ((0, 0), (-1, 2)):
+            forms = [
+                cube
+                for cube in generate_chunk(coord, seed).objects
+                if _blocks_walker(cube, seed)
+            ]
+            for index, first in enumerate(forms):
+                for second in forms[index + 1 :]:
+                    gap = hypot(
+                        first.position[0] - second.position[0],
+                        first.position[2] - second.position[2],
+                    ) - hypot(first.half_extents[0], first.half_extents[2]) - hypot(
+                        second.half_extents[0], second.half_extents[2]
+                    )
+                    assert gap >= clearance - 1e-6, (seed, coord, gap)
+
+
+def test_pass_corridors_form_one_connected_network() -> None:
+    """Corridors are ridge lines, so they branch and meet instead of ringing."""
+
+    for seed in SEEDS:
+        cell = 16.0
+        span = 20
+        inside = {
+            (ix, iz)
+            for iz in range(-span, span + 1)
+            for ix in range(-span, span + 1)
+            if pass_weight(ix * cell, iz * cell, seed) > 0.85
+        }
+        assert inside
+        seen: set[tuple[int, int]] = set()
+        largest = 0
+        for start in inside:
+            if start in seen:
+                continue
+            stack, size = [start], 0
+            seen.add(start)
+            while stack:
+                current = stack.pop()
+                size += 1
+                for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1), (1, -1), (-1, 1)):
+                    other = (current[0] + dx, current[1] + dz)
+                    if other in inside and other not in seen:
+                        seen.add(other)
+                        stack.append(other)
+            largest = max(largest, size)
+        assert largest / len(inside) > 0.85, (seed, largest, len(inside))
 
 
 def test_ravine_floors_are_darker_than_the_plateau() -> None:

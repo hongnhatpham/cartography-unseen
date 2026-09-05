@@ -6,6 +6,8 @@ import logging
 import secrets
 import sys
 import textwrap
+from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter, strftime
 
@@ -26,7 +28,7 @@ SMOKE_AI_TIMEOUT_S = 150.0
 CFG_LEVELS = (1.0, 1.25, 1.5, 2.0, 3.0)
 NOISE_WALK_LEVELS = (0.0, 2.5, 5.0, 10.0, 20.0, 40.0)
 PROMPT_WALK_LEVELS = (0.0, 3.0, 6.0, 12.0, 25.0, 50.0)
-AUTO_ADVANCE_LEVELS = (0.0, 20.0, 40.0, 80.0, 160.0)
+AUTO_ADVANCE_LEVELS = (0.0, 12.0, 24.0, 48.0, 96.0)
 
 
 def project_root() -> Path:
@@ -85,28 +87,89 @@ def persist_prompt(config_path: Path, prompt: str) -> float:
     return persist_config_value(config_path, "prompt", prompt)
 
 
-def load_prompt_library(path: Path) -> list[dict[str, str]]:
-    """Read prompts.json into name/prompt entries with the master prefix applied."""
+@dataclass(frozen=True, slots=True)
+class PromptEntry:
+    """One variant of a style family, carrying that family's live settings.
+
+    ``settings`` holds the family's overrides for the tunable backend keys
+    (timestep range, guide strength, CFG, depth guide, instability), so a
+    "Chrome Lattice" family can run hot while "Corrupted Render" runs cool.
+    """
+
+    family: str
+    prompt: str
+    settings: dict[str, float | int]
+
+
+def _family_entries(
+    family: dict[str, object], index: int, master_prefix: str
+) -> list[PromptEntry]:
+    """Expand one family object into one entry per subject variant."""
+    name = str(family.get("name", "")).strip()
+    base = str(family.get("base", "")).strip()
+    variants = family.get("variants")
+    if not name or not base:
+        raise RuntimeError(f"Prompt family {index} requires non-empty name and base")
+    if not isinstance(variants, list) or not variants:
+        raise RuntimeError(f"Prompt family {name!r} requires a non-empty 'variants' list")
+    raw_settings = family.get("settings", {})
+    if not isinstance(raw_settings, dict):
+        raise RuntimeError(f"Prompt family {name!r} settings must be an object")
+    unknown = sorted(set(raw_settings) - set(BACKEND_SETTING_KEYS))
+    if unknown:
+        raise RuntimeError(f"Prompt family {name!r} has unknown settings: {', '.join(unknown)}")
+    settings = {key: value for key, value in raw_settings.items()}
+    entries = []
+    for variant in variants:
+        subject = str(variant).strip()
+        if not subject:
+            raise RuntimeError(f"Prompt family {name!r} has an empty variant")
+        prompt = apply_master_prefix(master_prefix, f"{subject}, {base}")
+        entries.append(PromptEntry(family=name, prompt=prompt, settings=dict(settings)))
+    return entries
+
+
+def load_prompt_library(path: Path) -> list[PromptEntry]:
+    """Read prompts.json into one entry per family variant.
+
+    A "families" list is the current format. A legacy flat "prompts" list of
+    name/prompt objects still loads, with each entry its own family and no
+    settings override.
+    """
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise RuntimeError(f"Prompt library not found: {path}") from exc
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Invalid prompt library JSON: {exc}") from exc
-    entries = raw.get("prompts") if isinstance(raw, dict) else None
-    if not isinstance(entries, list) or not entries:
-        raise RuntimeError("prompts.json must contain a non-empty 'prompts' list")
+    if not isinstance(raw, dict):
+        raise RuntimeError("prompts.json must contain an object")
     master_prefix = str(raw.get("master_prefix", "")).strip()
-    cleaned: list[dict[str, str]] = []
-    for index, entry in enumerate(entries, start=1):
+    families = raw.get("families")
+    if isinstance(families, list) and families:
+        entries: list[PromptEntry] = []
+        for index, family in enumerate(families, start=1):
+            if not isinstance(family, dict):
+                raise RuntimeError(f"Prompt family {index} must be an object")
+            entries.extend(_family_entries(family, index, master_prefix))
+        return entries
+    flat = raw.get("prompts")
+    if not isinstance(flat, list) or not flat:
+        raise RuntimeError("prompts.json must contain a non-empty 'families' or 'prompts' list")
+    legacy: list[PromptEntry] = []
+    for index, entry in enumerate(flat, start=1):
         if not isinstance(entry, dict):
             raise RuntimeError(f"Prompt entry {index} must be an object")
         name = str(entry.get("name", "")).strip()
         prompt = str(entry.get("prompt", "")).strip()
         if not name or not prompt:
             raise RuntimeError(f"Prompt entry {index} requires non-empty name and prompt")
-        cleaned.append({"name": name, "prompt": apply_master_prefix(master_prefix, prompt)})
-    return cleaned
+        legacy.append(
+            PromptEntry(
+                family=name, prompt=apply_master_prefix(master_prefix, prompt), settings={}
+            )
+        )
+    return legacy
 
 
 def load_master_prefix(path: Path) -> str:
@@ -130,34 +193,85 @@ def apply_master_prefix(prefix: str, prompt: str) -> str:
     return f"{prefix}, {prompt}"
 
 
-def hue_words(world_label: str) -> str:
-    """The world's two leading hues as prompt vocabulary, e.g. "violet and lime".
+def world_hues(world_label: str) -> list[str]:
+    """The hue names in a "biomes / hue-hue-hue" label, in order."""
+    _, separator, palette = world_label.rpartition("/")
+    hues = [name.strip() for name in palette.split("-")] if separator else []
+    return [name for name in hues if name]
+
+
+def hue_words(world_label: str, offset: int = 0) -> str:
+    """A pair of the world's hues as prompt vocabulary, e.g. "violet and lime".
 
     ``ProxyRenderer.world_label`` reads "biomes / hue-hue-hue". The proxy's own
     chroma is largely discarded by the latent walk, so the palette only reaches
-    the screen if the prompt names it.
+    the screen if the prompt names it. ``offset`` rotates the pair through the
+    world's accents, which is how the hue drifts over a long walk instead of
+    locking to the first two names for the whole session.
     """
-    _, separator, palette = world_label.rpartition("/")
-    hues = [name.strip() for name in palette.split("-")] if separator else []
-    hues = [name for name in hues if name]
+    hues = world_hues(world_label)
     if not hues:
         return ""
-    return hues[0] if len(hues) == 1 else f"{hues[0]} and {hues[1]}"
+    if len(hues) == 1:
+        return hues[0]
+    start = offset % len(hues)
+    return f"{hues[start]} and {hues[(start + 1) % len(hues)]}"
 
 
-def compose_prompt(prompt: str, world_label: str) -> str:
-    """Library prompt plus the current world's hue words."""
-    words = hue_words(world_label)
+def compose_prompt(prompt: str, world_label: str, hue_offset: int = 0) -> str:
+    """The library prompt with the world's hue words appended.
+
+    Trailing hues tint without steering: the reference palette is a pale base
+    with one or two bursts, and a hue pair given more weight than that floods
+    the frame with saturated colour.
+    """
+    words = hue_words(world_label, hue_offset)
     if not words or words in prompt.casefold():
         return prompt
     return f"{prompt.rstrip().rstrip(',')}, {words}"
 
 
-def choose_different_prompt(
-    entries: list[dict[str, str]], current_prompt: str
-) -> dict[str, str]:
-    alternatives = [entry for entry in entries if entry["prompt"] != current_prompt]
+def choose_family_prompt(
+    entries: list[PromptEntry], recent_families: str | Iterable[str]
+) -> PromptEntry:
+    """A variant from a family the last few presses did not use — what Space picks.
+
+    Excluding only the current family still drew the same family three times in
+    eight presses, and a repeat inside one sitting is what reads as "the reset
+    did nothing".
+    """
+    if isinstance(recent_families, str):
+        recent_families = (recent_families,)
+    recent = set(recent_families)
+    alternatives = [entry for entry in entries if entry.family not in recent]
     return secrets.choice(alternatives or entries)
+
+
+# How many past presses the Space family draw avoids repeating.
+RECENT_FAMILY_MEMORY = 3
+
+
+def advance_prompt(
+    entries: list[PromptEntry], current: PromptEntry, jump_in_one_of: int = 3
+) -> PromptEntry:
+    """The next auto-advance step: another variant of the same family, or, one
+    time in ``jump_in_one_of``, a jump to a different family."""
+    siblings = [
+        entry
+        for entry in entries
+        if entry.family == current.family and entry.prompt != current.prompt
+    ]
+    if not siblings or secrets.randbelow(max(1, jump_in_one_of)) == 0:
+        return choose_family_prompt(entries, current.family)
+    return secrets.choice(siblings)
+
+
+def entry_for_prompt(entries: list[PromptEntry], prompt: str) -> PromptEntry:
+    """The library entry matching ``prompt``, or a settings-free custom entry."""
+    for entry in entries:
+        if entry.prompt == prompt:
+            return entry
+    return PromptEntry(family="Custom", prompt=prompt, settings={})
 
 
 def next_level(levels: tuple[float, ...], current: float) -> float:
@@ -227,6 +341,13 @@ def run() -> int:
         renderer.loading_screen("INITIALIZING", "Starting renderer and diffusion worker")
         camera = Camera.create_default()
         renderer.spawn_camera(camera)
+        try:
+            current_entry = entry_for_prompt(
+                load_prompt_library(prompt_library_path), config.prompt
+            )
+        except RuntimeError as exc:
+            logging.error("Prompt library ignored at startup: %s", exc)
+            current_entry = PromptEntry(family="Custom", prompt=config.prompt, settings={})
         effective_prompt = compose_prompt(config.prompt, renderer.world_label())
         backend_config = config.backend_dict(root)
         backend_config["prompt"] = effective_prompt
@@ -250,6 +371,11 @@ def run() -> int:
         latest_ai_version = 0
         last_config_check = 0.0
         last_prompt_advance = perf_counter()
+        # Which pair of the world's accent hues currently leads the prompt; it
+        # rotates on every auto-advance so a long walk changes colour, and
+        # resets with the world.
+        hue_offset = 0
+        recent_families: list[str] = [current_entry.family]
         last_input = perf_counter()
         autowalk = Autowalk(config.world_seed)
         autowalking = False
@@ -272,23 +398,39 @@ def run() -> int:
         ignore_prompt_hotkey_text = False
         seen_resolution_fallbacks = 0
 
+        def apply_live(values: dict[str, object]) -> None:
+            """Set settings on the config and forward the backend-tunable ones.
+
+            Nothing is written to config.json, so ephemeral changes (auto-advance
+            picking a new style family) cannot overwrite the configured startup
+            values or move config_mtime past an external edit.
+            """
+            for key, value in values.items():
+                setattr(config, key, value)
+            forward = {
+                key: value for key, value in values.items() if key in BACKEND_SETTING_KEYS
+            }
+            if forward:
+                worker.request_settings(**forward)
+
         def commit_many(values: dict[str, object], live: bool = True) -> None:
             """Set, persist and (optionally) forward settings in one atomic write."""
             nonlocal config_mtime
-            for key, value in values.items():
-                setattr(config, key, value)
-            config_mtime = persist_config_values(config_path, values)
             if live:
-                worker.request_settings(**values)
+                apply_live(values)
+            else:
+                for key, value in values.items():
+                    setattr(config, key, value)
+            config_mtime = persist_config_values(config_path, values)
 
         def commit(key: str, value: object, live: bool = True) -> None:
             """Set, persist and (optionally) forward one runtime setting."""
             commit_many({key: value}, live)
 
         def send_prompt(prompt: str, negative: str | None = None) -> int:
-            """Forward a prompt with the current world's hue words appended."""
+            """Forward a prompt led by the current world's hue words."""
             nonlocal effective_prompt
-            effective_prompt = compose_prompt(prompt, renderer.world_label())
+            effective_prompt = compose_prompt(prompt, renderer.world_label(), hue_offset)
             return worker.request_prompt(
                 effective_prompt,
                 config.negative_prompt if negative is None else negative,
@@ -314,6 +456,9 @@ def run() -> int:
                                     load_master_prefix(prompt_library_path), accepted
                                 )
                                 config.prompt = accepted
+                                current_entry = PromptEntry(
+                                    family="Custom", prompt=accepted, settings={}
+                                )
                                 required_prompt_revision = send_prompt(accepted)
                                 config_mtime = persist_prompt(config_path, accepted)
                                 # Restart the auto-advance countdown so a manual
@@ -533,22 +678,39 @@ def run() -> int:
                         notice_until = frame_started + 3.0
                         logging.info("Manual reseed: %s", new_seed)
                     elif event.key == pygame.K_SPACE:
-                        commit("world_seed", renderer.randomize_world(), live=False)
+                        # A reset changes the whole look: new world, new style
+                        # family with its own timestep/guide/CFG regime, and a
+                        # new noise seed so the walk does not resume the old one.
+                        # One redraw when the palette repeats: with a handful of
+                        # hue triads a back-to-back repeat is expected rather
+                        # than unlucky, and it is the one collision the viewer
+                        # actually notices.
+                        previous_hues = world_hues(renderer.world_label())
+                        world_seed = renderer.randomize_world()
+                        if world_hues(renderer.world_label()) == previous_hues:
+                            world_seed = renderer.randomize_world()
+                        reset: dict[str, object] = {
+                            "world_seed": world_seed,
+                            "seed": worker.request_reseed(),
+                        }
+                        hue_offset = 0
                         renderer.spawn_camera(camera)
-                        autowalk = Autowalk(config.world_seed)
-                        selected_prompt_name = "current prompt"
+                        autowalk = Autowalk(reset["world_seed"])
                         try:
-                            selected_prompt = choose_different_prompt(
-                                load_prompt_library(prompt_library_path), config.prompt
+                            current_entry = choose_family_prompt(
+                                load_prompt_library(prompt_library_path),
+                                recent_families,
                             )
-                            selected_prompt_name = selected_prompt["name"]
-                            config.prompt = selected_prompt["prompt"]
-                            required_prompt_revision = send_prompt(config.prompt)
-                            config_mtime = persist_prompt(config_path, config.prompt)
+                            recent_families.append(current_entry.family)
+                            del recent_families[:-RECENT_FAMILY_MEMORY]
+                            reset.update(current_entry.settings)
+                            reset["prompt"] = current_entry.prompt
+                            commit_many(reset)
+                            required_prompt_revision = send_prompt(current_entry.prompt)
                             last_prompt_advance = frame_started
                         except RuntimeError as exc:
                             logging.error("Prompt library ignored: %s", exc)
-                            selected_prompt_name = f"library error: {exc}"
+                            commit_many(reset, live=False)
                         # Preserve the last finished artwork while the new
                         # world and prompt generate. Reprojecting that old
                         # image with the new world's depth would expose the
@@ -564,11 +726,14 @@ def run() -> int:
                         last_conditioning_capture = 0.0
                         notice = ""
                         notice_until = 0.0
+                        notice = f"NEW WORLD — {current_entry.family}"
+                        notice_until = frame_started + 4.0
                         logging.info(
-                            "World randomized: %s (%s); prompt: %s",
+                            "World randomized: %s (%s); family: %s; seed: %s",
                             config.world_seed,
                             renderer.world_label(),
-                            selected_prompt_name,
+                            current_entry.family,
+                            config.seed,
                         )
                     elif event.key == pygame.K_p:
                         prompt_editing = True
@@ -715,11 +880,13 @@ def run() -> int:
                     status,
                     stats,
                     renderer.world_label(),
+                    current_entry.family,
                     log_path,
                     prompt_editing,
                     prompt_buffer,
                     notice if now < notice_until else "",
                     effective_prompt=effective_prompt,
+                    hue_offset=hue_offset,
                 )
             if reproject_frame is not None:
                 renderer.display_reprojected(
@@ -750,16 +917,16 @@ def run() -> int:
                 and now - last_prompt_advance >= config.prompt_auto_advance_seconds
             ):
                 last_prompt_advance = now
+                hue_offset += 1
                 try:
-                    selected_prompt = choose_different_prompt(
-                        load_prompt_library(prompt_library_path), config.prompt
+                    current_entry = advance_prompt(
+                        load_prompt_library(prompt_library_path), current_entry
                     )
-                    config.prompt = selected_prompt["prompt"]
-                    required_prompt_revision = send_prompt(config.prompt)
-                    # Auto-advance state is ephemeral: persisting it would move
-                    # config_mtime past an external edit and overwrite the
-                    # configured startup prompt.
-                    logging.info("Prompt auto-advanced to: %s", selected_prompt["name"])
+                    # Ephemeral: persisting would move config_mtime past an
+                    # external edit and overwrite the configured startup prompt.
+                    apply_live({**current_entry.settings, "prompt": current_entry.prompt})
+                    required_prompt_revision = send_prompt(current_entry.prompt)
+                    logging.info("Prompt auto-advanced to: %s", current_entry.family)
                 except RuntimeError as exc:
                     logging.error("Prompt auto-advance skipped: %s", exc)
 
@@ -789,6 +956,13 @@ def run() -> int:
                         ):
                             required_prompt_revision = send_prompt(
                                 updated.prompt, updated.negative_prompt
+                            )
+                            current_entry = PromptEntry(
+                                family=current_entry.family
+                                if updated.prompt == current_entry.prompt
+                                else "Custom",
+                                prompt=updated.prompt,
+                                settings={},
                             )
                             last_prompt_advance = frame_started
                         changed = {
@@ -863,11 +1037,13 @@ def build_overlay(
     status: object,
     stats: dict[str, float | int | str],
     world_label: str,
+    family: str,
     log_path: Path,
     prompt_editing: bool = False,
     prompt_buffer: str = "",
     notice: str = "",
     effective_prompt: str = "",
+    hue_offset: int = 0,
 ) -> list[str]:
     """Diagnostic lines for the F1 overlay: rates, walk state and hotkeys."""
     state = getattr(status, "state", "unknown")
@@ -897,8 +1073,9 @@ def build_overlay(
         f"BACKEND       {config.backend}       STATE  {state.upper()}",
         f"SEED          {stats.get('active_seed', config.seed)}        Shift+R reseed",
         f"WORLD         {config.world_seed}  {world_label}",
-        "              SPACE new world + prompt   P edit prompt",
-        f"HUE           {hue_words(world_label) or 'none'}  (appended to the prompt)",
+        f"FAMILY        {family}",
+        "              SPACE new world + style family   P edit prompt",
+        f"HUE           {hue_words(world_label, hue_offset) or 'none'}  (leads the prompt)",
         f"PROMPT        {(effective_prompt or config.prompt)[:58]}",
         f"AUTO ADVANCE  {config.prompt_auto_advance_seconds:5.1f}s               F9 cycle",
     ]
