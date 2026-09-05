@@ -1,6 +1,6 @@
 # Latent Space
 
-Latent Space is a real-time Windows installation. You move freely through a dense procedural blocky landscape and a diffusion model continuously rewrites what you see. The 3D render is never shown: it is a loose steering signal for a continuous walk through latent space. WASD and mouse movement stay responsive between diffusion updates through GPU depth reprojection.
+Latent Space is a real-time Windows installation. You move freely through a dense procedural landscape of blocks, curved forms and open wire structures, and a diffusion model continuously rewrites what you see. The 3D render is never shown in the normal AI view: it is a steering signal for a continuous walk through latent space. WASD and mouse movement stay responsive between diffusion updates through GPU depth reprojection.
 
 ## One-click installation
 
@@ -42,13 +42,14 @@ The NVIDIA display driver must already be installed. A separate CUDA Toolkit is 
 | F6 | Return to generated AI view |
 | F7 | Prompt caption at the bottom |
 | F8 | Toggle feedback reprojection |
-| F9 | Cycle prompt auto-advance: off, 12, 24, 48, 96 s. Auto-advance usually stays inside the current family and jumps to another about one time in three; current tuning and palette stay fixed |
+| F9 | Cycle prompt auto-advance: off, 12, 24, 48, 96 s. Each advance chooses a different family and preserves current tuning |
 | F12 | Toggle idle flight (starts after a minute without input) |
 | F10 | Cycle resolution modes |
 | F11 | Fullscreen / windowed |
 | [ / ] | Reprojection strength |
 | - / = | Diffusion steps, 1–4 |
 | , / . | Display sharpening |
+| H / J | Fog distance nearer / farther in steps of 10. Nearer means more fog |
 | I / O | Instability down / up |
 | K / L | Guide strength down / up |
 | T / Y | Shift the timestep window down / up by 25 |
@@ -59,6 +60,11 @@ The NVIDIA display driver must already be installed. A separate CUDA Toolkit is 
 While editing a prompt, Enter applies it, Escape cancels, and Ctrl+D restores the default text. Space changes only the prompt and preserves all current settings, including CFG and guide strength. It also keeps your position, world seed, diffusion seed and diagnostic state.
 
 Every accepted setting is written back to `config.json` immediately, so the next launch restores it. Freeze and diagnostic views stay session-only. Editing `config.json` in a text editor while the app runs also works: changes are picked up within half a second.
+
+`fog_distance` controls how far away structures fully fade into the atmosphere.
+The default, 196 world units, matches the original fog. Its range is 40–300.
+Press H to soften distant color sooner, or J to see farther. F1 shows the current
+distance. The setting affects the proxy sent to the AI and survives prompt changes.
 
 Movement has no gravity, fixed eye height or altitude limit. Look up and hold W to climb, look down to descend, or use Q/E to change height without changing your gaze. The world continues above and below you as well as horizontally. Release the keys to stop. Solid forms still block movement and you slide along them; you can pass above or below them wherever there is space. Idle flight also steers in three dimensions.
 
@@ -114,12 +120,18 @@ resolve into product shots (chrome, glass, foil) are kept out, so the sampler ha
 guess without landing on something concrete. Occasional human residue is accepted; the
 negative prompt names only gamepads, desks, interiors and furniture.
 
-Space chooses a prompt from another family, avoiding recently used families when possible.
-Automatic advance usually picks another variant of the same family and jumps families
-about one time in three. Neither action applies the family's sampler presets. A family's
+Space and automatic advance choose a prompt from another family, sharing a history
+that avoids the last three families when possible. Neither action applies the family's sampler presets. A family's
 `settings` may only name live-tunable backend keys; anything else is
 rejected when the library loads. F7 shows the effective prompt at 30% opacity, and the F1
 overlay names the current family.
+
+The effective prompt keeps the original text and appends the local landscape's hue
+pair. The proxy supplies the new curved and wire forms; there is no shared shape
+phrase appended to every subject. The saved prompt, default prompt and library
+text stay unchanged. Travelling into a different color region updates the hue cue
+through the existing prompt interpolation, without changing the subject or restarting
+the automatic prompt timer.
 
 A flat `"prompts": ["...", ...]` list still loads, with each entry treated as its own
 family carrying no settings.
@@ -147,7 +159,7 @@ family carrying no settings.
 | `noise_walk_seconds` | `5.0` | Seconds to slerp between seeded noise keyframes. 0 means fresh noise each frame |
 | `noise_jitter` | `0.12` | Small variance-preserving jitter mixed into the walk noise |
 | `prompt_walk_seconds` | `6.0` | Seconds to slerp CLIP embeddings to a new prompt. 0 hard-cuts |
-| `prompt_auto_advance_seconds` | `24.0` | Seconds between automatic library prompt changes. 0 disables. Short enough that a few hundred frames cross a family boundary, which is how a long walk changes subject and colour the way the reference does |
+| `prompt_auto_advance_seconds` | `24.0` | Seconds between changes to a different library prompt family. 0 disables |
 | per-family `settings` | — | Sampler presets retained for offline style comparisons. Space and auto-advance preserve the current live settings |
 | `feedback_reprojection` | `false` | Use the camera-aligned previous frame as the walk memory in place of `x0_prev`. The proxy still guides every frame. Costs about 39 ms of CPU per frame |
 | `seed` | `12345` | Noise keyframe seed |
@@ -159,16 +171,25 @@ family carrying no settings.
 
 ## How it works
 
-The renderer streams a deterministic field of instanced cubes in 64-unit chunks, in an 11x11x11 window around the camera. Thick panels define walls and openings, and a connected channel field opens routes horizontally and vertically. Reefs, lattice bars, shards, columns and overhangs vary across space. Along the channel field, 5% to 65% of interior object groups are omitted to clear passages while retaining the panels. World-space panel patterns and a seeded palette give the model large value breaks and depth cues.
+The renderer streams deterministic geometry in 64-unit chunks, in an 11x11x11 window around the camera. Thick panels define walls and openings, and a connected channel field opens routes horizontally and vertically. Reefs, lattice bars, shards, columns and overhangs remain, with curved wire sheets, ribbed arches, open cages and rounded solids added among them. Along the channel field, 5% to 65% of interior object groups are omitted to clear passages while retaining the panels.
+
+The seeded palette varies by region, with stronger color across surfaces and the surrounding atmosphere. Panels retain light and dark value breaks, but their surface checker texture is removed so it cannot become a repeated pattern in the AI image. The new forms and palette preserve the current resolution, CFG, guidance and other sampler settings.
+
+Six local palettes combine teal, cobalt, violet, rose, yellow, lime and pale accents
+in 128-unit regions across all three axes. Materials belong to their world positions.
+The atmosphere blends across region borders while the lower view stays dark.
+Returning to a region restores its colors; standing still does not cycle the palette.
+
+Wire collisions follow individual bars, leaving their openings available when the player fits. Shared instanced meshes and camera culling limit the cost of the additions. The original cubes retain their incremental upload path.
 
 There is no ceiling or bottom boundary. The streaming window follows the camera in all three axes, generating nearby chunks and releasing distant ones. Returning to a location recreates the same geometry from its coordinates and world seed. Fog hides the streaming edges. The collision body and spawn search use all three axes; movement is not attached to a terrain height. The flood-fill tests in `tests/test_world.py` check connected open space, and `tests/test_endless_world.py` checks vertical streaming and passage thinning.
 
-That render never reaches the screen. Every conditioning frame is uploaded to the GPU and encoded by TAESD into a latent. The backend then runs a continuous walk:
+That render is hidden in the normal AI view. Every conditioning frame is uploaded to the GPU and encoded by TAESD into a latent. The backend then runs a continuous walk:
 
 - `x0_prev` is the previous predicted clean latent, the memory of the walk.
 - Each frame first re-anchors the memory to the proxy latent (`memory_match`, `memory_match_std`, `memory_leash`) so hue and contrast cannot random-walk, then blends it toward the encoded proxy by `guide_strength`, adds noise at a timestep that breathes between `timestep_min` and `timestep_max`, runs one UNet step, and solves back to a clean latent.
 - The noise is not independent per frame. It slerps between seeded keyframes over `noise_walk_seconds`, which is what makes forms melt and regrow instead of flickering.
-- Prompt changes slerp the CLIP embeddings over `prompt_walk_seconds` rather than cutting. A pair of the world's palette hues is spliced into every prompt between its subject clause and its material clause, so each seed reads in its own colour; the pair stays fixed during prompt changes. Space draws a family that none of the last few presses used. Prompt changes preserve the world, camera, noise seed, latent memory and sampler settings.
+- Prompt changes slerp the CLIP embeddings over `prompt_walk_seconds` rather than cutting. A pair of the local landscape's hues follows the original prompt and changes as the player enters another color region. Space and timed changes avoid recent subject families. Prompt changes preserve the world, camera, noise seed, latent memory and sampler settings.
 - TAESD decodes the result. The full VAE is never loaded in the realtime path.
 
 `instability` scales both the timestep breathing and the guide wobble; at 0 both are pinned to their configured centres. Everything stays on the GPU as fp16, `channels_last` on the UNet, one uint8 readback per frame.

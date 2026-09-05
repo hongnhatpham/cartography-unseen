@@ -15,6 +15,8 @@ import numpy as np
 
 from app.config import (
     BACKEND_SETTING_KEYS,
+    MAX_FOG_DISTANCE,
+    MIN_FOG_DISTANCE,
     RESOLUTION_MODES,
     AppConfig,
     configure_local_environment,
@@ -202,11 +204,9 @@ def world_hues(world_label: str) -> list[str]:
 def hue_words(world_label: str, offset: int = 0) -> str:
     """A pair of the world's hues as prompt vocabulary, e.g. "violet and lime".
 
-    ``ProxyRenderer.world_label`` reads "biomes / hue-hue-hue". The proxy's own
-    chroma is largely discarded by the latent walk, so the palette only reaches
-    the screen if the prompt names it. ``offset`` rotates the pair through the
-    world's accents, which is how the hue drifts over a long walk instead of
-    locking to the first two names for the whole session.
+    ``ProxyRenderer.world_label`` reads "biomes / hue-hue-hue". Naming the local
+    palette helps the model retain the proxy's colors. ``offset`` selects a
+    different pair for offline comparisons.
     """
     hues = world_hues(world_label)
     if not hues:
@@ -218,12 +218,7 @@ def hue_words(world_label: str, offset: int = 0) -> str:
 
 
 def compose_prompt(prompt: str, world_label: str, hue_offset: int = 0) -> str:
-    """The library prompt with the world's hue words appended.
-
-    Trailing hues tint without steering: the reference palette is a pale base
-    with one or two bursts, and a hue pair given more weight than that floods
-    the frame with saturated colour.
-    """
+    """Append the local palette without changing the library's subject."""
     words = hue_words(world_label, hue_offset)
     if not words or words in prompt.casefold():
         return prompt
@@ -241,9 +236,15 @@ def choose_family_prompt(
     """
     if isinstance(recent_families, str):
         recent_families = (recent_families,)
-    recent = set(recent_families)
-    alternatives = [entry for entry in entries if entry.family not in recent]
-    return secrets.choice(alternatives or entries)
+    recent = list(recent_families)
+    while recent:
+        alternatives = [entry for entry in entries if entry.family not in recent]
+        if alternatives:
+            return secrets.choice(alternatives)
+        # Small libraries can exhaust the history. Allow the oldest family
+        # back first, keeping the current family excluded when possible.
+        recent.pop(0)
+    return secrets.choice(entries)
 
 
 # How many past presses the Space family draw avoids repeating.
@@ -251,18 +252,13 @@ RECENT_FAMILY_MEMORY = 3
 
 
 def advance_prompt(
-    entries: list[PromptEntry], current: PromptEntry, jump_in_one_of: int = 3
+    entries: list[PromptEntry], current: PromptEntry, recent_families: Iterable[str] = ()
 ) -> PromptEntry:
-    """The next auto-advance step: another variant of the same family, or, one
-    time in ``jump_in_one_of``, a jump to a different family."""
-    siblings = [
-        entry
-        for entry in entries
-        if entry.family == current.family and entry.prompt != current.prompt
-    ]
-    if not siblings or secrets.randbelow(max(1, jump_in_one_of)) == 0:
-        return choose_family_prompt(entries, current.family)
-    return secrets.choice(siblings)
+    """Choose a different subject family for both timed changes and Space."""
+    alternatives = [entry for entry in entries if entry.prompt != current.prompt]
+    if not alternatives:
+        raise RuntimeError("Prompt library has no different prompt")
+    return choose_family_prompt(alternatives, [*recent_families, current.family])
 
 
 def entry_for_prompt(entries: list[PromptEntry], prompt: str) -> PromptEntry:
@@ -336,6 +332,7 @@ def run() -> int:
             window_size=config.diffusion_size,
             display_monitor=config.display_monitor,
             world_seed=config.world_seed,
+            fog_distance=config.fog_distance,
         )
         renderer.loading_screen("INITIALIZING", "Starting renderer and diffusion worker")
         camera = Camera.create_default()
@@ -370,8 +367,10 @@ def run() -> int:
         latest_ai_version = 0
         last_config_check = 0.0
         last_prompt_advance = perf_counter()
-        # Keep the world's accent pair stable when selecting another prompt.
+        # Prompt selection preserves the local palette; travel changes it.
         hue_offset = 0
+        sent_hues = hue_words(renderer.world_label(), hue_offset)
+        last_palette_update = perf_counter()
         recent_families: list[str] = [current_entry.family]
         last_input = perf_counter()
         autowalk = Autowalk(config.world_seed)
@@ -424,9 +423,11 @@ def run() -> int:
             commit_many({key: value}, live)
 
         def send_prompt(prompt: str, negative: str | None = None) -> int:
-            """Forward a prompt led by the current world's hue words."""
-            nonlocal effective_prompt
+            """Forward the original subject with the current region's colors."""
+            nonlocal effective_prompt, sent_hues, last_palette_update
             effective_prompt = compose_prompt(prompt, renderer.world_label(), hue_offset)
+            sent_hues = hue_words(renderer.world_label(), hue_offset)
+            last_palette_update = perf_counter()
             return worker.request_prompt(
                 effective_prompt,
                 config.negative_prompt if negative is None else negative,
@@ -624,6 +625,15 @@ def run() -> int:
                         )
                         notice = f"INSTABILITY: {config.instability:.0%}"
                         notice_until = frame_started + 3.0
+                    elif event.key in (pygame.K_h, pygame.K_j):
+                        direction = -10.0 if event.key == pygame.K_h else 10.0
+                        commit(
+                            "fog_distance",
+                            max(MIN_FOG_DISTANCE, min(MAX_FOG_DISTANCE, config.fog_distance + direction)),
+                            live=False,
+                        )
+                        notice = f"FOG DISTANCE: {config.fog_distance:g}   H nearer / J farther"
+                        notice_until = frame_started + 3.0
                     elif event.key in (pygame.K_k, pygame.K_l):
                         direction = -0.05 if event.key == pygame.K_k else 0.05
                         commit(
@@ -676,13 +686,9 @@ def run() -> int:
                         # Keep the current world and live tuning while the
                         # backend walks toward another library prompt.
                         try:
-                            entries = [
-                                entry for entry in load_prompt_library(prompt_library_path)
-                                if entry.prompt != config.prompt
-                            ]
-                            if not entries:
-                                raise RuntimeError("Prompt library has no different prompt")
-                            current_entry = choose_family_prompt(entries, recent_families)
+                            current_entry = advance_prompt(
+                                load_prompt_library(prompt_library_path), current_entry, recent_families
+                            )
                             recent_families.append(current_entry.family)
                             del recent_families[:-RECENT_FAMILY_MEMORY]
                             commit("prompt", current_entry.prompt)
@@ -750,6 +756,7 @@ def run() -> int:
                 or diagnostic_mode != "none"
                 or frame_started - last_conditioning_capture >= 1.0 / config.conditioning_fps
             )
+            renderer.fog_distance = config.fog_distance
             if capture_due or config.reprojection:
                 proxy_started = perf_counter()
                 snapshot = renderer.render_scene(camera)
@@ -760,6 +767,15 @@ def run() -> int:
                 # Keep streaming and the location palette current without
                 # drawing a proxy frame that neither AI nor display will use.
                 renderer.update_world(camera.position)
+            # Let the existing prompt interpolation finish before retargeting
+            # colors. Crossing a region changes no subject or sampler setting.
+            if (
+                not prompt_editing
+                and frame_started - last_palette_update >= max(1.0, config.prompt_walk_seconds)
+                and hue_words(renderer.world_label(), hue_offset) != sent_hues
+            ):
+                required_prompt_revision = send_prompt(config.prompt)
+                logging.info("Landscape palette: %s", sent_hues)
             if capture_due:
                 capture_started = perf_counter()
                 conditioning = renderer.capture_conditioning(
@@ -886,8 +902,10 @@ def run() -> int:
                 last_prompt_advance = now
                 try:
                     current_entry = advance_prompt(
-                        load_prompt_library(prompt_library_path), current_entry
+                        load_prompt_library(prompt_library_path), current_entry, recent_families
                     )
+                    recent_families.append(current_entry.family)
+                    del recent_families[:-RECENT_FAMILY_MEMORY]
                     # Ephemeral: persisting would move config_mtime past an
                     # external edit and overwrite the configured startup prompt.
                     apply_live({"prompt": current_entry.prompt})
@@ -949,6 +967,7 @@ def run() -> int:
                             "reprojection_max_translation",
                             "reprojection_max_rotation",
                             "display_sharpen",
+                            "fog_distance",
                             "debug_overlay",
                             "prompt_caption",
                             "prompt_auto_advance_seconds",
@@ -1030,6 +1049,7 @@ def build_overlay(
         f"RES           {active_resolution}       F10 cycle       STEPS  {stats.get('steps', config.steps)}    - / = adjust",
         f"CFG           {float(stats.get('guidance_scale', config.guidance_scale)):4.2g}                  C cycle",
         f"SHARPNESS     {config.display_sharpen:4.1f}                  , / . adjust",
+        f"FOG DISTANCE  {config.fog_distance:4.0f}                   H nearer / J farther",
         f"TIMESTEP      {config.timestep_min}-{config.timestep_max} now {float(stats.get('timestep_now', 0.0)):5.0f}    T / Y shift",
         f"INSTABILITY   {config.instability:4.0%}                  I less / O more",
         f"GUIDE         {config.guide_strength:4.0%} now {float(stats.get('guide_strength_now', 0.0)):4.0%}         K less / L more",
@@ -1041,7 +1061,7 @@ def build_overlay(
         f"WORLD         {config.world_seed}  {world_label}",
         f"FAMILY        {family}",
         "              SPACE new prompt   P edit prompt",
-        f"HUE           {hue_words(world_label, hue_offset) or 'none'}  (leads the prompt)",
+        f"HUE           {hue_words(world_label, hue_offset) or 'none'}",
         f"PROMPT        {(effective_prompt or config.prompt)[:58]}",
         f"AUTO ADVANCE  {config.prompt_auto_advance_seconds:5.1f}s               F9 cycle",
     ]

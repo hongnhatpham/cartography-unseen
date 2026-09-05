@@ -20,6 +20,12 @@ RESOLUTION_MODES = (
     (1024, 768),
 )
 
+# Fog fades fully before the edge of the streamed world.
+DEFAULT_FOG_DISTANCE = 196.0
+MIN_FOG_DISTANCE = 40.0
+MAX_FOG_DISTANCE = 300.0
+
+
 # Live settings forwarded to the diffusion backend through request_settings.
 BACKEND_SETTING_KEYS = (
     "steps",
@@ -118,6 +124,9 @@ class AppConfig:
     reprojection_max_translation: float = 1.0
     reprojection_max_rotation: float = 10.0
     display_sharpen: float = 0.3
+    # World distance where structures fully fade into the atmosphere. Keep the
+    # maximum inside the streamed window so distant chunk edges stay hidden.
+    fog_distance: float = DEFAULT_FOG_DISTANCE
     target_display_fps: int = 60
     conditioning_fps: int = 15
     debug_overlay: bool = False
@@ -193,6 +202,8 @@ class AppConfig:
             raise RuntimeError("reprojection_max_rotation must be positive")
         if not 0.0 <= self.display_sharpen <= 2.0:
             raise RuntimeError("display_sharpen must be in [0, 2]")
+        if not MIN_FOG_DISTANCE <= self.fog_distance <= MAX_FOG_DISTANCE:
+            raise RuntimeError(f"fog_distance must be in [{MIN_FOG_DISTANCE:g}, {MAX_FOG_DISTANCE:g}]")
         if self.target_display_fps < 30:
             raise RuntimeError("target_display_fps must be at least 30")
         if self.display_monitor < 0:

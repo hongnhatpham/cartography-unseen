@@ -1,4 +1,4 @@
-"""Volumetric field of forms streamed as instanced cubes.
+"""Volumetric field of solid structures and open curved forms.
 
 There is no ground and no gravity. Space is an endless field of cubic cells; every
 cell face is either an opening or a wall built from a few thick panels, and
@@ -22,7 +22,7 @@ of enclosure. There is no ceiling, floor or altitude clamp.
 from __future__ import annotations
 
 from collections import deque
-from colorsys import hsv_to_rgb
+from colorsys import hsv_to_rgb, rgb_to_hsv
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from math import cos, floor, radians, sin, sqrt
@@ -30,6 +30,8 @@ from random import Random
 from typing import Callable, Iterable, Literal, TypeAlias
 
 import numpy as np
+
+from .form_meshes import form_bounds
 
 ChunkCoord: TypeAlias = tuple[int, int, int]
 Cell: TypeAlias = tuple[int, int, int]
@@ -41,6 +43,7 @@ CHUNK_SIZE = 64.0
 ACTIVE_CHUNK_RADIUS = 5
 MAX_ACTIVE_CHUNKS = (ACTIVE_CHUNK_RADIUS * 2 + 1) ** 3
 MAX_OBJECTS_PER_CHUNK = 512
+MAX_FORMS_PER_CHUNK = 64
 
 # One volume cell. Chambers this wide read as a room's worth of open space at
 # flight speed while still putting a surface within a couple of body lengths of
@@ -62,9 +65,6 @@ SLIDE_NUDGE = 0.35
 
 _MASK_64 = (1 << 64) - 1
 _BIOME_SALT = 0xB10E5
-_OBJECT_COLOR_SALT = 0xC01045
-_ACCENT_SALT = 0xACCE27
-_SKY_COLOR_SALT = 0x5A7C010
 _SPAWN_SALT = 0x5AA17
 _FACE_SALT = 0xFACE05
 _PANEL_SALT = 0x9A4E1
@@ -92,30 +92,14 @@ MIN_BIOME_WEIGHT = 0.06
 # Share of cells left empty, which is what keeps the chambers flyable.
 _EMPTY_CELL_SHARE = 0.30
 
-_HUE_OFFSETS = (0.17, 0.33, 0.5)
-_LEGIBILITY_MARGIN = 0.25
-_ROLE_HUE_SLOT: dict[str, int] = {"panel": 0, "mass": 1}
-# Base values before shading and tone; the banded key light in proxy.frag drops
-# away-facing sides to roughly a quarter of these.
-_ROLE_VALUE_RANGE: dict[str, tuple[float, float]] = {
-    "panel": (0.62, 0.90),
-    "mass": (0.70, 0.96),
-}
-# The accent is a low-frequency 3D ridge field, not a per-cube coin flip, so a
-# whole wall or reef takes the hue and it survives diffusion at 512x384.
-_ACCENT_CELL = 120.0
-_ACCENT_THRESHOLD = 0.94
-_NEUTRAL_SATURATION = (0.04, 0.13)
-_ACCENT_SATURATION = (0.62, 0.88)
-_ACCENT_VALUE = (0.60, 0.92)
 _MIN_TONE = 0.10
 # Panel tone checker: neighbouring walls alternate light and dark, so a frame
 # filled by the shell still carries a value break instead of one flat band.
 _TONE_LIGHT = 0.94
 _TONE_DARK = 0.42
 _HUE_NAMES = (
-    (0.04, "red"), (0.10, "amber"), (0.19, "lime"), (0.42, "green"),
-    (0.53, "cyan"), (0.66, "cobalt"), (0.79, "violet"), (0.92, "magenta"),
+    (0.04, "red"), (0.10, "amber"), (0.18, "yellow"), (0.29, "lime"), (0.42, "green"),
+    (0.53, "cyan"), (0.66, "cobalt"), (0.79, "violet"), (0.92, "magenta"), (0.98, "rose"),
     (1.01, "red"),
 )
 
@@ -137,10 +121,22 @@ class WorldCube:
 
 
 @dataclass(frozen=True, slots=True)
+class WorldForm:
+    """An additional curved solid or open frame, separate from the cell shell."""
+
+    mesh: str
+    position: Vec3
+    half_extents: Vec3
+    rotation: Vec3
+    color: Color
+
+
+@dataclass(frozen=True, slots=True)
 class WorldChunk:
     coord: ChunkCoord
     biomes: tuple[str, ...]
     objects: tuple[WorldCube, ...]
+    forms: tuple[WorldForm, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,104 +268,107 @@ def plan_chunk_cache(
 # --- palette ---------------------------------------------------------------
 
 
-@lru_cache(maxsize=16)
-def _sky_hsv(world_seed: int) -> tuple[float, float, float]:
-    """A near-white overcast sky with only a faint seeded tint."""
+# Each region keeps a dominant surface hue and two smaller accents. The swatches
+# combine the older pale/black structures with the newer wire-study colours.
+PALETTE_CELL = 128.0
+_PALETTE_BLEND = 24.0
+_TEAL, _VIOLET, _YELLOW = (.04, .69, .68), (.32, .25, .84), (.92, .78, .12)
+_ROSE, _PALE = (.87, .30, .48), (.72, .77, .82)
+_COBALT, _LIME = (.10, .30, .91), (.57, .85, .10)
+_REGIONAL_PALETTES: tuple[tuple[Color, Color, Color], ...] = (
+    (_TEAL, _VIOLET, _YELLOW),
+    (_COBALT, _PALE, _ROSE),
+    (_ROSE, _VIOLET, _LIME),
+    (_LIME, _TEAL, _PALE),
+    (_YELLOW, _COBALT, _ROSE),
+    (_VIOLET, _ROSE, _YELLOW),
+)
+_REGIONAL_HUES = tuple(tuple(rgb_to_hsv(*color)[0] for color in palette)
+                       for palette in _REGIONAL_PALETTES)
+# Horizon follows the dominant hue; the upper and lower gradient follow its
+# secondary hue. The lower value stays dark even in yellow and lime regions.
+_REGIONAL_ATMOSPHERES = tuple(
+    (hsv_to_rgb(hues[0], .66, .46), hsv_to_rgb(hues[1], .57, .58),
+     hsv_to_rgb(hues[1], .42, .11))
+    for hues in _REGIONAL_HUES
+)
 
-    hue = _unit_float(world_seed, _SKY_COLOR_SALT, 1)
-    saturation = 0.03 + 0.09 * _unit_float(world_seed, _SKY_COLOR_SALT, 2)
-    value = 0.88 + 0.12 * _unit_float(world_seed, _SKY_COLOR_SALT, 3)
-    return hue, saturation, value
+
+@lru_cache(maxsize=1 << 15)
+def _palette_at_cell(world_seed: int, x: int, y: int, z: int) -> int:
+    return _stable_seed(world_seed, 0xC010B, x, y, z) % len(_REGIONAL_PALETTES)
 
 
-def sky_color(world_seed: int) -> Color:
-    """Return the seeded mid-level fog colour shared by one world."""
-
-    return hsv_to_rgb(*_sky_hsv(world_seed))
-
-
-def zenith_color(world_seed: int) -> Color:
-    """Colour straight up: the secondary hue, deeper and darker than the fog."""
-
-    _, secondary, _ = world_palette(world_seed)
-    _, _, sky_value = _sky_hsv(world_seed)
-    return hsv_to_rgb(secondary, 0.55, max(0.30, sky_value - 0.42))
+def world_palette(
+    world_seed: int, x: float = 0.0, y: float = 0.0, z: float = 0.0,
+) -> tuple[float, float, float]:
+    """Dominant, secondary and accent hues of the current spatial region."""
+    cell = tuple(floor(value / PALETTE_CELL) for value in (x, y, z))
+    return _REGIONAL_HUES[_palette_at_cell(world_seed, *cell)]
 
 
-def nadir_color(world_seed: int) -> Color:
-    """Colour straight down: the same hue as the zenith, taken almost to black.
+def atmosphere_colors(
+    world_seed: int, x: float = 0.0, y: float = 0.0, z: float = 0.0,
+) -> tuple[Color, Color, Color]:
+    """Blend local horizon, zenith and nadir across region borders in all axes."""
+    axes = []
+    for value in (x, y, z):
+        cell = floor(value / PALETTE_CELL)
+        offset = value - cell * PALETTE_CELL
+        if offset < _PALETTE_BLEND:
+            weight = _smoothstep((offset + _PALETTE_BLEND) / (2 * _PALETTE_BLEND))
+            axes.append(((cell - 1, 1 - weight), (cell, weight)))
+        elif offset > PALETTE_CELL - _PALETTE_BLEND:
+            weight = _smoothstep((offset - PALETTE_CELL + _PALETTE_BLEND) / (2 * _PALETTE_BLEND))
+            axes.append(((cell, 1 - weight), (cell + 1, weight)))
+        else:
+            axes.append(((cell, 1.0),))
+    colors = [[0.0, 0.0, 0.0] for _ in range(3)]
+    for ix, wx in axes[0]:
+        for iy, wy in axes[1]:
+            for iz, wz in axes[2]:
+                atmosphere = _REGIONAL_ATMOSPHERES[_palette_at_cell(world_seed, ix, iy, iz)]
+                weight = wx * wy * wz
+                for target, source in zip(colors, atmosphere):
+                    for channel in range(3):
+                        target[channel] += source[channel] * weight
+    return tuple(tuple(color) for color in colors)
 
-    A dark lower background gives the scene an orientation without a ground
-    plane. Distant geometry fades into this colour when looking down.
-    """
 
-    _, secondary, _ = world_palette(world_seed)
-    return hsv_to_rgb(secondary, 0.42, 0.11)
+def sky_color(world_seed: int, x: float = 0.0, y: float = 0.0, z: float = 0.0) -> Color:
+    """Local horizon colour, shared by the sky and distant geometry."""
+    return atmosphere_colors(world_seed, x, y, z)[0]
+
+
+def zenith_color(world_seed: int, x: float = 0.0, y: float = 0.0, z: float = 0.0) -> Color:
+    return atmosphere_colors(world_seed, x, y, z)[1]
+
+
+def nadir_color(world_seed: int, x: float = 0.0, y: float = 0.0, z: float = 0.0) -> Color:
+    """Dark lower atmosphere supplies orientation without a ground plane."""
+    return atmosphere_colors(world_seed, x, y, z)[2]
 
 
 def _hue_distance(a: float, b: float) -> float:
     """Shortest distance between two hues on the wrap-around [0, 1) wheel."""
-
     diff = abs(a - b) % 1.0
     return min(diff, 1.0 - diff)
 
 
-@lru_cache(maxsize=16)
-def world_palette(world_seed: int) -> tuple[float, float, float]:
-    """Two or three hues shared by every object in one world.
-
-    The primary hue matches the fog and the secondary steps around the wheel by
-    a per-seed offset. Only the accent slot is ever drawn at full saturation, so
-    these read as one pale field plus a bold vein. An offset of 0.5 folds the
-    accent back onto the primary, which would make it share the fog hue and
-    vanish, so it maps to the secondary hue instead.
-    """
-
-    primary_hue, _, _ = _sky_hsv(world_seed)
-    pick = min(2, int(_unit_float(world_seed, _OBJECT_COLOR_SALT, 50) * len(_HUE_OFFSETS)))
-    offset = _HUE_OFFSETS[pick]
-    secondary_hue = (primary_hue + offset) % 1.0
-    accent_hue = secondary_hue if offset == 0.5 else (primary_hue + 2.0 * offset) % 1.0
-    return primary_hue, secondary_hue, accent_hue
-
-
-def is_accent_region(x: float, y: float, z: float, world_seed: int) -> bool:
-    """Whether this pocket of the volume belongs to a contiguous accent vein."""
-
-    return ridge(x, y, z, _ACCENT_CELL, world_seed, _ACCENT_SALT) > _ACCENT_THRESHOLD
-
-
 def object_color(world_seed: int, position: Vec3, role: Role, tone: float) -> Color:
-    """Colour one cube from its world position: pale neutral, or accent hue.
-
-    The accent comes from a low-frequency 3D field, so a whole wall or reef
-    carries the hue. ``tone`` then scales the value down.
-    """
-
-    x, y, z = position
-    parts = (_OBJECT_COLOR_SALT, int(x * 8.0), int(y * 8.0), int(z * 8.0))
-    palette = world_palette(world_seed)
-    accent = is_accent_region(x, y, z, world_seed)
-    hue = palette[2 if accent else _ROLE_HUE_SLOT[role]]
-    sat_low, sat_high = _ACCENT_SATURATION if accent else _NEUTRAL_SATURATION
-    saturation = sat_low + (sat_high - sat_low) * _unit_float(world_seed, *parts, 2)
-    low, high = _ACCENT_VALUE if accent else _ROLE_VALUE_RANGE[role]
-    value = low + (high - low) * _unit_float(world_seed, *parts, 3)
-
-    # Panels carry the fog hue by design. At these saturations the tint is
-    # barely visible, but a panel whose value also matches the fog would vanish
-    # into it, so separate it by value instead of leaving the palette.
-    if _hue_distance(hue, palette[0]) <= 1e-6:
-        _, _, sky_value = _sky_hsv(world_seed)
-        if abs(value - sky_value) < _LEGIBILITY_MARGIN:
-            midpoint = (low + high) * 0.5
-            pushed = (
-                sky_value - _LEGIBILITY_MARGIN
-                if midpoint <= sky_value
-                else sky_value + _LEGIBILITY_MARGIN
-            )
-            value = min(1.0, max(0.0, pushed))
-    return hsv_to_rgb(hue, saturation, value * max(_MIN_TONE, min(1.0, tone)))
+    """Fixed local material colours, with smaller shared accents and dark cuts."""
+    group = tuple(floor(value / PALETTE_CELL) for value in position)
+    palette = _REGIONAL_PALETTES[_palette_at_cell(world_seed, *group)]
+    cell = tuple(floor(value / VOLUME_CELL) for value in position)
+    accent = _unit_float(world_seed, 0xC010D, *cell)
+    slot = 0 if accent < .64 else 1 if accent < .89 else 2
+    chosen = palette[slot]
+    strong = value_noise(*position, 100.0, world_seed, 0xC010C) > .15
+    scale = .6 + .4 * max(_MIN_TONE, min(1.0, tone))
+    if tone < .3:
+        scale *= max(_MIN_TONE, tone) / .3
+    return tuple((channel if strong else neutral * .75 + channel * .25) * scale
+                 for channel, neutral in zip(chosen, (.77, .80, .82)))
 
 
 def _hue_name(hue: float) -> str:
@@ -430,7 +429,7 @@ def world_label(world_seed: int, x: float = 0.0, y: float = 0.0, z: float = 0.0)
     weights = biome_weights(x, y, z, world_seed)
     ranked = sorted(weights.items(), key=lambda item: (-item[1], item[0]))
     here = "+".join(name for name, weight in ranked if weight >= 0.2) or ranked[0][0]
-    primary, secondary, accent = world_palette(world_seed)
+    primary, secondary, accent = world_palette(world_seed, x, y, z)
     hues = [_hue_name(primary), _hue_name(secondary)]
     if _hue_distance(accent, secondary) > 1e-6:
         hues.append(_hue_name(accent))
@@ -691,6 +690,75 @@ def keep_interior(position: Vec3, world_seed: int) -> bool:
     return _unit_float(world_seed, 0x5AACE, *group) >= removal
 
 
+def _form_rotation(rotation: Vec3) -> np.ndarray:
+    """Match the renderer's Rz @ Ry @ Rx transform for collision and placement."""
+    x, y, z = map(radians, rotation)
+    cx, cy, cz, sx, sy, sz = cos(x), cos(y), cos(z), sin(x), sin(y), sin(z)
+    return np.array([
+        [cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx],
+        [sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx],
+        [-sy, cy * sx, cy * cx],
+    ])
+
+
+def _companion_forms(cubes: list[WorldCube], coord: ChunkCoord, seed: int) -> tuple[WorldForm, ...]:
+    """Anchor B's forms beside existing structures, away from channel peaks.
+
+    Each companion stays inside its owning cell with enough margin for the
+    camera at every cell face. The original opening graph is unchanged.
+    """
+    forms = []
+    for cube in cubes:
+        parts = tuple(int(value * 8) for value in cube.position)
+        pick = _unit_float(seed, 0xADD, *parts)
+        share = .38 if cube.role == "mass" else .28
+        if pick >= share:
+            continue
+        channel = channel_weight(*cube.position, seed)
+        if channel >= .95 or pick >= share * (1.0 - .65 * channel):
+            continue
+        shape = _unit_float(seed, 0xC08BE, *parts)
+        if cube.role == "panel":
+            name = "weave" if shape < .36 else "rounded" if shape < .45 else "cube"
+        else:
+            name = ("cage" if shape < .25 else "ribs" if shape < .55 else
+                    "weave" if shape < .80 else "rounded" if shape < .90 else "cube")
+        if name == "cube":
+            continue
+        axis = int(np.argmin(cube.half_extents))
+        half = np.asarray(cube.half_extents) * (.65 if name == "rounded" else .90)
+        if name in ("weave", "ribs"):
+            half[axis] = max(half[axis], min(v for k, v in enumerate(half) if k != axis) * .4)
+            name = f"{name}{axis}"
+        elif name == "cage":
+            # A frame has a real opening wide enough for the camera.
+            half = np.maximum(half, 5.6)
+        rotation = _form_rotation(cube.rotation)
+        extent = np.abs(rotation) @ half
+        half *= min(1.0, (VOLUME_CELL * .5 - WALKER_RADIUS - 1.0) / float(extent.max()))
+        extent = np.abs(rotation) @ half
+        position = np.asarray(cube.position, dtype=float)
+        direction = -1.0 if pick < share * .5 else 1.0
+        position += rotation[:, axis] * direction * (cube.half_extents[axis] + half[axis] * .8)
+        # Source panels lie on cell boundaries. Clamp ownership to this chunk
+        # so streaming never leaves an addition stranded in its neighbour.
+        owner = tuple(min(coord[k] * CELLS_PER_CHUNK + CELLS_PER_CHUNK - 1,
+                          max(coord[k] * CELLS_PER_CHUNK, floor(cube.position[k] / VOLUME_CELL)))
+                      for k in range(3))
+        center = np.asarray(cell_center(owner))
+        limit = VOLUME_CELL * .5 - WALKER_RADIUS - 1.0 - extent
+        position = np.clip(position, center - limit, center + limit)
+        if channel_weight(*position, seed) >= .95:
+            continue
+        color = object_color(seed, cube.position, cube.role, cube.tone)
+        if name != "rounded":
+            color = tuple(channel * .5 + tint * .5 for channel, tint in zip(color, (.68, .86, .92)))
+        forms.append(WorldForm(name, tuple(position), tuple(half), cube.rotation, color))
+        if len(forms) == MAX_FORMS_PER_CHUNK:
+            break
+    return tuple(forms)
+
+
 @lru_cache(maxsize=MAX_ACTIVE_CHUNKS * 2)
 def generate_chunk(coord: ChunkCoord, world_seed: int) -> WorldChunk:
     """Generate one chunk independently of cache state or generation order.
@@ -730,6 +798,7 @@ def generate_chunk(coord: ChunkCoord, world_seed: int) -> WorldChunk:
             replace(cube, color=object_color(world_seed, cube.position, cube.role, cube.tone))
             for cube in cubes
         ),
+        forms=_companion_forms(cubes, coord, world_seed),
     )
 
 
@@ -737,7 +806,7 @@ def generate_chunk(coord: ChunkCoord, world_seed: int) -> WorldChunk:
 
 
 def chunk_colliders(chunk: WorldChunk) -> np.ndarray:
-    """Every cube of one chunk as a yaw-aligned box.
+    """Source cubes as yaw-aligned boxes, plus each added tube segment.
 
     Rows are (cx, cy, cz, cos_yaw, sin_yaw, half_x, half_y, half_z). Tilt is
     folded into the vertical half extent rather than modelled, so a tilted plate
@@ -759,7 +828,23 @@ def chunk_colliders(chunk: WorldChunk) -> np.ndarray:
         )
         for cube in chunk.objects
     ]
-    return np.asarray(rows, dtype=np.float64).reshape(-1, 8)
+    cubes = np.asarray(rows, dtype=np.float64).reshape(-1, 8)
+    if not chunk.forms:
+        return cubes
+    return np.concatenate([cubes, *(form_colliders(form) for form in chunk.forms)])
+
+
+def form_colliders(form: WorldForm) -> np.ndarray:
+    """Conservative bounds of individual bars, preserving the holes between them."""
+    bounds = form_bounds(form.mesh)
+    centers = (bounds[:, :3] + bounds[:, 3:]) * .5
+    halves = (bounds[:, 3:] - bounds[:, :3]) * .5
+    linear = _form_rotation(form.rotation) * np.asarray(form.half_extents)[None, :]
+    rows = np.zeros((len(bounds), 8), dtype=np.float64)
+    rows[:, :3] = centers @ linear.T + np.asarray(form.position)
+    rows[:, 3] = 1.0
+    rows[:, 5:] = halves @ np.abs(linear).T
+    return rows
 
 
 def _local_offsets(
@@ -897,36 +982,43 @@ def clear_distances(
     reach: float = _HEADING_RANGE,
     step: float = _HEADING_STEP,
 ) -> np.ndarray:
-    """Distance run clear along each direction before a form blocks it.
+    """Distance to the first occupied march sample along each direction.
 
-    Every direction and every march sample is tested against the local boxes in
-    one vectorised pass, which turns a spawn search from seconds into
-    milliseconds.
+    Intersect rays with the expanded boxes, then snap each interval to the same
+    sample grid as the flight probe. This avoids allocating one matrix for
+    every sample along every ray when open frames add many small colliders.
     """
-
     count = len(directions)
     steps = max(1, int(reach / step))
     rows = _rows_near(origin, colliders, reach + 32.0)
     if rows.shape[0] == 0:
         return np.full(count, reach)
-    offsets = (np.arange(1, steps + 1) * step)[None, :, None]
-    points = np.asarray(origin) + np.asarray(directions)[:, None, :] * offsets
-    flat = points.reshape(-1, 3)
-    dx = flat[:, 0, None] - rows[None, :, 0]
-    dz = flat[:, 2, None] - rows[None, :, 2]
-    local_x = dx * rows[:, 3] - dz * rows[:, 4]
-    local_z = dx * rows[:, 4] + dz * rows[:, 3]
-    local_y = flat[:, 1, None] - rows[None, :, 1]
-    hit = (
-        (
-            (np.abs(local_x) < rows[:, 5] + WALKER_RADIUS)
-            & (np.abs(local_y) < rows[:, 6] + WALKER_RADIUS)
-            & (np.abs(local_z) < rows[:, 7] + WALKER_RADIUS)
-        )
-        .any(axis=1)
-        .reshape(count, steps)
+    directions_array = np.asarray(directions)
+    local_origin = _local_offsets(*origin, rows)
+    local_direction = (
+        directions_array[:, 0, None] * rows[:, 3] - directions_array[:, 2, None] * rows[:, 4],
+        np.broadcast_to(directions_array[:, 1, None], (count, len(rows))),
+        directions_array[:, 0, None] * rows[:, 4] + directions_array[:, 2, None] * rows[:, 3],
     )
-    return np.where(hit.any(axis=1), hit.argmax(axis=1), steps) * step
+    entry = np.full((count, len(rows)), -np.inf)
+    leave = np.full_like(entry, np.inf)
+    for axis, velocity in enumerate(local_direction):
+        half = rows[:, 5 + axis] + WALKER_RADIUS
+        offset = local_origin[axis]
+        moving = np.abs(velocity) > 1e-12
+        low = np.full_like(entry, -np.inf)
+        high = np.full_like(entry, np.inf)
+        np.divide(-half - offset, velocity, out=low, where=moving)
+        np.divide(half - offset, velocity, out=high, where=moving)
+        axis_entry, axis_leave = np.minimum(low, high), np.maximum(low, high)
+        parallel_outside = ~moving & (np.abs(offset) >= half)
+        axis_entry[parallel_outside] = np.inf
+        axis_leave[parallel_outside] = -np.inf
+        np.maximum(entry, axis_entry, out=entry)
+        np.minimum(leave, axis_leave, out=leave)
+    first_sample = np.maximum(1., np.floor(entry / step) + 1.)
+    hit = (first_sample <= steps) & (first_sample * step < leave)
+    return np.where(hit, first_sample - 1., steps).min(axis=1) * step
 
 
 def open_heading(

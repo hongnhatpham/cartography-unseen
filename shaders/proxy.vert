@@ -24,7 +24,7 @@ void main() {
     );
     vec4 world = model * vec4(in_position, 1.0);
     world_position = world.xyz;
-    world_normal = normalize(mat3(model) * in_normal);
+    world_normal = normalize(transpose(inverse(mat3(model))) * in_normal);
     material_color = instance_color;
     gl_Position = projection * view * world;
 }

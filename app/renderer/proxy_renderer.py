@@ -16,6 +16,8 @@ except ImportError as exc:  # pragma: no cover - rendered as a startup error by 
     ) from exc
 
 from app.renderer.camera import Camera
+from app.config import DEFAULT_FOG_DISTANCE
+from app.renderer.form_meshes import form_meshes
 from app.renderer.world import (
     ACTIVE_CHUNK_RADIUS,
     CHUNK_SIZE,
@@ -23,15 +25,14 @@ from app.renderer.world import (
     ChunkCoord,
     WorldChunk,
     WorldCube,
+    WorldForm,
     chunk_colliders,
     open_heading,
     resolve_collisions,
     generate_chunk,
-    nadir_color,
+    atmosphere_colors,
     plan_chunk_cache,
-    sky_color,
     SPAWN_PITCHES,
-    zenith_color,
     spawn_pose,
     world_label,
     world_to_chunk,
@@ -68,6 +69,7 @@ class ProxyRenderer:
         window_size: tuple[int, int] = (640, 384),
         display_monitor: int = 0,
         world_seed: int = 12345,
+        fog_distance: float = DEFAULT_FOG_DISTANCE,
     ) -> None:
         pygame.init()
         pygame.font.init()
@@ -98,6 +100,7 @@ class ProxyRenderer:
         self.ctx = moderngl.create_context(require=330)
         self.ctx.enable(moderngl.DEPTH_TEST)
         self.project_root = project_root
+        self.fog_distance = fog_distance
         if isinstance(resolution, int):
             resolution = (resolution, resolution)
         self.render_width, self.render_height = resolution
@@ -123,7 +126,7 @@ class ProxyRenderer:
             fragment_shader=(shader_root / "reproject.frag").read_text(encoding="utf-8"),
         )
 
-        meshes = {"cube": _cube_vertices()}
+        meshes = {"cube": _cube_vertices(), **form_meshes()}
         self.mesh_buffers = {name: self.ctx.buffer(vertices.tobytes()) for name, vertices in meshes.items()}
         self.instance_buffers = {
             name: self.ctx.buffer(reserve=19 * np.dtype("f4").itemsize)
@@ -204,9 +207,13 @@ class ProxyRenderer:
         self.reproject_ms = 0.0
 
         self.world_seed = world_seed
-        self.sky_color = sky_color(world_seed)
+        self.sky_color, self.zenith_color, self.nadir_color = atmosphere_colors(world_seed)
         self._chunks: dict[ChunkCoord, WorldChunk] = {}
         self._chunk_instances: dict[ChunkCoord, np.ndarray] = {}
+        self._chunk_form_instances: dict[ChunkCoord, dict[str, np.ndarray]] = {}
+        self._form_instances: dict[str, np.ndarray] = {}
+        self._form_bounds: dict[str, np.ndarray] = {}
+        self._form_view_key: tuple | None = None
         self._chunk_colliders: dict[ChunkCoord, np.ndarray] = {}
         self._stream_center: ChunkCoord | None = None
         self._render_origin = np.zeros(3, dtype=np.float64)
@@ -287,7 +294,7 @@ class ProxyRenderer:
 
     @staticmethod
     def _pack_instances(
-        objects: tuple[WorldCube, ...], origin: np.ndarray | None = None
+        objects: tuple[WorldCube, ...] | tuple[WorldForm, ...], origin: np.ndarray | None = None
     ) -> np.ndarray:
         """Pack column-major transforms and colors for one instanced draw.
 
@@ -352,6 +359,7 @@ class ProxyRenderer:
         for coord in plan.evict:
             del self._chunks[coord]
             del self._chunk_instances[coord]
+            self._chunk_form_instances.pop(coord, None)
             self._chunk_colliders.pop(coord, None)
         budget = len(plan.load) if not self._chunks else CHUNK_LOAD_BUDGET
         loaded = plan.load[:budget]
@@ -362,6 +370,13 @@ class ProxyRenderer:
                 chunk.objects, origin=np.asarray(coord, dtype=np.float64) * CHUNK_SIZE
             )
             self._chunk_colliders[coord] = chunk_colliders(chunk)
+            by_mesh: dict[str, list[WorldForm]] = {}
+            for form in chunk.forms:
+                by_mesh.setdefault(form.mesh, []).append(form)
+            self._chunk_form_instances[coord] = {
+                mesh: self._pack_instances(tuple(forms), origin=np.asarray(coord, dtype=np.float64) * CHUNK_SIZE)
+                for mesh, forms in by_mesh.items()
+            }
 
         cube_buffer = self.instance_buffers["cube"]
         count = sum(len(part) for part in self._chunk_instances.values())
@@ -385,7 +400,67 @@ class ProxyRenderer:
             offset = 0 if rebuild else self._instance_counts["cube"] * 19 * 4
             cube_buffer.write(cube_data, offset=offset)
         self._instance_counts["cube"] = count
+        self._update_form_instances(coords, plan.center, rebuild)
         self._instance_buffer_revision += 1
+
+    def _update_form_instances(
+        self, coords: tuple[ChunkCoord, ...], center: ChunkCoord, rebuild: bool
+    ) -> None:
+        """Keep additive transforms in the same local origin as the cube buffer.
+
+        Chunk batches append during streaming; eviction and rebasing rebuild the
+        bounded CPU cache. Only the forms visible to a draw are sent to the GPU.
+        """
+        if rebuild:
+            self._form_instances.clear()
+            self._form_bounds.clear()
+        batches: dict[str, list[np.ndarray]] = {}
+        offsets: dict[str, list[tuple[int, int, int]]] = {}
+        for coord in coords:
+            for mesh, packed in self._chunk_form_instances[coord].items():
+                batches.setdefault(mesh, []).append(packed)
+                offsets.setdefault(mesh, []).append(tuple(coord[i] - center[i] for i in range(3)))
+        for mesh, parts in batches.items():
+            packed = np.concatenate(parts, axis=0)
+            translation = np.asarray(offsets[mesh], dtype=np.float64) * CHUNK_SIZE
+            packed[:, 12:15] += np.repeat(translation, [len(part) for part in parts], axis=0)
+            if mesh in self._form_instances:
+                packed = np.concatenate((self._form_instances[mesh], packed), axis=0)
+            self._form_instances[mesh] = packed
+            # Rotation preserves the norm of the scaled unit-box corner.
+            linear = packed[:, :12].reshape(-1, 3, 4)[:, :, :3]
+            radius = np.sqrt(np.sum(linear * linear, axis=(1, 2)))
+            self._form_bounds[mesh] = np.column_stack((packed[:, 12:15], radius))
+        self._form_view_key = None
+
+    @staticmethod
+    def _visible_forms(bounds: np.ndarray, clip: np.ndarray) -> np.ndarray:
+        """Conservative sphere/frustum test, including near-plane crossings."""
+        planes = np.asarray([clip[3] + sign * clip[axis] for axis in range(3) for sign in (-1, 1)])
+        planes /= np.linalg.norm(planes[:, :3], axis=1)[:, None]
+        return ((bounds[:, :3] @ planes[:, :3].T + planes[:, 3]) >= -bounds[:, 3, None]).all(axis=1)
+
+    def _prepare_form_draw(self, local_view: np.ndarray, projection: np.ndarray) -> None:
+        """Upload visible forms when the camera or streamed geometry changes."""
+        key = (local_view.tobytes(), projection.tobytes())
+        if key == self._form_view_key:
+            return
+        clip = projection.astype(np.float64) @ local_view
+        for mesh in self.mesh_vaos:
+            if mesh == "cube":
+                continue
+            packed = self._form_instances.get(mesh)
+            count = 0
+            if packed is not None:
+                selected = packed[self._visible_forms(self._form_bounds[mesh], clip)]
+                count = len(selected)
+                if count:
+                    buffer = self.instance_buffers[mesh]
+                    if selected.nbytes > buffer.size:
+                        buffer.orphan(max(selected.nbytes, buffer.size * 2))
+                    buffer.write(selected)
+            self._instance_counts[mesh] = count
+        self._form_view_key = key
 
     def _world_contains(self, position: np.ndarray) -> bool:
         return world_to_chunk(*position) in self._chunks
@@ -458,9 +533,13 @@ class ProxyRenderer:
             if world_seed is None
             else int(world_seed)
         )
-        self.sky_color = sky_color(self.world_seed)
+        self.sky_color, self.zenith_color, self.nadir_color = atmosphere_colors(self.world_seed)
         self._chunks.clear()
         self._chunk_instances.clear()
+        self._chunk_form_instances.clear()
+        self._form_instances.clear()
+        self._form_bounds.clear()
+        self._form_view_key = None
         self._chunk_colliders.clear()
         self._stream_center = None
         self._instance_counts = {name: 0 for name in self.mesh_buffers}
@@ -483,6 +562,9 @@ class ProxyRenderer:
         if manage_chunks:
             self._update_world(camera.position)
         snapshot = camera.snapshot(aspect=self.render_width / self.render_height)
+        self.sky_color, self.zenith_color, self.nadir_color = atmosphere_colors(
+            self.world_seed, *camera.position
+        )
         self.proxy_fbo.use()
         self.ctx.viewport = (0, 0, self.render_width, self.render_height)
         self.ctx.enable(moderngl.DEPTH_TEST)
@@ -492,13 +574,14 @@ class ProxyRenderer:
         self.proxy_fbo.clear(*self.sky_color, 1.0, depth=1.0)
         self._draw_sky(camera)
         local_view = self._local_view(snapshot.view_matrix)
+        self._prepare_form_draw(local_view, snapshot.projection_matrix)
         self.proxy_program["view"].write(local_view.T.astype("f4").tobytes())
         self.proxy_program["projection"].write(snapshot.projection_matrix.T.astype("f4").tobytes())
         self.proxy_program["camera_position"].value = tuple(camera.position - self._render_origin)
-        self.proxy_program["pattern_origin"].value = tuple(np.remainder(self._render_origin, 10.0))
         self.proxy_program["fog_color"].value = self.sky_color
-        self.proxy_program["zenith_color"].value = zenith_color(self.world_seed)
-        self.proxy_program["nadir_color"].value = nadir_color(self.world_seed)
+        self.proxy_program["fog_distance"].value = self.fog_distance
+        self.proxy_program["zenith_color"].value = self.zenith_color
+        self.proxy_program["nadir_color"].value = self.nadir_color
         for mesh, count in self._instance_counts.items():
             if count:
                 self.mesh_vaos[mesh].render(instances=count)
@@ -527,8 +610,8 @@ class ProxyRenderer:
         self.sky_program["tan_half_fov"].value = float(tan(radians(camera.fov) * 0.5))
         self.sky_program["aspect"].value = self.render_width / self.render_height
         self.sky_program["fog_color"].value = self.sky_color
-        self.sky_program["zenith_color"].value = zenith_color(self.world_seed)
-        self.sky_program["nadir_color"].value = nadir_color(self.world_seed)
+        self.sky_program["zenith_color"].value = self.zenith_color
+        self.sky_program["nadir_color"].value = self.nadir_color
         self.sky_vao.render()
         self.ctx.enable(moderngl.DEPTH_TEST)
 
@@ -836,6 +919,7 @@ class ProxyRenderer:
             *self.mesh_buffers.values(),
             self.quad_vao,
             self.reproject_vao,
+            self.sky_vao,
             self.quad_buffer,
             self.proxy_fbo,
             self.reproject_fbo,
@@ -849,6 +933,7 @@ class ProxyRenderer:
             self.proxy_program,
             self.screen_program,
             self.reproject_program,
+            self.sky_program,
         )
         for resource in resources:
             resource.release()

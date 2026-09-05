@@ -29,6 +29,9 @@ def make_renderer():
     r.world_seed = 934943880
     r._chunks = {}
     r._chunk_instances = {}
+    r._chunk_form_instances = {}
+    r._form_instances = {}
+    r._form_bounds = {}
     r._chunk_colliders = {}
     r._stream_center = None
     r._render_origin = np.zeros(3, dtype=np.float64)
@@ -47,6 +50,15 @@ def assert_complete_geometry(r):
         part[:, 12:15] += np.array([coord[i] - r._stream_center[i] for i in range(3)]) * 64
         expected.extend(row.tobytes() for row in part)
     assert sorted(row.tobytes() for row in actual) == sorted(expected)
+    expected_forms = {}
+    for coord, batches in r._chunk_form_instances.items():
+        for mesh, local in batches.items():
+            part = local.copy()
+            part[:, 12:15] += np.array([coord[i] - r._stream_center[i] for i in range(3)]) * 64
+            expected_forms.setdefault(mesh, []).extend(row.tobytes() for row in part)
+    assert set(r._form_instances) == set(expected_forms)
+    for mesh, rows in expected_forms.items():
+        assert sorted(row.tobytes() for row in r._form_instances[mesh]) == sorted(rows)
 
 
 def test_partial_load_uploads_only_new_geometry_and_preserves_retained_chunks():

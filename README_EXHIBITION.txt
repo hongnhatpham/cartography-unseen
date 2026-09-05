@@ -75,8 +75,10 @@ F7               Toggle the current prompt at the bottom at 30% opacity
 F8               Toggle feedback reprojection: the previous frame, aligned
                  to the camera, becomes the walk memory (slower, stickier)
 F9               Cycle prompt auto-advance: off, 12, 24, 48, 96 s. Advancing
-                 usually stays inside the current family and changes family
-                 about one time in three. Current tuning and palette stay fixed
+                 changes family and avoids the last three families when possible,
+                 sharing history with Space. Current tuning stays fixed
+H / J            Fog distance nearer / farther, 10 units per press. Nearer
+                 means more fog; farther means less. F1 shows the distance
 F12              Toggle idle flight. With no input for a minute the camera
                  flies on its own; any key or mouse movement takes over
 F10              Cycle generation resolution/aspect modes
@@ -201,16 +203,34 @@ without the full F1 diagnostics.
 
 HOW THE IMAGE IS MADE
 ---------------------
-The application renders a dense procedural field of instanced cubes: thick
-panels, reefs, lattice bars, shards, columns and overhangs. Openings connect
-in three dimensions, with less interior clutter along passages. Each world
-derives its palette and sky from a seed. The renderer keeps a finite window
-of nearby chunks and streams new ones as you move in any direction. There
-is no ceiling or bottom boundary. Returning to a location recreates the
-same geometry. Fog hides the streaming edges.
+Fog distance controls where structures fully fade into the atmosphere. The
+default is 196 world units, matching the original fog, with a range of 40–300.
+H brings the fog closer to soften distant colors; J pushes it farther away.
+The value saves automatically and survives prompt changes and restarts.
 
-That render is never shown. It is uploaded to the GPU and encoded by TAESD into
-a latent, and then used only as a steering signal for a continuous walk: the
+The application renders a dense procedural field of thick panels, reefs,
+lattice bars, shards, columns and overhangs. Curved wire sheets, ribbed arches,
+open cages and rounded solids add variety among the existing blocks. Openings
+connect in three dimensions, with less interior clutter along passages. Each
+world derives its palette and sky from a seed, with stronger regional color
+across surfaces and the atmosphere. The surface checker texture is removed;
+light and dark panels still give the AI large value breaks and depth cues.
+The renderer keeps a finite window of nearby chunks and streams new ones
+as you move in any direction. There is no ceiling or bottom boundary.
+Returning to a location recreates the same geometry and colors.
+Fog hides the streaming edges.
+
+The effective prompt keeps your original wording and adds the local landscape's
+hue pair. Curved and wire forms come from the proxy, without appending the same
+shape phrase to every prompt. As you travel, colors change with the landscape
+in any direction, including upward and downward. Color cues use the existing
+prompt interpolation and do not restart the automatic prompt timer.
+Your saved prompt, default prompt and library text stay unchanged. Resolution,
+CFG, guide strength and the other sampler settings remain as you set them.
+Space still changes only the prompt.
+
+That render is hidden in the normal AI view. TAESD encodes it on the GPU into
+a latent, which steers a continuous walk: the
 previous clean latent is re-anchored to it (so colour and contrast cannot
 drift away), blended toward it, noised at a breathing timestep,
 pushed through one SD-Turbo UNet step, and decoded by TAESD. The noise itself

@@ -322,7 +322,7 @@ def test_unknown_family_settings_are_rejected(tmp_path: Path) -> None:
         load_prompt_library(path)
 
 
-def test_space_leaves_the_current_family_and_auto_advance_usually_stays(tmp_path: Path) -> None:
+def test_space_and_auto_advance_leave_the_current_family(tmp_path: Path) -> None:
     """Space has to change the whole look, so it may never return a sibling."""
     entries = load_prompt_library(_library(tmp_path))
     alpha = entries[0]
@@ -336,11 +336,8 @@ def test_space_leaves_the_current_family_and_auto_advance_usually_stays(tmp_path
         choose_family_prompt(entries, ["Beta"]).family == "Alpha" for _ in range(20)
     )
     assert choose_family_prompt(entries, ["Alpha", "Beta"]) in entries
-    families = [advance_prompt(entries, alpha, jump_in_one_of=4).family for _ in range(200)]
-    assert "Alpha" in families and "Beta" in families
-    assert families.count("Beta") < families.count("Alpha")
-    # jump_in_one_of=1 is the always-jump case used to prove the branch exists.
-    assert advance_prompt(entries, alpha, jump_in_one_of=1).family == "Beta"
+    assert all(advance_prompt(entries, alpha).family == "Beta" for _ in range(20))
+    assert advance_prompt(entries, alpha, ["Beta", "Alpha"]).family == "Beta"
 
 
 def test_entry_for_prompt_falls_back_to_a_settings_free_custom_entry(tmp_path: Path) -> None:
@@ -375,7 +372,7 @@ def test_hue_words_rotate_through_the_world_accents() -> None:
 
 
 def test_compose_prompt_appends_the_world_hue_once() -> None:
-    """Hues trail the prompt so they tint rather than steer; never stacked."""
+    """Local hues follow the original prompt and never stack."""
     composed = compose_prompt(
         "a voxel landscape, corrupted 3D render", "shards+voxels / violet-lime-cyan"
     )
@@ -424,6 +421,9 @@ def test_renderer_chunk_cache_stays_bounded_and_regenerates_evicted_chunks() -> 
     renderer.world_seed = 12345
     renderer._chunks = {}
     renderer._chunk_instances = {}
+    renderer._chunk_form_instances = {}
+    renderer._form_instances = {}
+    renderer._form_bounds = {}
     renderer._chunk_colliders = {}
     renderer._stream_center = None
     renderer.instance_buffers = {"cube": FakeBuffer()}

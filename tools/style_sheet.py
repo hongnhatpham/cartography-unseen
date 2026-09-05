@@ -338,7 +338,7 @@ def run_grid(args: argparse.Namespace, config: AppConfig, out_dir: Path) -> dict
     tiles_dir.mkdir(parents=True, exist_ok=True)
 
     renderer = ProxyRenderer(
-        ROOT, resolution, fullscreen=False, window_size=resolution, world_seed=config.world_seed
+        ROOT, resolution, fullscreen=False, window_size=resolution, world_seed=config.world_seed, fog_distance=config.fog_distance
     )
     manifest: list[dict[str, object]] = []
     rows: list[tuple[str, list[Image.Image]]] = []
@@ -464,7 +464,7 @@ def run_walk(args: argparse.Namespace, config: AppConfig, out_dir: Path) -> dict
     frames_dir.mkdir(parents=True, exist_ok=True)
 
     renderer = ProxyRenderer(
-        ROOT, resolution, fullscreen=False, window_size=resolution, world_seed=world_seed
+        ROOT, resolution, fullscreen=False, window_size=resolution, world_seed=world_seed, fog_distance=config.fog_distance
     )
     images: list[Image.Image] = []
     started = perf_counter()
@@ -709,6 +709,7 @@ def run_pairs(args: argparse.Namespace, config: AppConfig, out_dir: Path) -> dic
         fullscreen=False,
         window_size=config.diffusion_size,
         world_seed=world_seed,
+        fog_distance=config.fog_distance,
     )
     scores: list[dict[str, float]] = []
     tiles: list[Image.Image] = []
@@ -811,7 +812,7 @@ def run_families(args: argparse.Namespace, config: AppConfig, out_dir: Path) -> 
     stride = max(1, args.family_frames // columns)
 
     renderer = ProxyRenderer(
-        ROOT, resolution, fullscreen=False, window_size=resolution, world_seed=world_seed
+        ROOT, resolution, fullscreen=False, window_size=resolution, world_seed=world_seed, fog_distance=config.fog_distance
     )
     rows: list[tuple[str, list[Image.Image]]] = []
     report: list[dict[str, object]] = []
@@ -889,7 +890,7 @@ def run_space_resets(
     clock_fps = args.walk_clock_fps if args.walk_clock_fps > 0 else 10.0
 
     renderer = ProxyRenderer(
-        ROOT, resolution, fullscreen=False, window_size=resolution, world_seed=config.world_seed
+        ROOT, resolution, fullscreen=False, window_size=resolution, world_seed=config.world_seed, fog_distance=config.fog_distance
     )
     rows: list[tuple[str, list[Image.Image]]] = []
     report: list[dict[str, object]] = []

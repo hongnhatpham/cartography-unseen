@@ -32,7 +32,7 @@ from app.renderer.world import (
     dominant_biome,
     face_open,
     generate_chunk,
-    is_accent_region,
+    object_color,
     is_blocked,
     legibility,
     nadir_color,
@@ -190,58 +190,49 @@ def test_chunks_hold_several_orders_of_object_size() -> None:
         assert max(max(cube.half_extents) for cube in cubes) > 12.0
 
 
-def test_object_hues_snap_to_the_world_palette() -> None:
+def test_objects_use_a_varied_chromatic_palette() -> None:
     for seed in SEEDS:
-        palette = world_palette(seed)
-        for cube in generate_chunk((2, 0, -3), seed).objects:
-            hue = rgb_to_hsv(*cube.color)[0]
-            assert min(abs(hue - option) for option in palette) < 1e-6
+        colors = [object_color(seed, (float(x), float(y), float(z)), "mass", 1.)
+                  for x in range(-400, 401, 80) for y in (-200, 0, 200) for z in (-200, 0, 200)]
+        hsv = np.array([rgb_to_hsv(*color) for color in colors])
+        assert np.isfinite(colors).all()
+        assert np.min(colors) >= 0 and np.max(colors) <= 1
+        assert np.median(hsv[:, 1]) > .5
+        assert len(set(np.floor(hsv[:, 0] * 12).astype(int))) >= 4
 
 
-def test_the_accent_is_a_contiguous_three_dimensional_vein() -> None:
-    """A per-cube coin flip does not survive diffusion; a whole wall does."""
-
+def test_colour_regions_hold_together_locally_and_change_during_travel() -> None:
     for seed in SEEDS:
         rng = Random(seed)
-        samples = []
-        for _ in range(600):
-            x, y, z = rng.uniform(-400, 400), rng.uniform(-260, 260), rng.uniform(-400, 400)
-            samples.append(
-                (
-                    is_accent_region(x, y, z, seed),
-                    is_accent_region(x + 12.0, y, z, seed),
-                    is_accent_region(x, y + 12.0, z, seed),
-                )
-            )
-        agreement = sum(
-            (here == beside) + (here == above) for here, beside, above in samples
-        ) / (2 * len(samples))
-        coverage = sum(here for here, _, _ in samples) / len(samples)
-        assert agreement > 0.85
-        assert 0.02 < coverage < 0.30
+        near, far = [], []
+        for _ in range(300):
+            point = tuple(rng.uniform(-500, 500) for _ in range(3))
+            color = np.array(object_color(seed, point, "mass", 1.))
+            near.append(np.linalg.norm(color - object_color(seed, (point[0] + 2, *point[1:]), "mass", 1.)))
+            far.append(np.linalg.norm(color - object_color(seed, (point[0] + 240, *point[1:]), "mass", 1.)))
+        assert np.mean(near) < np.mean(far) * .2
+        assert np.mean(far) > .25
 
 
-def test_objects_stay_legible_against_the_fog_they_share_a_hue_with() -> None:
+def test_dark_structures_keep_depth_cues_under_the_richer_colour() -> None:
     for seed in SEEDS:
-        sky_value = rgb_to_hsv(*sky_color(seed))[2]
-        primary = world_palette(seed)[0]
-        for cube in generate_chunk((0, 0, 0), seed).objects:
-            hue, _, value = rgb_to_hsv(*cube.color)
-            if abs(hue - primary) < 1e-6:
-                assert abs(value - sky_value) >= 0.24
+        for point in ((0., 0., 0.), (-160., 48., 192.), (32., -256., 16.)):
+            light = max(object_color(seed, point, "panel", 1.))
+            dark = max(object_color(seed, point, "panel", .1))
+            assert light > .6
+            assert dark < light * .3
 
 
-def test_the_background_darkens_below_and_saturates_above() -> None:
-    """No ground plane, so the only cue for which way is up is this gradient."""
-
+def test_background_keeps_a_dark_nadir_across_colour_regions() -> None:
     for seed in SEEDS:
-        fog_value = rgb_to_hsv(*sky_color(seed))[2]
-        zenith_hue, zenith_sat, zenith_value = rgb_to_hsv(*zenith_color(seed))
-        nadir_value = rgb_to_hsv(*nadir_color(seed))[2]
-        assert nadir_value < 0.2
-        assert zenith_value < fog_value - 0.2
-        assert zenith_sat > 0.4
-        assert abs(zenith_hue - world_palette(seed)[1]) < 1e-6
+        for position in ((64., 64., 64.), (-192., 320., 64.), (64., -448., 64.)):
+            horizon = sky_color(seed, *position)
+            zenith = zenith_color(seed, *position)
+            nadir = nadir_color(seed, *position)
+            assert rgb_to_hsv(*horizon)[1] > .5
+            assert rgb_to_hsv(*zenith)[1] > .5
+            assert max(nadir) < .2
+            assert max(nadir) < max(horizon) < max(zenith)
 
 
 def test_collision_pushes_out_along_the_shallowest_axis_in_three_dimensions() -> None:

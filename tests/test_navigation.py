@@ -50,6 +50,7 @@ def test_prompt_selection_preserves_live_experience(monkeypatch, tmp_path, trigg
     states = []
     poses = []
     images = []
+    fog_distances = []
     settings = []
     reseeds = []
     prompts = []
@@ -96,6 +97,8 @@ def test_prompt_selection_preserves_live_experience(monkeypatch, tmp_path, trigg
 
     def record_display(self, image, *args, **kwargs):
         images.append(image.copy())
+        if frame >= 0:
+            fog_distances.append(self.fog_distance)
         return display(self, image, *args, **kwargs)
 
     def record_overlay(*args, **kwargs):
@@ -107,7 +110,7 @@ def test_prompt_selection_preserves_live_experience(monkeypatch, tmp_path, trigg
         frame += 1
         keys = []
         if frame == 0:
-            keys = [pygame.K_c, pygame.K_l, pygame.K_y]
+            keys = [pygame.K_c, pygame.K_l, pygame.K_y, pygame.K_h, pygame.K_h, pygame.K_j]
         elif frame == 1 and view_key is not None:
             keys = [view_key]
         elif frame == 3 and trigger == "space":
@@ -129,6 +132,8 @@ def test_prompt_selection_preserves_live_experience(monkeypatch, tmp_path, trigg
     after, next_view, next_hue = states[4]
     assert before["prompt"] != chosen.prompt
     assert after == {**before, "prompt": chosen.prompt}
+    assert before["fog_distance"] == config["fog_distance"] - 10
+    assert all(distance == before["fog_distance"] for distance in fog_distances)
     assert settings and all(at == 0 for at, _ in settings)
     assert reseeds == []
     assert prompts == [(3, main.compose_prompt(chosen.prompt, poses[2][3], hue), config["negative_prompt"])]
