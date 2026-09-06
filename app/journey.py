@@ -4,12 +4,14 @@ from __future__ import annotations
 import base64
 from bisect import bisect_right
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from copy import deepcopy
 from datetime import datetime, timezone
 from html import escape
 import json
 import math
+import multiprocessing as mp
 import os
 from pathlib import Path
 import textwrap
@@ -20,6 +22,11 @@ import numpy as np
 from PIL import Image
 
 from app.types import GeneratedFrame
+from app.journey_updates import _merge_snapshot, _snapshot_delta
+
+
+# Each recorder owns one persistent process, which applies its live jobs in order.
+_worker_snapshot: dict | None = None
 
 
 def _utc() -> str:
@@ -38,11 +45,49 @@ def _atomic_json(path: Path, data: dict) -> None:
     temporary.replace(path)
 
 
+def _apply_update(delta: dict) -> dict:
+    global _worker_snapshot
+    _worker_snapshot = _merge_snapshot(_worker_snapshot, delta)
+    return _worker_snapshot
+
+
+def _save_checkpoint(directory: Path, delta: dict) -> None:
+    _atomic_json(directory / "manifest.json", _apply_update(delta))
+
+
+def _save_frame(directory: Path, descriptor: dict, pixels: np.ndarray, delta: dict) -> None:
+    """Publish the original PNG before publishing a manifest that references it."""
+    data = _apply_update(delta)
+    path = directory / descriptor["path"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".png.tmp")
+    with temporary.open("wb") as output:
+        Image.fromarray(pixels).save(output, format="PNG")
+        output.flush()
+        os.fsync(output.fileno())
+    temporary.replace(path)
+    _atomic_json(directory / "manifest.json", data)
+
+
+def _save_archive(directory: Path, data: dict) -> None:
+    """Finish portable exports in the same worker after all image writes."""
+    _atomic_json(directory / "manifest.json", data)
+    _export_svg(directory / "map.svg", data)
+    viewer = Path(__file__).resolve().parents[1] / "assets" / "journey-viewer.html"
+    if viewer.exists():
+        manifest = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
+        html = viewer.read_text(encoding="utf-8").replace(
+            "/* JOURNEY_MANIFEST */", f"window.JOURNEY_MANIFEST = {manifest};")
+        temporary = directory / "index.html.tmp"
+        temporary.write_text(html, encoding="utf-8")
+        temporary.replace(directory / "index.html")
+
+
 class JourneyRecorder:
     """One mutable journey, one bounded disk task, and immutable archive checkpoints.
 
     All public methods belong to the main thread. Image encoding and file writes
-    run on one worker. Only reset/close wait for durable storage. A failed task
+    run in one worker process. Only reset/close wait for durable storage. A failed task
     retains its original image and can be retried by reset/close.
     """
 
@@ -52,13 +97,18 @@ class JourneyRecorder:
         self.root = Path(root).resolve()
         self.world_seed = int(world_seed)
         self.capture_distance = float(capture_distance)
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="journey-archive")
+        self._executor = self._new_executor()
+        self._worker_broken = False
         self._future: Future | None = None
-        self._task: Callable | None = None
+        self._task: tuple[Callable, tuple, dict] | None = None
         self._error: str | None = None
         self._reported_error: str | None = None
         self._closed = False
         self._new_journey(None, None)
+
+    @staticmethod
+    def _new_executor() -> ProcessPoolExecutor:
+        return ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"))
 
     def _new_journey(self, timestamp: float | None, preceding: str | None) -> None:
         self.id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid4().hex[:12]
@@ -81,6 +131,7 @@ class JourneyRecorder:
         self._capture_distances: dict[str, float] = {}
         self._seen_sequences: set[int] = set()
         self._last_checkpoint = timestamp
+        self._last_sent_snapshot: dict | None = None
 
     @property
     def nonempty(self) -> bool:
@@ -123,7 +174,7 @@ class JourneyRecorder:
         self._check_pending()
         if self.nonempty and self._future is None and timestamp - self._last_checkpoint >= 5.0:
             data = self.snapshot()
-            self._submit(lambda: _atomic_json(self.archive_dir / "manifest.json", data))
+            self._submit(_save_checkpoint, self.archive_dir, snapshot=data)
             self._last_checkpoint = float(timestamp)
 
     def record_prompt(self, prompt: str, revision: int, trigger: str, position, rotation,
@@ -186,25 +237,20 @@ class JourneyRecorder:
         self._seen_sequences.add(frame.sequence)
         pixels = np.array(frame.image, copy=True)
         data = self.snapshot()
-        directory = self.archive_dir
-
-        def save() -> None:
-            path = directory / descriptor["path"]
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = path.with_suffix(".png.tmp")
-            with temporary.open("wb") as output:
-                Image.fromarray(pixels).save(output, format="PNG")
-                output.flush()
-                os.fsync(output.fileno())
-            temporary.replace(path)
-            _atomic_json(directory / "manifest.json", data)
-
-        self._submit(save)
+        self._submit(_save_frame, self.archive_dir, descriptor, pixels, snapshot=data)
         return True
 
-    def _submit(self, task: Callable) -> None:
-        self._task = task
-        self._future = self._executor.submit(task)
+    def _submit(self, task: Callable, *args, snapshot: dict) -> None:
+        # Retain the full immutable view for recovery, but only transfer new records.
+        delta = _snapshot_delta(self._last_sent_snapshot, snapshot)
+        self._task = task, args, snapshot
+        self._last_sent_snapshot = snapshot
+        try:
+            self._future = self._executor.submit(task, *args, delta)
+        except BrokenProcessPool as error:
+            # Keep the accepted image for an explicit retry even if submission fails.
+            self._future = Future()
+            self._future.set_exception(error)
 
     def _check_pending(self) -> None:
         if self._future is not None and self._future.done():
@@ -249,9 +295,23 @@ class JourneyRecorder:
 
     def flush(self) -> None:
         """Finish writes, retrying a previously failed task once per explicit call."""
+        failed = self._future.exception() if self._future is not None and self._future.done() else None
+        if self._worker_broken or isinstance(failed, BrokenProcessPool):
+            self._executor.shutdown(wait=True)
+            self._executor = self._new_executor()
+            self._last_sent_snapshot = None
+            self._worker_broken = False
         if self._future is not None:
-            if self._future.done() and self._future.exception() is not None:
-                self._future = self._executor.submit(self._task)
+            if failed is not None:
+                task, args, snapshot = self._task
+                # A failed job may already have merged its delta. Replace that state
+                # on every retry, including retries in a newly spawned worker.
+                try:
+                    self._future = self._executor.submit(task, *args, _snapshot_delta(None, snapshot))
+                except BrokenProcessPool:
+                    self._worker_broken = True
+                    raise
+                self._last_sent_snapshot = snapshot
             self._future.result()
             self._future = None
             self._task = None
@@ -266,20 +326,12 @@ class JourneyRecorder:
         data.pop("archive_dir", None)
         directory = self.archive_dir
 
-        def save() -> None:
-            _atomic_json(directory / "manifest.json", data)
-            _export_svg(directory / "map.svg", data)
-            viewer = Path(__file__).resolve().parents[1] / "assets" / "journey-viewer.html"
-            if viewer.exists():
-                manifest = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
-                html = viewer.read_text(encoding="utf-8").replace(
-                    "/* JOURNEY_MANIFEST */", f"window.JOURNEY_MANIFEST = {manifest};")
-                temporary = directory / "index.html.tmp"
-                temporary.write_text(html, encoding="utf-8")
-                temporary.replace(directory / "index.html")
-
         # Keep the old journey intact until every requested artifact is saved.
-        self._executor.submit(save).result()
+        try:
+            self._executor.submit(_save_archive, directory, data).result()
+        except BrokenProcessPool:
+            self._worker_broken = True
+            raise
         return directory
 
     def reset(self, timestamp: float) -> Path | None:

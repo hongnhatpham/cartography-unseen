@@ -145,17 +145,19 @@ def test_normal_cli_forwards_duration_and_thresholds_without_loading_app(monkeyp
     assert calls[0][3:] == (100, 250, True, None)
 
 
-@pytest.mark.parametrize("map_check", ["off", "active", "idle", "cycle", "recorder"])
+@pytest.mark.parametrize("map_check", ["off", "active", "idle", "cycle", "recorder", "soak", "soak-off"])
 def test_map_comparison_matches_controls_and_windows_without_gpu(monkeypatch, tmp_path, map_check):
     from tools import replay_performance
     from app import main
     from app.journey import JourneyRecorder
     from app.renderer.proxy_renderer import ProxyRenderer
     import pygame
+    map_enabled = map_check not in ("off", "soak-off")
 
     source = tmp_path / "source.json"
     source.write_text(json.dumps({"movement_speed": 8, "journey_map": True,
-                                  "fullscreen": True, "debug_overlay": True}), encoding="utf-8")
+                                  "fullscreen": True, "debug_overlay": True,
+                                  "prompt_auto_advance_seconds": 61}), encoding="utf-8")
     source_text = source.read_text()
     output = tmp_path / map_check
     renderer_arguments, archive_roots = [], []
@@ -174,21 +176,22 @@ def test_map_comparison_matches_controls_and_windows_without_gpu(monkeypatch, tm
         assert buttons == (False, False, False)
         events = renderer.poll_events()
         assert [(event.type, event.key) for event in events] == (
-            [(pygame.KEYDOWN, pygame.K_F1)] if map_check != "off" else [])
+            [(pygame.KEYDOWN, pygame.K_F1)] if map_enabled else [])
         assert renderer.poll_events() == []
-        if map_check != "off":
+        if map_enabled:
             JourneyRecorder(tmp_path / "real-journeys", 123)
         return 0
 
     monkeypatch.setattr(main, "run", application)
     assert replay_performance.run(600, output, source, 100, map_check=map_check) == 1
     summary = json.loads((output / "summary.json").read_text())
-    assert summary["error"] == ("" if map_check == "off" else
+    assert summary["error"] == ("" if not map_enabled else
                                 "Map child did not return rendering measurements")
     assert renderer_arguments == [{"window_size": (1920, 1080), "window_position": (0, 0)}]
-    assert archive_roots == ([output / "journeys"] if map_check != "off" else [])
+    assert archive_roots == ([output / "journeys"] if map_enabled else [])
     copied_config = json.loads((output / "config.json").read_text())
-    assert copied_config["journey_map"] is (map_check != "off")
+    assert copied_config["journey_map"] is map_enabled
+    assert copied_config["prompt_auto_advance_seconds"] == (61 if map_check in ("soak", "soak-off") else 0)
     assert not copied_config["fullscreen"]
     assert not copied_config["debug_overlay"]
     assert source.read_text() == source_text

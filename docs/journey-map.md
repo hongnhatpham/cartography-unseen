@@ -327,9 +327,11 @@ two-projector workload before choosing final update rates and texture budgets.
 
 ## Remaining tuning and future work
 
-- [Performance check, 6 September 2026](map-performance-20260906.md): fresh-map
-  overhead is small, but 1,200-image history still causes intermittent stalls.
-  Long-running exhibition performance is not yet signed off.
+- [Growing-map fixes, 6 September 2026](performance/map-history-20260906.md):
+  incremental archive transfers and cached geometry remove the observed history
+  slowdown. A 4,800-image stress test passed and a 52.59-minute growth run verified
+  final exports. Occasional rendering/AI gaps remain; longer unattended operation
+  has not been certified.
 
 - Tune the 12-unit capture spacing and ten-second grace period on the projectors.
 - Whether Space should also change procedural geometry, seeds or player position.

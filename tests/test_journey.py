@@ -1,6 +1,10 @@
 import base64
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from io import BytesIO
 import json
+import os
+import pickle
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -9,6 +13,14 @@ import pytest
 
 from app.journey import JourneyRecorder, _atomic_json
 from app.types import GeneratedFrame
+
+
+@pytest.fixture
+def archive_thread(monkeypatch):
+    """Keep local fault-injection patches visible inside the archive worker."""
+    from app import journey
+    monkeypatch.setattr(journey, "ProcessPoolExecutor",
+                        lambda **kwargs: ThreadPoolExecutor(max_workers=kwargs["max_workers"]))
 
 
 def test_manifest_invalid_update_preserves_previous_file_and_allows_retry(tmp_path):
@@ -116,7 +128,7 @@ def test_reset_archives_before_clear_and_rejects_old_frames(tmp_path):
     assert len(list(tmp_path.glob("*/manifest.json"))) == 2
 
 
-def test_save_failure_retains_journey_and_retry_archives_same_data(tmp_path, monkeypatch):
+def test_save_failure_retains_journey_and_retry_archives_same_data(tmp_path, monkeypatch, archive_thread):
     import app.journey as module
 
     recorder = JourneyRecorder(tmp_path, 42)
@@ -139,7 +151,7 @@ def test_save_failure_retains_journey_and_retry_archives_same_data(tmp_path, mon
     recorder.close()
 
 
-def test_failed_png_task_retains_original_and_retry_saves_it(tmp_path, monkeypatch):
+def test_failed_png_task_retains_original_and_retry_saves_it(tmp_path, monkeypatch, archive_thread):
     recorder = JourneyRecorder(tmp_path, 42)
     pose(recorder, (0, 0, 0), 0.)
     prompt(recorder)
@@ -159,6 +171,149 @@ def test_failed_png_task_retains_original_and_retry_saves_it(tmp_path, monkeypat
     archive = recorder.close()
     with Image.open(archive / "images/000001.png") as image:
         np.testing.assert_array_equal(np.asarray(image), frame(0., 1).image)
+
+
+def test_dead_archive_worker_retries_accepted_frame_without_losing_original(tmp_path):
+    recorder = JourneyRecorder(tmp_path, 42)
+    pose(recorder, (0, 0, 0), 0.)
+    prompt(recorder)
+    assert recorder.offer_frame(frame(0., 1))
+    recorder.flush()
+    # Kill the actual spawned worker between jobs, then submit through the real caller.
+    with pytest.raises(BrokenProcessPool):
+        recorder._executor.submit(os._exit, 1).result(timeout=15)
+    pose(recorder, (12, 0, 0), .2)
+    generated = frame(.2, 2, (12, 0, 0))
+    expected = generated.image.copy()
+    assert recorder.offer_frame(generated)
+    generated.image[:] = 255
+    assert recorder.poll() is not None
+    recorder.flush()
+    checkpoint = json.loads((recorder.archive_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert [image["id"] for image in checkpoint["images"]] == ["image-1", "image-2"]
+    archive = recorder.close()
+    manifest = json.loads((archive / "manifest.json").read_text(encoding="utf-8"))
+    assert [image["id"] for image in manifest["images"]] == ["image-1", "image-2"]
+    with Image.open(archive / "images/000002.png") as image:
+        np.testing.assert_array_equal(np.asarray(image), expected)
+
+
+def test_failed_final_export_then_worker_restart_preserves_resumed_live_history(tmp_path):
+    recorder = JourneyRecorder(tmp_path, 42)
+    pose(recorder, (0, 0, 0), 0.)
+    prompt(recorder)
+    assert recorder.offer_frame(frame(0., 1))
+    recorder.flush()
+    with pytest.raises(BrokenProcessPool):
+        recorder._executor.submit(os._exit, 1).result(timeout=15)
+    with pytest.raises(BrokenProcessPool):
+        recorder.reset(.1)
+
+    # The replacement worker saves the manifest but cannot complete the export.
+    blocked = recorder.archive_dir / "map.svg.tmp"
+    blocked.mkdir()
+    with pytest.raises(OSError):
+        recorder.reset(.2)
+    blocked.rmdir()
+    pose(recorder, (12, 0, 0), .3)
+    assert recorder.offer_frame(frame(.3, 2, (12, 0, 0)))
+    recorder.flush()
+    checkpoint = json.loads((recorder.archive_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert [image["id"] for image in checkpoint["images"]] == ["image-1", "image-2"]
+    assert checkpoint["segments"][0]["points"][0]["position"] == [0., 0., 0.]
+    assert "completion_reason" not in checkpoint
+    recorder.close()
+
+
+def test_failed_incremental_png_job_resets_worker_before_retry_without_duplicate_images(tmp_path):
+    recorder = JourneyRecorder(tmp_path, 42)
+    pose(recorder, (0, 0, 0), 0.)
+    prompt(recorder)
+    assert recorder.offer_frame(frame(0., 1))
+    recorder.flush()
+
+    # The second job merges an append delta before this real filesystem failure.
+    blocked = recorder.archive_dir / "images/000002.png.tmp"
+    blocked.mkdir()
+    pose(recorder, (12, 0, 0), .2)
+    assert recorder.offer_frame(frame(.2, 2, (12, 0, 0)))
+    with pytest.raises(OSError):
+        recorder.flush()
+    manifest_path = recorder.archive_dir / "manifest.json"
+    checkpoint = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert [image["id"] for image in checkpoint["images"]] == ["image-1"]
+
+    blocked.rmdir()
+    recorder.flush()
+    checkpoint = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert [image["id"] for image in checkpoint["images"]] == ["image-1", "image-2"]
+    with Image.open(recorder.archive_dir / "images/000002.png") as image:
+        np.testing.assert_array_equal(np.asarray(image), frame(.2, 2).image)
+
+    # Subsequent append deltas must continue from the successfully retried snapshot.
+    pose(recorder, (24, 0, 0), .4)
+    assert recorder.offer_frame(frame(.4, 3, (24, 0, 0)))
+    recorder.flush()
+    checkpoint = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert [image["id"] for image in checkpoint["images"]] == ["image-1", "image-2", "image-3"]
+    assert checkpoint["segments"][0]["points"][-1]["position"] == [24., 0., 0.]
+    recorder.close()
+
+
+def test_live_archive_submission_transfers_new_records_instead_of_accumulated_route(tmp_path, archive_thread):
+    recorder = JourneyRecorder(tmp_path, 42)
+    pose(recorder, (0, 0, 0), 0.)
+    prompt(recorder)
+    for index in range(1, 1001):
+        pose(recorder, (index, 0, 0), index / 1000)
+    assert recorder.offer_frame(frame(1., 1, (1000, 0, 0)))
+    recorder.flush()
+
+    original_submit = recorder._executor.submit
+    submitted = []
+
+    def capture_submit(task, *args):
+        submitted.append(args[-1])
+        return original_submit(task, *args)
+
+    recorder._executor.submit = capture_submit
+    pose(recorder, (1012, 0, 0), 1.1)
+    assert recorder.offer_frame(frame(1.1, 2, (1012, 0, 0)))
+    recorder.flush()
+    update = submitted[0]
+    assert update["reset"] is False
+    assert [image["id"] for image in update["images"]] == ["image-2"]
+    assert len(update["segments"][0]["points"]) == 2
+    assert len(pickle.dumps(update)) < 4096
+    checkpoint = json.loads((recorder.archive_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert len(checkpoint["segments"][0]["points"]) == 1002
+    recorder.close()
+
+
+def test_worker_dying_after_io_failure_can_retry_again_after_failed_submission(tmp_path):
+    recorder = JourneyRecorder(tmp_path, 42)
+    pose(recorder, (0, 0, 0), 0.)
+    prompt(recorder)
+    blocked = recorder.archive_dir / "images/000001.png.tmp"
+    blocked.mkdir(parents=True)
+    assert recorder.offer_frame(frame(0., 1))
+    with pytest.raises(OSError):
+        recorder.flush()
+
+    # The retained future reports the I/O error, so it does not reveal this later death.
+    with pytest.raises(BrokenProcessPool):
+        recorder._executor.submit(os._exit, 1).result(timeout=15)
+    blocked.rmdir()
+    with pytest.raises(BrokenProcessPool):
+        recorder.flush()
+
+    # A failed retry submission must allow the next explicit retry to replace the pool.
+    recorder.flush()
+    checkpoint = json.loads((recorder.archive_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert [image["id"] for image in checkpoint["images"]] == ["image-1"]
+    with Image.open(recorder.archive_dir / "images/000001.png") as image:
+        np.testing.assert_array_equal(np.asarray(image), frame(0., 1).image)
+    recorder.close()
 
 
 def test_svg_preserves_original_pixels_vectors_and_exact_prompt(tmp_path):

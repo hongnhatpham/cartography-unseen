@@ -50,10 +50,12 @@ keeps the application open for retry. Each archive lives in `journeys/<id>/`:
 If the browser blocks local image loading, use **Open archive** in the viewer
 and select that saved journey folder. The files stay on your computer.
 
-The recorder writes checkpoints during play. Existing archives are never
-overwritten by a new journey. The map viewer runs separately, caps drawing at
-30 FPS and bounds loaded textures. Closing only the map window leaves recording
-running in the main application.
+The recorder sends incremental checkpoints to a separate archive process during
+play. Existing archives are never overwritten by a new journey. The map viewer
+runs separately, reuses image geometry, caps drawing at 30 FPS and bounds loaded
+textures. Closing only the map window leaves recording running in the main
+application. The [growing-map investigation](docs/performance/map-history-20260906.md)
+records the fixes, timing comparisons and archive-integrity checks.
 
 Use `run.bat --no-map`, or set `journey_map` to false in `config.json`, for the
 single-window experience. Map enablement and capture/inactivity settings apply

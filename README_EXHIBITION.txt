@@ -82,6 +82,12 @@ Quitting also archives the current nonempty map. Failed saves keep the main
 window open with an error; resolve the disk problem and press Escape to retry.
 Closing only the map window leaves recording running until the main app exits.
 
+Live archive encoding runs in a separate process. Normal saves transfer new
+records to that process, keeping accumulated history off the gameplay thread.
+The map reuses image geometry as the journey grows. Original PNG quality,
+capture spacing and the saved route are preserved. A failed save retains its
+pending image and retries when you save/reset or quit again.
+
 Look in journeys/<id>/ for manifest.json, original images, map.svg and index.html.
 Open index.html for an interactive map with prompt history and original-image
 inspection. If the browser blocks local images, choose Open archive and select
@@ -456,6 +462,24 @@ timings.csv records every display interval, generation duration and new AI image
 publication interval. --max-ai-gap-ms 250 is checked by default, so repeating an
 old image cannot hide an AI freeze. The command fails on either threshold, an
 incomplete run, lost measurements or a generation resolution fallback.
+
+For a two-hour growing-map test with real AI images and automatic prompt
+changes, use a new output folder:
+
+  runtime\python\python.exe tools\long_map_session.py --seconds 7200 --output logs\performance\map-soak-new
+
+This simulates human traversal on the repeatable route. It records process
+memory, GPU telemetry, archive progress and both window timings. Keep other
+GPU workloads stopped. Disable your window manager separately if comparing
+against runs made without it. To stop early while preserving final exports,
+create an empty stop-requested file inside the run's output folder. An early
+stop is recorded as incomplete. Analyze a finished run with:
+
+  runtime\python\python.exe tools\summarize_long_map.py logs\performance\map-soak-new
+
+Use --interrupted only to recover available measurements after an abnormal
+termination. It does not certify the missing tail or final archive.
+
 For normal play with automatic prompts and your current diagnostics settings,
 use the lightweight recorder:
 

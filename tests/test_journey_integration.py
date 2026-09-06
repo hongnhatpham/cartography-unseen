@@ -1,5 +1,6 @@
 """Main-loop exhibition controls must preserve maps through reset and save errors."""
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import json
 import sys
 from types import SimpleNamespace
@@ -21,6 +22,9 @@ def key(value, *, repeat=False, released=False):
 
 @pytest.fixture
 def exhibition(monkeypatch, tmp_path):
+    # Local save-failure patches must run in this process alongside the scripted UI.
+    monkeypatch.setattr(archive, "ProcessPoolExecutor",
+                        lambda **kwargs: ThreadPoolExecutor(max_workers=kwargs["max_workers"]))
     source = main.project_root()
     config = json.loads((source / "config.json").read_text(encoding="utf-8"))
     config.update(journey_map=True, backend="proxy_passthrough", fullscreen=True,

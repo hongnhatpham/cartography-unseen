@@ -8,6 +8,7 @@ from queue import Empty, Full
 import time
 
 from app.map_idle import MapFade, title_surface
+from app.journey_updates import _merge_snapshot, _snapshot_delta
 
 
 class MapWindow:
@@ -72,46 +73,6 @@ class MapWindow:
             queue.close()
 
 
-def _snapshot_delta(previous: dict | None, snapshot: dict) -> dict:
-    """Only the last sampled point can change: snapshots add an unsampled live tail."""
-    reset = previous is None or previous.get("id") != snapshot.get("id")
-    prior = {} if reset else previous
-    old_segments = {segment["id"]: segment for segment in prior.get("segments", [])}
-    segments = []
-    for segment in snapshot.get("segments", []):
-        old = old_segments.get(segment["id"])
-        if old is not None and old.get("ended") is not None:
-            continue
-        offset = max(0, len(old["points"])-1) if old is not None else 0
-        segments.append({"segment": {key: value for key, value in segment.items() if key != "points"},
-                         "offset": offset, "points": segment["points"][offset:]})
-    return {"reset": reset,
-            "metadata": {key: value for key, value in snapshot.items()
-                         if key not in ("segments", "images", "prompts")},
-            "segments": segments, "images": snapshot.get("images", [])[len(prior.get("images", [])):],
-            "prompts": snapshot.get("prompts", [])}
-
-
-def _merge_snapshot(snapshot: dict | None, delta: dict) -> dict:
-    """Apply every queued delta, including while the map is black, in FIFO order."""
-    if snapshot is None or delta["reset"]:
-        snapshot = {"segments": [], "images": []}
-    snapshot.update(delta["metadata"])
-    snapshot["prompts"] = delta["prompts"]
-    segments = {segment["id"]: segment for segment in snapshot["segments"]}
-    for patch in delta["segments"]:
-        segment_id = patch["segment"]["id"]
-        segment = segments.get(segment_id)
-        if segment is None:
-            segment = {"points": []}
-            snapshot["segments"].append(segment)
-            segments[segment_id] = segment
-        segment.update(patch["segment"])
-        segment["points"][patch["offset"]:] = patch["points"]
-    snapshot["images"].extend(delta["images"])
-    return snapshot
-
-
 def image_corners(image: dict):
     """Plane centered at the capture pose, matching Camera's pitch/yaw convention."""
     import numpy as np
@@ -162,6 +123,10 @@ class _Scene:
         self.lines = []
         self.outlines = None
         self.planes = []
+        self._journey_id = None
+        self._image_count = 0
+        self._image_corners = {}
+        self._plane_ids = set()
         self.textures = {}
         self.retry = {}
         self.caption = None
@@ -188,22 +153,28 @@ class _Scene:
 
     def update(self, snapshot):
         import numpy as np
-        if snapshot.get("id") != self.snapshot.get("id"):
+        reset = snapshot.get("id") != self._journey_id
+        if reset:
+            self._journey_id = snapshot.get("id")
             for texture in self.textures.values():
                 texture.release()
             self.textures.clear()
             self.retry.clear()
             self.anchor = None
-        for buffer, vao, *_ in self.lines + self.planes:
+            for buffer, vao, _ in self.planes:
+                vao.release()
+                buffer.release()
+            self.planes = []
+            self._image_count = 0
+            self._image_corners.clear()
+            self._plane_ids.clear()
+            self.nearest = []
+            self.nearest_at = 0
+        for buffer, vao, *_ in self.lines:
             vao.release()
             buffer.release()
-        if self.outlines:
-            for resource in self.outlines:
-                resource.release()
-            self.outlines = None
-        self.lines, self.planes = [], []
+        self.lines = []
         self.snapshot = snapshot
-        self.nearest_at = 0
         self.caption_prompt = next((event for event in reversed(snapshot.get("prompts", []))
                                     if event.get("prompt") != event.get("previous_prompt")), None)
         key = (snapshot.get("id"), self.caption_prompt.get("id")) if self.caption_prompt else None
@@ -224,18 +195,43 @@ class _Scene:
         else:
             self.bounds = None
         all_images = snapshot.get("images", [])
+        # Image descriptors are immutable and append-only within a journey.
+        # Keep independent counts: the receiver merges deltas into this snapshot.
+        added_images = len(all_images) != self._image_count
+        for item in all_images[self._image_count:]:
+            self._image_corners[str(item["id"])] = image_corners(item)-self.anchor
+        self._image_count = len(all_images)
         selected = representative_images(all_images,
             (snapshot.get("current_pose") or {}).get("position", self.anchor))
         selected_ids = {str(item["id"]) for item in selected}
-        outlines = []
+        selection_changed = selected_ids != self._plane_ids
+        planes = {str(plane[2]["id"]): plane for plane in self.planes}
+        for key in planes.keys()-selected_ids:
+            buffer, vao, _ = planes.pop(key)
+            vao.release()
+            buffer.release()
+        self.planes = []
         for item in all_images:
-            corners = image_corners(item)-self.anchor
-            if str(item["id"]) in selected_ids:
-                self.planes.append((*self._geometry(corners, [[0,0],[1,0],[1,1],[0,1]]), item))
-            else:
-                outlines.extend(corners[[0,1,1,2,2,3,3,0]])
-        if outlines:
-            self.outlines = self._geometry(outlines)
+            key = str(item["id"])
+            if key in selected_ids:
+                plane = planes.get(key)
+                if plane is None:
+                    plane = (*self._geometry(self._image_corners[key],
+                              [[0,0],[1,0],[1,1],[0,1]]), item)
+                self.planes.append(plane)
+        if reset or added_images or selection_changed:
+            if self.outlines:
+                for resource in self.outlines:
+                    resource.release()
+                self.outlines = None
+            outlines = [self._image_corners[str(item["id"])] for item in all_images
+                        if str(item["id"]) not in selected_ids]
+            if outlines:
+                vertices = np.asarray(outlines)[:, [0,1,1,2,2,3,3,0]].reshape(-1, 3)
+                self.outlines = self._geometry(vertices)
+        if selection_changed:
+            self.nearest_at = 0
+        self._plane_ids = selected_ids
 
     def _load_textures(self, position):
         from PIL import Image

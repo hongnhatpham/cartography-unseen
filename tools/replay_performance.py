@@ -13,10 +13,12 @@ archives, requesting 1920x1080 windows with diagnostics closed. Verify actual
 window_size in run.json and size in map-metrics.json: a tiling window manager
 can override the request. The child timings measure CPU submission, not GPU
 completion. --map-check cycle releases W from seconds 20 to 40 for autowalk.
+--map-check soak/soak-off retains automatic prompt changes for long sessions.
 """
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from contextlib import ExitStack
 import csv
 import hashlib
@@ -147,6 +149,32 @@ class NoKeys:
         return iter(())
 
 
+def measured_archive_task(task_name, args, output):
+    """Importable worker probe; distinguish encoding CPU time from disk waits."""
+    from app import journey
+    from time import thread_time
+    task = getattr(journey, task_name)
+    original_json = journey._atomic_json
+    rows = []
+
+    def timed(function, name, *values):
+        before, cpu_before = perf_counter(), thread_time()
+        try:
+            return function(*values)
+        finally:
+            rows.append((name, before, perf_counter(), (thread_time()-cpu_before)*1000))
+
+    def atomic_json(*values):
+        return timed(original_json, "archive_json", *values)
+
+    try:
+        with patch.object(journey, "_atomic_json", atomic_json):
+            return timed(task, task_name, *args)
+    finally:
+        with Path(output).open("a", newline="", encoding="utf-8") as stream:
+            csv.writer(stream).writerows(rows)
+
+
 def measurement_config(config: dict, normal: bool = False):
     """Keep the source untouched; normal mode only shortens the idle-flight delay."""
     overrides = ({"autowalk_idle_seconds": 2.0} if normal else {
@@ -204,7 +232,10 @@ def run(seconds: float, output: Path, source: Path, threshold: float, max_ai_gap
     output.mkdir(parents=True, exist_ok=False)
     config = measurement_config(json.loads(source.read_text(encoding="utf-8")), normal)
     if map_check:
-        config.update(journey_map=map_check != "off", fullscreen=False, debug_overlay=False)
+        config.update(journey_map=map_check not in ("off", "soak-off"), fullscreen=False, debug_overlay=False)
+        if map_check in ("soak", "soak-off"):
+            config["prompt_auto_advance_seconds"] = json.loads(source.read_text(encoding="utf-8")).get(
+                "prompt_auto_advance_seconds", 24.0)
         if map_check == "cycle":
             config["autowalk_idle_seconds"] = 2.0
     config_path = output / "config.json"
@@ -216,6 +247,7 @@ def run(seconds: float, output: Path, source: Path, threshold: float, max_ai_gap
                     collector=("minimal publication/presentation/generation timestamps" if normal else
                                "publication/presentation/generation and coarse stage timings"),
                     launched=strftime("%Y-%m-%dT%H:%M:%S%z"))
+    metadata["archive_pickle_samples"] = []
     if map_check:
         metadata.update(map_check=map_check, main_window_size=[1920, 1080],
                         map_window_size=[1920, 1080],
@@ -240,6 +272,7 @@ def run(seconds: float, output: Path, source: Path, threshold: float, max_ai_gap
     launched = perf_counter()
     origin = None
     worker = None
+    recorder = None
     original_worker_init = worker_module.DiffusionWorker.__init__
     original_backend = worker_module.create_backend
     original_poll = ProxyRenderer.poll_events
@@ -248,7 +281,20 @@ def run(seconds: float, output: Path, source: Path, threshold: float, max_ai_gap
     original_hues = main.hue_words
     original_renderer_init = ProxyRenderer.__init__
     controls_closed = False
+    stop_check_at = 0.0
+    stop_requested = False
     initial_hues = []
+    gc_events = deque(maxlen=4096)
+    gc_started = None
+
+    def gc_event(phase, info):
+        nonlocal gc_started
+        if phase == "start":
+            gc_started = perf_counter()
+        elif gc_started is not None:
+            # A GC callback may run while Metrics.lock is held. Defer recording.
+            gc_events.append((gc_started, perf_counter()))
+            gc_started = None
 
     def worker_init(self, *args, **kwargs):
         nonlocal worker
@@ -257,25 +303,34 @@ def run(seconds: float, output: Path, source: Path, threshold: float, max_ai_gap
         original_publish = self.generated.publish
         def publish(frame):
             metrics.published(perf_counter())
+            metadata["measurement_started"] = metrics.started
             return original_publish(frame)
         self.generated.publish = publish
 
     def backend_factory(*args, **kwargs):
         backend = original_backend(*args, **kwargs)
         backend.generate = metrics.timed(backend.generate, "generate")
+        backend.set_prompt = metrics.timed(backend.set_prompt, "set_prompt")
         return backend
 
     def poll():
-        nonlocal controls_closed
+        nonlocal controls_closed, stop_check_at, stop_requested
         events = original_poll() if normal else metrics.timed(original_poll, "poll_events")()
         if not normal:
             events = [event for event in events if event.type == pygame.QUIT or
                       (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE)]
         now = perf_counter()
+        while gc_events:
+            metrics.record("python_gc", *gc_events.popleft())
+        if now >= stop_check_at:
+            stop_requested = (output / "stop-requested").exists()
+            stop_check_at = now+1
+        if stop_requested:
+            metadata["stop_reason"] = "requested through stop-requested file"
         if map_check and config["journey_map"] and not controls_closed:
             events.append(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_F1, mod=0))
             controls_closed = True
-        if ((metrics.started is not None and now - metrics.started >= seconds)
+        if (stop_requested or (metrics.started is not None and now - metrics.started >= seconds)
                 or now - launched > seconds + 300):
             metrics.ended = now
             events.append(pygame.event.Event(pygame.QUIT))
@@ -346,12 +401,30 @@ def run(seconds: float, output: Path, source: Path, threshold: float, max_ai_gap
                 for name in ("render_scene", "capture_conditioning", "_update_world"):
                     stack.enter_context(patch.object(ProxyRenderer, name, metrics.timed(getattr(ProxyRenderer, name), name)))
             if map_check:
-                from app import map_view
+                import gc
+                from multiprocessing.reduction import ForkingPickler
+                from app import journey, map_view
                 from app.journey import JourneyRecorder
                 from app.journey_session import JourneySession
+                gc.callbacks.append(gc_event)
+                stack.callback(gc.callbacks.remove, gc_event)
+                original_dumps = ForkingPickler.dumps
+                def pickle_dump(cls, value, protocol=None):
+                    if type(value).__name__ != "_CallItem":
+                        return original_dumps(value, protocol)
+                    before = perf_counter()
+                    result = original_dumps(value, protocol)
+                    end = perf_counter()
+                    metrics.record("archive_pickle", before, end)
+                    if metrics.started is not None:
+                        metadata["archive_pickle_samples"].append((end-metrics.started, len(result), (end-before)*1000))
+                    return result
+                stack.enter_context(patch.object(ForkingPickler, "dumps", classmethod(pickle_dump)))
                 original_recorder_init = JourneyRecorder.__init__
                 def recorder_init(self, root, *args, **kwargs):
+                    nonlocal recorder
                     original_recorder_init(self, output / "journeys", *args, **kwargs)
+                    recorder = self
                 stack.enter_context(patch.object(ProxyRenderer, "__init__", renderer_init))
                 stack.enter_context(patch.object(ProxyRenderer, "read_input", map_inputs))
                 stack.enter_context(patch.object(JourneyRecorder, "__init__", recorder_init))
@@ -361,8 +434,24 @@ def run(seconds: float, output: Path, source: Path, threshold: float, max_ai_gap
                 stack.enter_context(patch.object(map_view, "_run", measured_map_run))
                 stack.enter_context(patch.object(JourneySession, "observe",
                     metrics.timed(JourneySession.observe, "journey_observe")))
+                stack.enter_context(patch.object(JourneyRecorder, "snapshot",
+                    metrics.timed(JourneyRecorder.snapshot, "journey_snapshot")))
                 stack.enter_context(patch.object(JourneySession, "offer_frame",
                     metrics.timed(JourneySession.offer_frame, "journey_offer_frame")))
+                if hasattr(JourneyRecorder, "_new_executor"):
+                    original_executor = JourneyRecorder._new_executor
+                    def archive_executor():
+                        executor = original_executor()
+                        submit = executor.submit
+                        def measured_submit(task, *args):
+                            return submit(measured_archive_task, task.__name__, args,
+                                          str(output / "archive-timings.csv"))
+                        executor.submit = measured_submit
+                        return executor
+                    stack.enter_context(patch.object(JourneyRecorder, "_new_executor", staticmethod(archive_executor)))
+                else:
+                    stack.enter_context(patch.object(journey, "_atomic_json",
+                        metrics.timed(journey._atomic_json, "archive_json")))
             code = main.run()
     except BaseException:
         error = traceback.format_exc()
@@ -375,6 +464,20 @@ def run(seconds: float, output: Path, source: Path, threshold: float, max_ai_gap
             if status.error or status.resolution_fallbacks:
                 error = error or str(status)
         if map_check and config["journey_map"]:
+            if recorder is not None and getattr(recorder, "nonempty", False):
+                manifest_path = recorder.archive_dir / "manifest.json"
+                if not manifest_path.exists():
+                    error = error or "Journey manifest was not saved"
+                else:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    images = manifest.get("images", [])
+                    metadata["archive_images"] = len(images)
+                    if (manifest.get("completion_reason") != "quit" or
+                            len(images) != len(recorder._data["images"]) or
+                            not (recorder.archive_dir / "map.svg").is_file() or
+                            not (recorder.archive_dir / "index.html").is_file() or
+                            any(not (recorder.archive_dir / item["path"]).is_file() for item in images)):
+                        error = error or "Journey final export is incomplete"
             map_metrics = output / "map-metrics.json"
             if not map_metrics.exists():
                 error = error or "Map child did not return rendering measurements"
@@ -398,7 +501,7 @@ def cli():
     parser.add_argument("--seconds", type=float, default=120)
     parser.add_argument("--normal", action="store_true",
                         help="measure normal play/settings with idle flight after two seconds; no synthetic route")
-    parser.add_argument("--map-check", choices=("off", "active", "idle", "cycle", "recorder"),
+    parser.add_argument("--map-check", choices=("off", "active", "idle", "cycle", "recorder", "soak", "soak-off"),
                         help="matched map check; recorder keeps archives/IPC but draws only the cached title")
     parser.add_argument("--max-stall-ms", type=float, default=100)
     parser.add_argument("--max-ai-gap-ms", type=float, default=250,
