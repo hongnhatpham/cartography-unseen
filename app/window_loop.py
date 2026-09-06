@@ -17,6 +17,8 @@ from typing import Callable, Any
 
 import pygame
 
+from app.window_placement import WindowPlacement
+
 
 class WindowLoop:
     active: WindowLoop | None = None
@@ -70,8 +72,7 @@ class WindowLoop:
             pointer = ctypes.c_void_p
             self._make_current = self._api("SDL_GL_MakeCurrent", ctypes.c_int, pointer, pointer)
             self._get_error = self._api("SDL_GetError", ctypes.c_char_p)
-            self._set_fullscreen = self._api("SDL_SetWindowFullscreen", ctypes.c_int, pointer, ctypes.c_uint)
-            self._get_flags = self._api("SDL_GetWindowFlags", ctypes.c_uint, pointer)
+            self._placement = WindowPlacement()
             self.window = self._api("SDL_GL_GetCurrentWindow", pointer)()
             self.context = self._api("SDL_GL_GetCurrentContext", pointer)()
             if not self.window or not self.context:
@@ -188,16 +189,19 @@ class WindowLoop:
             self._motion = (0, 0)
         return result
 
-    def toggle_fullscreen(self):
-        def toggle():
-            fullscreen = bool(self._get_flags(self.window) & 1)
-            # SDL fullscreen desktop preserves the existing GL context. The
-            # pygame wrapper additionally makes GL current on the wrong thread.
-            if self._set_fullscreen(self.window, 0 if fullscreen else 0x1001) != 0:
-                raise RuntimeError(self._get_error().decode("utf-8", errors="replace"))
+    @property
+    def is_fullscreen(self):
+        return self._placement.is_fullscreen
+
+    def set_fullscreen(self, enabled):
+        def change():
+            fullscreen = self._placement.set_fullscreen(enabled)
             self.size = pygame.display.get_window_size()
-            return not fullscreen
-        return self.call(toggle)
+            return fullscreen
+        return self.call(change)
+
+    def toggle_fullscreen(self):
+        return self.set_fullscreen(not self.is_fullscreen)
 
     def close(self):
         with self._lock:

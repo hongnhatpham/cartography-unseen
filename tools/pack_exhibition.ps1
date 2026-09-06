@@ -42,6 +42,7 @@ $reportTarget = Join-Path $Target "docs\performance"
 New-Item -ItemType Directory -Path $reportTarget -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $Root "docs\performance\window-input-stutter-20260905.md") -Destination $reportTarget
 Copy-Item -LiteralPath (Join-Path $Root "docs\performance\inference-freezes-20260905.md") -Destination $reportTarget
+Copy-Item -LiteralPath (Join-Path $Root "docs\journey-map.md") -Destination (Join-Path $Target "docs")
 New-Item -ItemType Directory -Path `
     (Join-Path $Target "cache"), `
     (Join-Path $Target "logs"), `

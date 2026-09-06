@@ -44,7 +44,7 @@ def test_main_idle_controls_cover_both_presentations(monkeypatch, tmp_path, repr
     from app.renderer import proxy_renderer
 
     config = json.loads((main.project_root() / "config.json").read_text(encoding="utf-8"))
-    config.update(backend="proxy_passthrough", fullscreen=False, debug_overlay=False,
+    config.update(journey_map=False, backend="proxy_passthrough", fullscreen=False, debug_overlay=False,
                   reprojection=reprojection, prompt_caption=False, autowalk_idle_seconds=2,
                   prompt_auto_advance_seconds=3, random_seed_on_launch=False)
     path = tmp_path / "config.json"
@@ -70,6 +70,8 @@ def test_main_idle_controls_cover_both_presentations(monkeypatch, tmp_path, repr
             tick += 1
 
     class Renderer:
+        def set_operator_mode(self, enabled): pass
+
         def __init__(self, *args, **kwargs):
             self.sequence = 0
             self.reproject_ms = 0.

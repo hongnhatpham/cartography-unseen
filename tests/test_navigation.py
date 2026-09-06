@@ -26,7 +26,7 @@ def test_prompt_selection_preserves_live_experience(monkeypatch, tmp_path, trigg
     from app.types import GeneratedFrame
 
     config = json.loads((main.project_root() / "config.json").read_text(encoding="utf-8"))
-    config.update(backend="proxy_passthrough", fullscreen=False, debug_overlay=True,
+    config.update(journey_map=False, backend="proxy_passthrough", fullscreen=False, debug_overlay=True,
                   reprojection=False, random_seed_on_launch=False,
                   prompt_auto_advance_seconds=30 if trigger == "auto" else 0,
                   autowalk_idle_seconds=0)
@@ -168,7 +168,7 @@ def test_prompt_selection_preserves_live_experience(monkeypatch, tmp_path, trigg
 @pytest.mark.parametrize("idle", [False, True])
 def test_application_accepts_manual_and_idle_flight(monkeypatch, tmp_path, idle):
     config = json.loads((main.project_root() / "config.json").read_text(encoding="utf-8"))
-    config.update(backend="proxy_passthrough", fullscreen=False, debug_overlay=False,
+    config.update(journey_map=False, backend="proxy_passthrough", fullscreen=False, debug_overlay=False,
                   prompt_auto_advance_seconds=0, autowalk_idle_seconds=0.001 if idle else 0)
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config), encoding="utf-8")

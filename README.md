@@ -2,6 +2,64 @@
 
 Latent Space is a real-time Windows installation. You move freely through a dense procedural landscape of blocks, curved forms and open wire structures, and a diffusion model continuously rewrites what you see. The 3D render is never shown in the normal AI view: it is a steering signal for a continuous walk through latent space. Input and display run independently of AI generation. Depth reprojection is optional and remains disabled in the current exhibition settings.
 
+## Two-projector journey map
+
+The normal launch opens two movable windows: the first-person experience and
+the journey map. The F1 operator overlay starts open so the mouse is free.
+Drag each window by its title bar onto the intended screen, then press **F**
+to make both fullscreen on their respective screens. Press F again with the
+overlay open to restore their windowed positions. Close F1 to return mouse
+control to traversal. F works from either window while the overlay is open;
+F11 still toggles only the first-person window.
+
+The map follows the selected Image field design. It orbits the current player
+position, records human movement in three dimensions, and places generated
+images at their original camera positions and viewing angles. An initial view
+starts each human segment, then captures occur every `map_capture_distance`
+world units travelled, 12 by default. Turning in place does not capture more
+images. These clean generated frames retain their source resolution and omit
+display overlays, sharpening and optional display reprojection.
+
+After `map_idle_seconds` without movement or mouse look, 10 by default, the
+map crossfades over 1.2 seconds to a centered Cartography Unseen title in the
+same Space Grotesk SemiBold font as the first-person title. The idle screen
+credits Nhat (Hong) Pham, Agnieszka Kiejziewicz, Ricardo Arce and Kok Yoong Lim,
+with a contributor credit for Tom Nguyen and a QR code linking to
+[emergentplay.bynhat.com](https://emergentplay.bynhat.com).
+Automatic flight also starts this fade and stops path/image capture immediately.
+Returning fades the map back in over 0.6 seconds, smoothly reversing an unfinished
+transition. The player marker uses the actual current position, and recording
+starts a disconnected stroke. After the fade out, map scene rendering stops; the cached
+title screen has no continuous animation. Operator placement instructions can
+still appear when F1 is open. Prompt events retain exact text, timing, pose,
+trigger and the revision associated with each image, including changes while
+the map is idle.
+
+Space saves the current nonempty map before starting a new prompt and an empty
+map. Procedural geometry, player position and diffusion seed keep their existing
+behavior. Escape or closing the main window saves the final map. A failed save
+keeps the application open for retry. Each archive lives in `journeys/<id>/`:
+
+- `manifest.json` contains the route, image poses, prompt history and settings.
+- `images/` contains the original PNG images.
+- `map.svg` contains the full journey as vector paths with embedded bitmap images
+  and a prompt index. Bitmap detail remains limited by the source resolution.
+- `index.html` is an interactive viewer. Open it locally to orbit, pan, zoom and
+  inspect prompts and original images. Keep it with its manifest and images.
+
+If the browser blocks local image loading, use **Open archive** in the viewer
+and select that saved journey folder. The files stay on your computer.
+
+The recorder writes checkpoints during play. Existing archives are never
+overwritten by a new journey. The map viewer runs separately, caps drawing at
+30 FPS and bounds loaded textures. Closing only the map window leaves recording
+running in the main application.
+
+Use `run.bat --no-map`, or set `journey_map` to false in `config.json`, for the
+single-window experience. Map enablement and capture/inactivity settings apply
+at launch. The [journey map brief](docs/journey-map.md) records the decisions.
+Publishing selected archives on Emergent Play remains a separate step.
+
 ## One-click installation
 
 Requirements:
@@ -28,7 +86,7 @@ Open the F1 diagnostics overlay to unlock settings hotkeys. Closing it locks
 them immediately. Movement, mouse look, Space, Enter, Escape and F1 always work.
 Temporary loading or status panels do not unlock settings.
 
-After ten seconds without player input, the Cartography Unseen title fades
+In the first-person window, after ten seconds without player input, the title fades
 in at the upper left and movement instructions appear at the lower right.
 They use Emergent Play's Space Grotesk and IBM Plex Mono typography. The fade
 takes 1.2 seconds; keyboard or mouse input fades them out in 0.25 seconds.
@@ -46,11 +104,12 @@ fitting on smaller windows to preserve the gap between them.
 | Mouse | Look |
 | Shift | Fly faster |
 | Escape | Exit |
-| Space | New prompt and random tuning within the ranges below; keep world, viewpoint and diffusion seed |
+| Space | Save/reset the journey map, choose a new prompt and random tuning; keep world, viewpoint and diffusion seed |
 | Enter | Save the displayed AI image as a PNG in `screenshot/` |
 | Shift + R | New diffusion seed |
 | P | Edit prompt |
 | F1 | Diagnostics overlay |
+| F | Fullscreen both windows on their current screens, or restore placement; requires F1 open |
 | F2 | Proxy / generated AI view |
 | F3 | Normal / depth / edge diagnostics |
 | F4 | Freeze diffusion |

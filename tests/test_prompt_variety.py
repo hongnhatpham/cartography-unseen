@@ -15,7 +15,7 @@ def test_subject_changes_vary_tuning_while_travel_only_changes_color(monkeypatch
 
     entries = main.load_prompt_library(main.project_root() / "prompts.json")
     config = json.loads((main.project_root() / "config.json").read_text())
-    config.update(prompt=entries[0].prompt, backend="proxy_passthrough", fullscreen=False,
+    config.update(journey_map=False, prompt=entries[0].prompt, backend="proxy_passthrough", fullscreen=False,
                   debug_overlay=False, prompt_caption=False, reprojection=False,
                   prompt_auto_advance_seconds=24, prompt_walk_seconds=6,
                   autowalk_idle_seconds=0, random_seed_on_launch=False)
@@ -44,6 +44,8 @@ def test_subject_changes_vary_tuning_while_travel_only_changes_color(monkeypatch
             tick += 1
 
     class Renderer:
+        def set_operator_mode(self, enabled): pass
+
         def __init__(self, *args, **kwargs):
             self.sequence = 0
             self.reproject_ms = 0
@@ -64,6 +66,8 @@ def test_subject_changes_vary_tuning_while_travel_only_changes_color(monkeypatch
                 return [pygame.event.Event(pygame.QUIT)]
             if tick in (2, 6):
                 return [pygame.event.Event(pygame.KEYDOWN, key=pygame.K_SPACE, mod=0)]
+            if tick in (3, 7):
+                return [pygame.event.Event(pygame.KEYUP, key=pygame.K_SPACE, mod=0)]
             return []
 
         def world_label(self):

@@ -128,6 +128,10 @@ class AppConfig:
     # maximum inside the streamed window so distant chunk edges stay hidden.
     fog_distance: float = DEFAULT_FOG_DISTANCE
     player_trail: bool = True
+    # Separate projector map. Older configurations keep their single window.
+    journey_map: bool = False
+    map_capture_distance: float = 12.0
+    map_idle_seconds: float = 10.0
     target_display_fps: int = 60
     conditioning_fps: int = 15
     debug_overlay: bool = False
@@ -217,6 +221,12 @@ class AppConfig:
             raise RuntimeError("movement_speed must be positive")
         if self.autowalk_idle_seconds < 0.0:
             raise RuntimeError("autowalk_idle_seconds must be zero or greater")
+        if not isinstance(self.journey_map, bool):
+            raise RuntimeError("journey_map must be true or false")
+        if not 0.1 <= self.map_capture_distance <= 10000.0:
+            raise RuntimeError("map_capture_distance must be between 0.1 and 10000")
+        if not 0.0 <= self.map_idle_seconds <= 300.0:
+            raise RuntimeError("map_idle_seconds must be between 0 and 300")
 
     def backend_dict(self, project_root: Path) -> dict[str, Any]:
         """Full settings dict handed to the backend, with model paths resolved."""

@@ -41,13 +41,12 @@ def native(monkeypatch):
         SDL_GL_MakeCurrent=FakeFunction(lambda window, context: calls.append(
             ("context", threading.get_ident(), context)) or 0),
         SDL_GetError=FakeFunction(lambda: b"fake error"),
-        SDL_SetWindowFullscreen=FakeFunction(lambda *_: 0),
-        SDL_GetWindowFlags=FakeFunction(lambda *_: 0),
         SDL_GL_GetCurrentWindow=FakeFunction(lambda: 123),
         SDL_GL_GetCurrentContext=FakeFunction(lambda: 456),
     )
     monkeypatch.setattr(window_loop, "pygame", fake)
     monkeypatch.setattr(window_loop.ctypes, "CDLL", lambda _: sdl)
+    monkeypatch.setattr(window_loop, "WindowPlacement", lambda: SimpleNamespace(is_fullscreen=False))
     return SimpleNamespace(calls=calls, fail_input=fail_input, pygame=fake)
 
 

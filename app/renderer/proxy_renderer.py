@@ -22,6 +22,7 @@ from app.renderer.form_meshes import form_meshes
 from app.renderer.idle_overlay import IdleOverlay
 from app.screenshots import ScreenshotWriter
 from app.window_loop import WindowLoop
+from app.window_placement import WindowPlacement
 from app.renderer.player_trail import PlayerTrail
 from app.renderer.trail_renderer import TrailRenderer
 from app.renderer.world import (
@@ -76,12 +77,16 @@ class ProxyRenderer:
         display_monitor: int = 0,
         world_seed: int = 12345,
         fog_distance: float = DEFAULT_FOG_DISTANCE,
+        window_position: tuple[int, int] | None = None,
     ) -> None:
         pygame.font.init()
-        create_window = lambda: self._create_window(window_size, fullscreen, display_monitor)
+        self._operator_mode = False
+        self._prompt_editing = False
+        create_window = lambda: self._create_window(window_size, fullscreen, display_monitor, window_position)
         self._window_loop = WindowLoop(create_window) if sys.platform == "win32" else None
         if self._window_loop is None:
             create_window()
+            self._placement = WindowPlacement()
         window_size = self._window_size()
 
         self.ctx = None
@@ -102,7 +107,7 @@ class ProxyRenderer:
             raise
 
     @staticmethod
-    def _create_window(window_size, fullscreen, display_monitor):
+    def _create_window(window_size, fullscreen, display_monitor, window_position=None):
         pygame.display.init()
         pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
         pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
@@ -118,6 +123,9 @@ class ProxyRenderer:
         # Create a real windowed mode first so SDL remembers a useful restore
         # size when an app launched fullscreen later receives F11.
         pygame.display.set_mode(window_size, flags, display=display_monitor, vsync=0)
+        if window_position is not None:
+            from pygame._sdl2 import Window
+            Window.from_display_module().position = window_position
         if fullscreen:
             result = pygame.display.toggle_fullscreen()
             if result < 0:
@@ -268,38 +276,54 @@ class ProxyRenderer:
         return self._window_loop.call(function) if self._window_loop else function()
 
     def set_prompt_editing(self, editing: bool):
+        self._prompt_editing = editing
         def change():
             if editing:
                 pygame.key.start_text_input()
             else:
                 pygame.key.stop_text_input()
-            pygame.event.set_grab(not editing)
-            pygame.mouse.set_visible(editing)
+            released = editing or self._operator_mode
+            pygame.event.set_grab(not released)
+            pygame.mouse.set_visible(released)
             pygame.mouse.get_rel()
         self._window_call(change)
         if self._window_loop:
             self._window_loop.read_input()
+
+    def set_operator_mode(self, enabled: bool) -> None:
+        """Release the pointer while arranging windows or using the F1 panel."""
+        self._operator_mode = bool(enabled)
+        self.set_prompt_editing(self._prompt_editing)
 
     def read_input(self):
         if self._window_loop:
             return self._window_loop.read_input()
         return pygame.mouse.get_rel(), pygame.key.get_pressed(), pygame.mouse.get_pressed()
 
-    def toggle_fullscreen(self) -> bool:
-        """Switch display mode without rebuilding the active OpenGL context."""
+    def focus(self) -> None:
+        """Return input to traversal after closing controls on the map projector."""
+        def activate():
+            from pygame._sdl2 import Window
+            Window.from_display_module().focus()
+        self._window_call(activate)
+
+    @property
+    def is_fullscreen(self) -> bool:
+        placement = self._window_loop if self._window_loop else self._placement
+        return placement.is_fullscreen
+
+    def set_fullscreen(self, enabled: bool) -> bool:
+        """Fill the current monitor, preserving the window and its restore bounds."""
         if self._window_loop:
-            is_fullscreen = self._window_loop.toggle_fullscreen()
+            is_fullscreen = self._window_loop.set_fullscreen(enabled)
         else:
-            result = pygame.display.toggle_fullscreen()
-            if result < 0:
-                raise RuntimeError(f"SDL could not toggle fullscreen: {pygame.get_error()}")
-            is_fullscreen = bool(pygame.display.is_fullscreen())
-        if not is_fullscreen:
-            self.resize_window_to_render()
+            is_fullscreen = self._placement.set_fullscreen(enabled)
         self.window_size = self._window_size()
         self._last_overlay_update = 0.0
-        self.set_prompt_editing(False)
         return is_fullscreen
+
+    def toggle_fullscreen(self) -> bool:
+        return self.set_fullscreen(not self.is_fullscreen)
 
     def resize_window_to_render(self) -> None:
         """Match a windowed SDL window to the active generation dimensions."""

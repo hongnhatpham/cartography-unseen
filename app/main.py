@@ -59,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Latent Space realtime diffusion renderer")
     parser.add_argument("--debug", action="store_true", help="windowed mode with diagnostics")
     parser.add_argument("--windowed", action="store_true", help="disable fullscreen")
+    parser.add_argument("--no-map", action="store_true", help="run only the first-person window")
     parser.add_argument("--monitor", type=int, help="zero-based fullscreen monitor index")
     parser.add_argument("--list-monitors", action="store_true", help="print detected monitors and exit")
     parser.add_argument("--config", type=Path, help="alternate project-relative config file")
@@ -321,7 +322,11 @@ def _run() -> int:
         config.diffusion_resolution = args.resolution
     if args.monitor is not None:
         config.display_monitor = args.monitor
-    fullscreen = config.fullscreen and not (args.debug or args.windowed)
+    if args.no_map:
+        config.journey_map = False
+    # Exhibition windows open in placement mode; F applies fullscreen after
+    # the operator drags each title bar onto the intended projector.
+    fullscreen = config.fullscreen and not (args.debug or args.windowed or config.journey_map)
 
     try:
         import pygame
@@ -348,16 +353,18 @@ def _run() -> int:
 
     renderer: ProxyRenderer | None = None
     worker: DiffusionWorker | None = None
+    journey = None
     screenshots = ScreenshotWriter(root / "screenshot")
     try:
         renderer = ProxyRenderer(
             root,
             config.diffusion_size,
             fullscreen,
-            window_size=config.diffusion_size,
+            window_size=(960, 640) if config.journey_map else config.diffusion_size,
             display_monitor=config.display_monitor,
             world_seed=config.world_seed,
             fog_distance=config.fog_distance,
+            window_position=(60, 60) if config.journey_map and config.display_monitor == 0 else None,
         )
         renderer.loading_screen("INITIALIZING", "Starting renderer and diffusion worker")
         camera = Camera.create_default()
@@ -385,7 +392,8 @@ def _run() -> int:
         frame_age_ms = ExponentialAverage(0.15)
         running = True
         session_started = perf_counter()
-        overlay_enabled = bool(config.debug_overlay or debug_requested)
+        overlay_enabled = bool(config.debug_overlay or debug_requested or config.journey_map)
+        renderer.set_operator_mode(overlay_enabled)
         force_proxy = False
         diagnostic_mode = "none"
         frozen = False
@@ -419,6 +427,46 @@ def _run() -> int:
         notice_until = 0.0
         ignore_prompt_hotkey_text = False
         seen_resolution_fallbacks = 0
+        space_held = False
+        if config.journey_map:
+            from app.journey_session import JourneySession
+
+            journey = JourneySession(root, config)
+            journey.window.set_operator_mode(overlay_enabled)
+            journey.prompt(config.prompt, 0, "initial", camera, {
+                **config.backend_settings(), "submitted_prompt": effective_prompt,
+                "negative_prompt": config.negative_prompt,
+                "seed": config.seed, "backend": config.backend,
+            }, timestamp=session_started)
+
+        def toggle_projectors() -> None:
+            """Use each window's current monitor and preserve its restore bounds."""
+            nonlocal notice, notice_until
+            try:
+                enabled = renderer.set_fullscreen(not renderer.is_fullscreen)
+                if journey is not None:
+                    journey.window.set_fullscreen(enabled)
+                notice = "BOTH WINDOWS FULLSCREEN - F restores placement" if enabled else "DRAG WINDOW TITLE BARS TO SCREENS - F fullscreen both"
+            except RuntimeError as exc:
+                notice = f"DISPLAY SETUP: {exc}"
+                logging.error("Projector fullscreen failed: %s", exc)
+            notice_until = perf_counter() + 5.0
+
+        def request_quit() -> None:
+            """Do not dismiss the only recoverable map when its final save fails."""
+            nonlocal running, notice, notice_until, overlay_enabled
+            try:
+                if journey is not None:
+                    journey.recorder.close()
+                running = False
+            except (RuntimeError, OSError) as exc:
+                notice = f"MAP SAVE FAILED - still open. Free disk space, then press Escape to retry. {exc}"
+                notice_until = perf_counter() + 60.0
+                overlay_enabled = True
+                renderer.set_operator_mode(True)
+                if journey is not None:
+                    journey.window.set_operator_mode(True)
+                logging.exception("Exit deferred to preserve the journey")
 
         def apply_live(values: dict[str, object]) -> None:
             """Set settings on the config and forward the backend-tunable ones.
@@ -452,6 +500,7 @@ def _run() -> int:
         def send_prompt(
             prompt: str, negative: str | None = None, *,
             vary_settings: bool = False, persist: bool = False,
+            trigger: str = "regional_palette",
         ) -> int:
             """Forward the original subject with the current region's colors."""
             nonlocal effective_prompt, sent_hues, last_palette_update
@@ -468,23 +517,45 @@ def _run() -> int:
                 logging.info("Prompt variation: timestep %s-%s, sharpness %.2f, instability %.0f%%, guide %.0f%%",
                              config.timestep_min, config.timestep_max, config.display_sharpen,
                              config.instability * 100, config.guide_strength * 100)
-                return worker.request_prompt(
+                revision = worker.request_prompt(
                     effective_prompt, config.negative_prompt if negative is None else negative,
                     settings={key: value for key, value in values.items() if key in BACKEND_SETTING_KEYS},
                 )
-            return worker.request_prompt(
-                effective_prompt,
-                config.negative_prompt if negative is None else negative,
-            )
+            else:
+                revision = worker.request_prompt(
+                    effective_prompt,
+                    config.negative_prompt if negative is None else negative,
+                )
+            if journey is not None:
+                journey.prompt(prompt, revision, trigger, camera, {
+                    **config.backend_settings(), "submitted_prompt": effective_prompt,
+                    "negative_prompt": config.negative_prompt if negative is None else negative,
+                    "seed": config.seed, "backend": config.backend,
+                })
+            return revision
 
         while running:
             frame_started = perf_counter()
+            quit_requested = False
             screenshot_requested = False
             screenshot_notice = screenshots.poll()
             if screenshot_notice:
                 notice, notice_until = screenshot_notice, frame_started + 3.0
             input_event = False
-            for event in renderer.poll_events():
+            events = list(renderer.poll_events())
+            if journey is not None:
+                for message in journey.poll():
+                    if message == "__toggle_fullscreen__":
+                        events.append(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_f, mod=0))
+                    elif message == "__toggle_overlay__":
+                        events.append(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_F1, mod=0))
+                    else:
+                        notice, notice_until = str(message), frame_started + 6.0
+            for event in events:
+                if event.type == pygame.KEYUP and event.key == pygame.K_SPACE:
+                    space_held = False
+                elif event.type == pygame.WINDOWFOCUSLOST:
+                    space_held = False
                 if event.type in (
                     pygame.KEYDOWN, pygame.KEYUP, pygame.TEXTINPUT, pygame.TEXTEDITING,
                     pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP,
@@ -492,7 +563,7 @@ def _run() -> int:
                 ):
                     input_event = True
                 if event.type == pygame.QUIT:
-                    running = False
+                    quit_requested = True
                 elif prompt_editing and event.type == pygame.TEXTINPUT:
                     if ignore_prompt_hotkey_text and event.text.lower() == "p":
                         ignore_prompt_hotkey_text = False
@@ -513,6 +584,7 @@ def _run() -> int:
                                 )
                                 required_prompt_revision = send_prompt(
                                     accepted, vary_settings=prompt_changed, persist=True,
+                                    trigger="editor",
                                 )
                                 # Restart the auto-advance countdown so a manual
                                 # prompt is not overwritten moments after entry.
@@ -545,10 +617,13 @@ def _run() -> int:
                     ):
                         continue
                     if event.key == pygame.K_ESCAPE:
-                        running = False
+                        quit_requested = True
                     elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                         if not screenshots.busy:
                             screenshot_requested = True
+                    elif event.key == pygame.K_f:
+                        if not getattr(event, "repeat", False):
+                            toggle_projectors()
                     elif event.key == pygame.K_F11:
                         try:
                             is_fullscreen = renderer.toggle_fullscreen()
@@ -591,6 +666,11 @@ def _run() -> int:
                         commit("prompt_caption", prompt_caption_enabled, live=False)
                     elif event.key == pygame.K_F1:
                         overlay_enabled = not overlay_enabled
+                        renderer.set_operator_mode(overlay_enabled)
+                        if journey is not None:
+                            journey.window.set_operator_mode(overlay_enabled)
+                            if not overlay_enabled:
+                                renderer.focus()
                         commit("debug_overlay", overlay_enabled, live=False)
                     elif event.key == pygame.K_F2:
                         # From a diagnostic view, F2 is a one-press return to AI.
@@ -747,22 +827,31 @@ def _run() -> int:
                         notice_until = frame_started + 3.0
                         logging.info("Manual reseed: %s", new_seed)
                     elif event.key == pygame.K_SPACE:
+                        if space_held or getattr(event, "repeat", False):
+                            continue
+                        space_held = True
                         # Keep the current world and live tuning while the
                         # backend walks toward another library prompt.
                         try:
-                            current_entry = advance_prompt(
+                            next_entry = advance_prompt(
                                 load_prompt_library(prompt_library_path), current_entry, recent_families
                             )
+                            if journey is not None:
+                                journey.reset(frame_started)
+                            current_entry = next_entry
                             recent_families.append(current_entry.family)
                             del recent_families[:-RECENT_FAMILY_MEMORY]
                             required_prompt_revision = send_prompt(
                                 current_entry.prompt, vary_settings=True, persist=True,
+                                trigger="space",
                             )
                             last_prompt_advance = frame_started
                             notice = f"NEW PROMPT: {current_entry.family}"
                             notice_until = frame_started + 4.0
                             logging.info("Prompt selected: %s", current_entry.family)
-                        except RuntimeError as exc:
+                        except (RuntimeError, OSError) as exc:
+                            notice = f"NEW JOURNEY NOT STARTED: {exc}"
+                            notice_until = frame_started + 8.0
                             logging.error("Prompt selection skipped: %s", exc)
                     elif event.key == pygame.K_p:
                         prompt_editing = True
@@ -772,7 +861,7 @@ def _run() -> int:
                         notice = ""
 
             (mouse_x, mouse_y), keys, mouse_buttons = renderer.read_input()
-            if not prompt_editing:
+            if not prompt_editing and not overlay_enabled:
                 camera.rotate(mouse_x, mouse_y, config.mouse_sensitivity)
             speed = config.movement_speed
             if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]:
@@ -817,6 +906,13 @@ def _run() -> int:
                 renderer.constrain_camera(camera, dt)
 
             trail.update(camera.position, frame_started, config.player_trail)
+            if journey is not None:
+                journey.observe(
+                    camera.position, [camera.pitch, camera.yaw, 0.0], frame_started,
+                    interacting=bool(strafe or ahead or rise or (
+                        not overlay_enabled and (mouse_x or mouse_y)
+                    )), autowalking=autowalking, suppressed=prompt_editing,
+                )
             capture_due = (
                 conditioning is None
                 or force_proxy
@@ -856,6 +952,8 @@ def _run() -> int:
             assert conditioning is not None
 
             ai_version, published_ai = worker.generated.get()
+            if journey is not None:
+                journey.offer_frame(published_ai)
             if (
                 ai_version > latest_ai_version
                 and published_ai is not None
@@ -1001,7 +1099,7 @@ def _run() -> int:
                     # Ephemeral: persisting would move config_mtime past an
                     # external edit and overwrite the configured startup prompt.
                     apply_live({"prompt": current_entry.prompt})
-                    required_prompt_revision = send_prompt(current_entry.prompt, vary_settings=True)
+                    required_prompt_revision = send_prompt(current_entry.prompt, vary_settings=True, trigger="automatic")
                     logging.info("Prompt auto-advanced to: %s", current_entry.family)
                 except RuntimeError as exc:
                     logging.error("Prompt auto-advance skipped: %s", exc)
@@ -1068,8 +1166,12 @@ def _run() -> int:
                         if prompt_request_changed:
                             required_prompt_revision = send_prompt(
                                 config.prompt, vary_settings=prompt_changed,
+                                trigger="configuration",
                             )
                         overlay_enabled = bool(config.debug_overlay or debug_requested)
+                        renderer.set_operator_mode(overlay_enabled)
+                        if journey is not None:
+                            journey.window.set_operator_mode(overlay_enabled)
                         prompt_caption_enabled = config.prompt_caption
                         config_mtime = current_mtime
                         logging.info("Hot-reloaded config: %s", ", ".join(sorted(changed)) or "prompt/navigation")
@@ -1086,6 +1188,8 @@ def _run() -> int:
                 ):
                     running = False
             clock.tick(config.target_display_fps)
+            if quit_requested:
+                request_quit()
         logging.info(
             "Session ended: %s displayed frames, %.1f display FPS, %.1f proxy FPS",
             displayed_frames,
@@ -1101,6 +1205,12 @@ def _run() -> int:
         screenshots.close()
         if worker is not None:
             worker.stop()
+        if journey is not None:
+            try:
+                journey.close()
+            except Exception as exc:
+                logging.exception("Journey save failed on exit; checkpoint retained")
+                print(f"Journey save failed: {exc}. Check journeys/ for the checkpoint.", file=sys.stderr)
         if renderer is not None:
             renderer.close()
 
@@ -1135,6 +1245,7 @@ def build_overlay(
         "FUNCTION KEYS  F1 overlay  F2 proxy/AI  F3 diagnostics  F4 freeze",
         "               F5 reprojection  F6 AI  F7 caption  F8 feedback",
         "               F9 auto advance  F10 resolution  F11 fullscreen  F12 autowalk",
+        "PROJECTORS    F fullscreen both  F1 releases mouse for window placement",
         "",
         f"DISPLAY       {display_fps:6.1f} FPS     VIEW  {view_name}{' (FROZEN)' if frozen else ''}",
         f"PROXY         {proxy_fps:6.1f} FPS     RENDER {proxy_ms:6.2f} ms",

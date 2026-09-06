@@ -25,7 +25,7 @@ def test_proxy_work_follows_consumers_without_slowing_flight(
     from app.renderer import proxy_renderer
 
     config = json.loads((main.project_root() / "config.json").read_text(encoding="utf-8"))
-    config.update(backend=backend, fullscreen=False, reprojection=False,
+    config.update(journey_map=False, backend=backend, fullscreen=False, reprojection=False,
                   target_display_fps=64, conditioning_fps=16, debug_overlay=False,
                   prompt_caption=False, prompt_auto_advance_seconds=0,
                   autowalk_idle_seconds=0, player_trail=True)
@@ -52,6 +52,8 @@ def test_proxy_work_follows_consumers_without_slowing_flight(
             tick += 1
 
     class Renderer:
+        def set_operator_mode(self, enabled): pass
+
         def __init__(self, *args, **kwargs):
             self.sequence = 0
             self.reproject_ms = 0

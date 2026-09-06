@@ -14,7 +14,7 @@ from app.types import ConditioningFrame
 
 def test_f1_unlocks_settings_in_event_order_without_unlocking_for_notices(monkeypatch, tmp_path):
     config = json.loads((main.project_root() / "config.json").read_text(encoding="utf-8"))
-    config.update(backend="proxy_passthrough", fullscreen=False, debug_overlay=False,
+    config.update(journey_map=False, backend="proxy_passthrough", fullscreen=False, debug_overlay=False,
                   reprojection=False, prompt_caption=False, autowalk_idle_seconds=0,
                   prompt_auto_advance_seconds=0, random_seed_on_launch=False,
                   player_trail=True, fog_distance=196.)
@@ -60,6 +60,8 @@ def test_f1_unlocks_settings_in_event_order_without_unlocking_for_notices(monkey
             tick += 1
 
     class Renderer:
+        def set_operator_mode(self, enabled): pass
+
         def __init__(self, *args, **kwargs):
             self.sequence = 0
             self.reproject_ms = 0

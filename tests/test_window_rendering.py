@@ -38,12 +38,26 @@ def test_rendering_continues_during_native_input_pause_and_mode_changes(monkeypa
         assert finished.wait(2)
         monkeypatch.setattr(pygame.event, "wait", original_wait)
 
-        # SDL mode changes must not steal the current context from rendering.
-        assert renderer.toggle_fullscreen()
+        renderer.set_operator_mode(True)
+        assert renderer._window_call(pygame.mouse.get_visible)
+        assert not renderer._window_call(pygame.event.get_grab)
+
+        placement = renderer._window_loop._placement
+        bounds = renderer._window_call(lambda: (placement.window.position, placement.window.size))
+        # SDL mode changes must preserve the GL context and dragged window bounds.
+        assert renderer.set_fullscreen(True)
+        assert renderer.is_fullscreen
+        assert renderer.set_fullscreen(True), "Repeated requests must not toggle"
         renderer.display(np.full((256, 384, 3), 192, dtype=np.uint8), [])
         assert not renderer.toggle_fullscreen()
+        assert renderer._window_call(lambda: (placement.window.position, placement.window.size)) == bounds
+        assert renderer._window_call(pygame.mouse.get_visible), "Fullscreen must retain operator mode"
+
         renderer.set_prompt_editing(True)
+        renderer.set_operator_mode(False)
+        assert renderer._window_call(pygame.mouse.get_visible), "Editing keeps the pointer released"
         renderer.set_prompt_editing(False)
+        assert not renderer._window_call(pygame.mouse.get_visible)
         renderer.display(np.full((256, 384, 3), 224, dtype=np.uint8), [])
         assert renderer.ctx.error == "GL_NO_ERROR"
     finally:
