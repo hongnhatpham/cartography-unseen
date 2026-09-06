@@ -142,4 +142,61 @@ def test_normal_cli_forwards_duration_and_thresholds_without_loading_app(monkeyp
     monkeypatch.setattr(replay_performance, "run", lambda *args: calls.append(args) or 0)
     assert replay_performance.cli() == 0
     assert calls[0][0] == 600
-    assert calls[0][3:] == (100, 250, True)
+    assert calls[0][3:] == (100, 250, True, None)
+
+
+@pytest.mark.parametrize("map_check", ["off", "active", "idle", "cycle", "recorder"])
+def test_map_comparison_matches_controls_and_windows_without_gpu(monkeypatch, tmp_path, map_check):
+    from tools import replay_performance
+    from app import main
+    from app.journey import JourneyRecorder
+    from app.renderer.proxy_renderer import ProxyRenderer
+    import pygame
+
+    source = tmp_path / "source.json"
+    source.write_text(json.dumps({"movement_speed": 8, "journey_map": True,
+                                  "fullscreen": True, "debug_overlay": True}), encoding="utf-8")
+    source_text = source.read_text()
+    output = tmp_path / map_check
+    renderer_arguments, archive_roots = [], []
+    monkeypatch.setattr(ProxyRenderer, "__init__",
+                        lambda self, *args, **kwargs: renderer_arguments.append(kwargs))
+    monkeypatch.setattr(JourneyRecorder, "__init__",
+                        lambda self, root, *args, **kwargs: archive_roots.append(root))
+    monkeypatch.setattr(ProxyRenderer, "poll_events", staticmethod(lambda: []))
+
+    def application():
+        renderer = ProxyRenderer(window_size=(384, 256), window_position=(60, 60))
+        mouse, keys, buttons = renderer.read_input()
+        assert keys[pygame.K_w] is (map_check != "idle")
+        assert not any(keys[key] for key in (pygame.K_a, pygame.K_s, pygame.K_d, pygame.K_LSHIFT))
+        assert mouse == (0, 0)
+        assert buttons == (False, False, False)
+        events = renderer.poll_events()
+        assert [(event.type, event.key) for event in events] == (
+            [(pygame.KEYDOWN, pygame.K_F1)] if map_check != "off" else [])
+        assert renderer.poll_events() == []
+        if map_check != "off":
+            JourneyRecorder(tmp_path / "real-journeys", 123)
+        return 0
+
+    monkeypatch.setattr(main, "run", application)
+    assert replay_performance.run(600, output, source, 100, map_check=map_check) == 1
+    summary = json.loads((output / "summary.json").read_text())
+    assert summary["error"] == ("" if map_check == "off" else
+                                "Map child did not return rendering measurements")
+    assert renderer_arguments == [{"window_size": (1920, 1080), "window_position": (0, 0)}]
+    assert archive_roots == ([output / "journeys"] if map_check != "off" else [])
+    copied_config = json.loads((output / "config.json").read_text())
+    assert copied_config["journey_map"] is (map_check != "off")
+    assert not copied_config["fullscreen"]
+    assert not copied_config["debug_overlay"]
+    assert source.read_text() == source_text
+
+
+def test_map_cli_cannot_silently_use_unmatched_normal_route(monkeypatch):
+    from tools import replay_performance
+    monkeypatch.setattr(replay_performance.sys, "argv", ["replay", "--normal", "--map-check", "active"])
+    with pytest.raises(SystemExit) as error:
+        replay_performance.cli()
+    assert error.value.code == 2

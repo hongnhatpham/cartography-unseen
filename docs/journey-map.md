@@ -327,6 +327,10 @@ two-projector workload before choosing final update rates and texture budgets.
 
 ## Remaining tuning and future work
 
+- [Performance check, 6 September 2026](map-performance-20260906.md): fresh-map
+  overhead is small, but 1,200-image history still causes intermittent stalls.
+  Long-running exhibition performance is not yet signed off.
+
 - Tune the 12-unit capture spacing and ten-second grace period on the projectors.
 - Whether Space should also change procedural geometry, seeds or player position.
 - Review the full-map SVG viewpoint and prompt caption legibility at exhibition scale.

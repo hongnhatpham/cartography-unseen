@@ -7,6 +7,12 @@ polling remains enabled; only Quit and Escape affect the automated run.
 Add --normal to retain real controls, automatic prompts and saved image settings,
 with idle flight after two seconds and only scalar display/publication/generation
 timings. Both modes start measurement at the first AI frame.
+
+--map-check off/active compares the same route with real W input and isolated
+archives, requesting 1920x1080 windows with diagnostics closed. Verify actual
+window_size in run.json and size in map-metrics.json: a tiling window manager
+can override the request. The child timings measure CPU submission, not GPU
+completion. --map-check cycle releases W from seconds 20 to 40 for autowalk.
 """
 from __future__ import annotations
 
@@ -151,10 +157,56 @@ def measurement_config(config: dict, normal: bool = False):
     return {**config, **overrides}
 
 
+def measured_map_run(root, poses, maps, notices, stop):
+    """Spawn-safe instrumentation, with no framebuffer readback or recording."""
+    import pygame
+    from app.map_view import _run, _Scene
+    from time import process_time
+    original_mode, original_draw, original_update = pygame.display.set_mode, _Scene.draw, _Scene.update
+    records, updates, details = [], [], {}
+    failures = []
+    class Notices:
+        def put_nowait(self, value):
+            if value.startswith("Map window failed:"):
+                failures.append(value)
+            notices.put_nowait(value)
+    static_map = os.environ.get("CARTOGRAPHY_MAP_STATIC") == "1"
+    started, cpu_started = perf_counter(), process_time()
+    def mode(size, *args, **kwargs):
+        return original_mode((1920, 1080), *args, **kwargs)
+    def draw(self, pose, angle, size, operator, map_opacity=None):
+        if not details:
+            details.update(renderer=self.gl.info.get("GL_RENDERER"), size=size,
+                           clock_started=started)
+        before = perf_counter()
+        original_draw(self, pose, angle, size, operator, 0.0 if static_map else map_opacity)
+        records.append((before-started, (perf_counter()-before)*1000,
+                        pose["active"], map_opacity, len(self.textures)))
+    def update(self, snapshot):
+        before = perf_counter()
+        if static_map:
+            self.snapshot = snapshot
+        else:
+            original_update(self, snapshot)
+        updates.append((before-started, (perf_counter()-before)*1000,
+                        len(snapshot.get("images", []))))
+    with patch.object(pygame.display, "set_mode", mode), patch.object(_Scene, "draw", draw), patch.object(_Scene, "update", update):
+        _run(root, poses, maps, Notices(), stop)
+    Path(os.environ["CARTOGRAPHY_MAP_METRICS"]).write_text(json.dumps({
+        "pid": os.getpid(), "cpu_seconds": process_time()-cpu_started,
+        "wall_seconds": perf_counter()-started, "draws": records, "updates": updates,
+        "static_map_probe": static_map, "failures": failures, **details,
+    }), encoding="utf-8")
+
+
 def run(seconds: float, output: Path, source: Path, threshold: float, max_ai_gap_ms: float = 250,
-        normal: bool = False):
+        normal: bool = False, map_check: str | None = None):
     output.mkdir(parents=True, exist_ok=False)
     config = measurement_config(json.loads(source.read_text(encoding="utf-8")), normal)
+    if map_check:
+        config.update(journey_map=map_check != "off", fullscreen=False, debug_overlay=False)
+        if map_check == "cycle":
+            config["autowalk_idle_seconds"] = 2.0
     config_path = output / "config.json"
     config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
     metadata = dict(pid=os.getpid(), requested_seconds=seconds, source_config=str(source),
@@ -164,6 +216,11 @@ def run(seconds: float, output: Path, source: Path, threshold: float, max_ai_gap
                     collector=("minimal publication/presentation/generation timestamps" if normal else
                                "publication/presentation/generation and coarse stage timings"),
                     launched=strftime("%Y-%m-%dT%H:%M:%S%z"))
+    if map_check:
+        metadata.update(map_check=map_check, main_window_size=[1920, 1080],
+                        map_window_size=[1920, 1080],
+                        map_input=("W for 20s, release for 20s, then W" if map_check == "cycle" else
+                                   "no human input" if map_check == "idle" else "held W"))
     metadata["source_sha256"] = {
         str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
         for folder in (ROOT / "app", ROOT / "shaders")
@@ -189,6 +246,8 @@ def run(seconds: float, output: Path, source: Path, threshold: float, max_ai_gap
     original_present = ProxyRenderer._present_texture
     original_constrain = ProxyRenderer.constrain_camera
     original_hues = main.hue_words
+    original_renderer_init = ProxyRenderer.__init__
+    controls_closed = False
     initial_hues = []
 
     def worker_init(self, *args, **kwargs):
@@ -207,11 +266,15 @@ def run(seconds: float, output: Path, source: Path, threshold: float, max_ai_gap
         return backend
 
     def poll():
+        nonlocal controls_closed
         events = original_poll() if normal else metrics.timed(original_poll, "poll_events")()
         if not normal:
             events = [event for event in events if event.type == pygame.QUIT or
                       (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE)]
         now = perf_counter()
+        if map_check and config["journey_map"] and not controls_closed:
+            events.append(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_F1, mod=0))
+            controls_closed = True
         if ((metrics.started is not None and now - metrics.started >= seconds)
                 or now - launched > seconds + 300):
             metrics.ended = now
@@ -246,6 +309,20 @@ def run(seconds: float, output: Path, source: Path, threshold: float, max_ai_gap
             initial_hues.append(original_hues(*args, **kwargs))
         return initial_hues[0]
 
+    def renderer_init(self, *args, **kwargs):
+        kwargs["window_size"] = (1920, 1080)
+        kwargs["window_position"] = (0, 0)
+        original_renderer_init(self, *args, **kwargs)
+
+    class ReplayKeys(NoKeys):
+        def __getitem__(self, key):
+            elapsed = perf_counter()-metrics.started if metrics.started is not None else 0
+            moving = map_check != "idle" and not (map_check == "cycle" and 20 <= elapsed < 40)
+            return moving and key == pygame.K_w
+
+    def map_inputs(self):
+        return (0, 0), ReplayKeys(), (False, False, False)
+
     metrics.writer.start()
     code, error = 1, ""
     try:
@@ -268,6 +345,24 @@ def run(seconds: float, output: Path, source: Path, threshold: float, max_ai_gap
                     stack.enter_context(patch.object(target, name, value))
                 for name in ("render_scene", "capture_conditioning", "_update_world"):
                     stack.enter_context(patch.object(ProxyRenderer, name, metrics.timed(getattr(ProxyRenderer, name), name)))
+            if map_check:
+                from app import map_view
+                from app.journey import JourneyRecorder
+                from app.journey_session import JourneySession
+                original_recorder_init = JourneyRecorder.__init__
+                def recorder_init(self, root, *args, **kwargs):
+                    original_recorder_init(self, output / "journeys", *args, **kwargs)
+                stack.enter_context(patch.object(ProxyRenderer, "__init__", renderer_init))
+                stack.enter_context(patch.object(ProxyRenderer, "read_input", map_inputs))
+                stack.enter_context(patch.object(JourneyRecorder, "__init__", recorder_init))
+                stack.enter_context(patch.dict(os.environ,
+                    {"CARTOGRAPHY_MAP_METRICS": str(output / "map-metrics.json"),
+                     "CARTOGRAPHY_MAP_STATIC": "1" if map_check == "recorder" else "0"}))
+                stack.enter_context(patch.object(map_view, "_run", measured_map_run))
+                stack.enter_context(patch.object(JourneySession, "observe",
+                    metrics.timed(JourneySession.observe, "journey_observe")))
+                stack.enter_context(patch.object(JourneySession, "offer_frame",
+                    metrics.timed(JourneySession.offer_frame, "journey_offer_frame")))
             code = main.run()
     except BaseException:
         error = traceback.format_exc()
@@ -279,6 +374,19 @@ def run(seconds: float, output: Path, source: Path, threshold: float, max_ai_gap
             metadata["backend_stats"] = worker.stats()
             if status.error or status.resolution_fallbacks:
                 error = error or str(status)
+        if map_check and config["journey_map"]:
+            map_metrics = output / "map-metrics.json"
+            if not map_metrics.exists():
+                error = error or "Map child did not return rendering measurements"
+            else:
+                observed = json.loads(map_metrics.read_text(encoding="utf-8"))
+                metadata["map_actual_size"] = observed.get("size")
+                if observed.get("failures"):
+                    error = error or "; ".join(observed["failures"])
+                elif observed.get("clock_started", 0) + observed["wall_seconds"] < metrics.ended - .25:
+                    error = error or "Map child stopped before measurement ended"
+                elif not observed["draws"] or (map_check != "idle" and not observed["updates"]):
+                    error = error or "Map workload was not exercised"
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         summary = metrics.finish(code, error, threshold, max_ai_gap_ms)
     print(json.dumps(summary, indent=2))
@@ -290,17 +398,21 @@ def cli():
     parser.add_argument("--seconds", type=float, default=120)
     parser.add_argument("--normal", action="store_true",
                         help="measure normal play/settings with idle flight after two seconds; no synthetic route")
+    parser.add_argument("--map-check", choices=("off", "active", "idle", "cycle", "recorder"),
+                        help="matched map check; recorder keeps archives/IPC but draws only the cached title")
     parser.add_argument("--max-stall-ms", type=float, default=100)
     parser.add_argument("--max-ai-gap-ms", type=float, default=250,
                         help="fail if new AI image publications pause longer than this")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--config", type=Path, default=ROOT / "config.json")
     args = parser.parse_args()
+    if args.normal and args.map_check:
+        parser.error("--map-check uses the fixed route and cannot be combined with --normal")
     if any(not math.isfinite(value) or value <= 0 for value in (args.seconds, args.max_stall_ms, args.max_ai_gap_ms)):
         parser.error("duration and stall thresholds must be positive and finite")
     output = args.output or ROOT / "logs/performance" / f"replay-{strftime('%Y%m%d-%H%M%S')}"
     return run(args.seconds, output.resolve(), args.config.resolve(), args.max_stall_ms, args.max_ai_gap_ms,
-               args.normal)
+               args.normal, args.map_check)
 
 
 if __name__ == "__main__":

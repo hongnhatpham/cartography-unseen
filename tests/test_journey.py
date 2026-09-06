@@ -7,8 +7,22 @@ import numpy as np
 from PIL import Image
 import pytest
 
-from app.journey import JourneyRecorder
+from app.journey import JourneyRecorder, _atomic_json
 from app.types import GeneratedFrame
+
+
+def test_manifest_invalid_update_preserves_previous_file_and_allows_retry(tmp_path):
+    path = tmp_path / "manifest.json"
+    original = {"prompt": "forêt 雨", "position": [1.5, 2, 3]}
+    _atomic_json(path, original)
+    previous = path.read_bytes()
+    with pytest.raises(ValueError):
+        _atomic_json(path, {"position": [float("nan"), 2, 3]})
+    assert path.read_bytes() == previous
+    replacement = {"prompt": "nước", "archive_dir": str(tmp_path)}
+    _atomic_json(path, replacement)
+    assert json.loads(path.read_text(encoding="utf-8")) == {"prompt": "nước"}
+    assert replacement["archive_dir"] == str(tmp_path)
 
 
 def pose(recorder, position, timestamp, active=True):

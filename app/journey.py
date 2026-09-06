@@ -31,7 +31,8 @@ def _atomic_json(path: Path, data: dict) -> None:
     temporary = path.with_suffix(".json.tmp")
     with temporary.open("w", encoding="utf-8") as output:
         portable = {key: value for key, value in data.items() if key != "archive_dir"}
-        json.dump(portable, output, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        # One-shot encoding avoids streaming Python chunks while gameplay is running.
+        output.write(json.dumps(portable, ensure_ascii=False, separators=(",", ":"), allow_nan=False))
         output.flush()
         os.fsync(output.fileno())
     temporary.replace(path)
