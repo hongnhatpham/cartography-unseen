@@ -9,6 +9,7 @@ from concurrent.futures.process import BrokenProcessPool
 from copy import deepcopy
 from datetime import datetime, timezone
 from html import escape
+import hashlib
 import json
 import math
 import multiprocessing as mp
@@ -56,31 +57,41 @@ def _save_checkpoint(directory: Path, delta: dict) -> None:
 
 
 def _save_frame(directory: Path, descriptor: dict, pixels: np.ndarray, delta: dict) -> None:
-    """Publish the original PNG before publishing a manifest that references it."""
+    """Publish lossless image pixels before a manifest that references them."""
     data = _apply_update(delta)
     path = directory / descriptor["path"]
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".png.tmp")
+    temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("wb") as output:
-        Image.fromarray(pixels).save(output, format="PNG")
+        if path.suffix == ".webp":
+            Image.fromarray(pixels).save(output, format="WEBP", lossless=True, exact=True, method=3)
+        else:
+            Image.fromarray(pixels).save(output, format="PNG")
         output.flush()
         os.fsync(output.fileno())
     temporary.replace(path)
     _atomic_json(directory / "manifest.json", data)
 
 
-def _save_archive(directory: Path, data: dict) -> None:
+def _save_archive(directory: Path, data: dict, export_svg: bool = False) -> None:
     """Finish portable exports in the same worker after all image writes."""
+    marker = directory / "complete.json"
+    marker.unlink(missing_ok=True)
     _atomic_json(directory / "manifest.json", data)
-    _export_svg(directory / "map.svg", data)
+    if export_svg:
+        _export_svg(directory / "map.svg", data)
     viewer = Path(__file__).resolve().parents[1] / "assets" / "journey-viewer.html"
-    if viewer.exists():
-        manifest = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
-        html = viewer.read_text(encoding="utf-8").replace(
-            "/* JOURNEY_MANIFEST */", f"window.JOURNEY_MANIFEST = {manifest};")
-        temporary = directory / "index.html.tmp"
-        temporary.write_text(html, encoding="utf-8")
-        temporary.replace(directory / "index.html")
+    manifest = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
+    html = viewer.read_text(encoding="utf-8").replace(
+        "/* JOURNEY_MANIFEST */", f"window.JOURNEY_MANIFEST = {manifest};")
+    temporary = directory / "index.html.tmp"
+    with temporary.open("w", encoding="utf-8") as output:
+        output.write(html)
+        output.flush()
+        os.fsync(output.fileno())
+    temporary.replace(directory / "index.html")
+    _atomic_json(marker, {"schema_version": 1,
+                          "manifest_sha256": hashlib.sha256((directory / "manifest.json").read_bytes()).hexdigest()})
 
 
 class JourneyRecorder:
@@ -91,12 +102,17 @@ class JourneyRecorder:
     retains its original image and can be retried by reset/close.
     """
 
-    def __init__(self, root: Path, world_seed: int, capture_distance: float = 12.0) -> None:
+    def __init__(self, root: Path, world_seed: int, capture_distance: float = 12.0, *,
+                 image_format: str = "webp", export_svg: bool = False) -> None:
         if not math.isfinite(capture_distance) or capture_distance <= 0:
             raise ValueError("capture_distance must be positive and finite")
+        if image_format not in {"webp", "png"}:
+            raise ValueError("image_format must be webp or png")
         self.root = Path(root).resolve()
         self.world_seed = int(world_seed)
         self.capture_distance = float(capture_distance)
+        self.image_format = image_format
+        self.export_svg = export_svg
         self._executor = self._new_executor()
         self._worker_broken = False
         self._future: Future | None = None
@@ -226,7 +242,7 @@ class JourneyRecorder:
             return False
         number = len(self._data["images"]) + 1
         height, width = frame.image.shape[:2]
-        descriptor = {"id": f"image-{number}", "path": f"images/{number:06d}.png",
+        descriptor = {"id": f"image-{number}", "path": f"images/{number:06d}.{self.image_format}",
                       "segment_id": segment_id, "position": frame.camera_position.tolist(),
                       "rotation": frame.camera_rotation.tolist(), "timestamp": source_time,
                       "generation_timestamp": float(frame.generation_timestamp), "sequence": int(frame.sequence),
@@ -328,7 +344,7 @@ class JourneyRecorder:
 
         # Keep the old journey intact until every requested artifact is saved.
         try:
-            self._executor.submit(_save_archive, directory, data).result()
+            self._executor.submit(_save_archive, directory, data, self.export_svg).result()
         except BrokenProcessPool:
             self._worker_broken = True
             raise
@@ -367,8 +383,9 @@ def _plane_corners(image: dict) -> list[np.ndarray]:
             for sx, sy in ((-1, 1), (1, 1), (-1, -1), (1, -1))]
 
 
-def _export_svg(path: Path, data: dict) -> None:
-    """A full-journey orthographic view with vector routes and original PNGs."""
+def _export_svg(path: Path, data: dict, image_directory: Path | None = None) -> None:
+    """Export vector routes and lossless images, including legacy PNG archives."""
+    image_directory = image_directory or path.parent
     planes = [(sample, _plane_corners(sample)) for sample in data["images"]]
     geometry = [_project(point["position"]) for segment in data["segments"] for point in segment["points"]]
     geometry.extend(corner for _, corners in planes for corner in corners)
@@ -398,8 +415,10 @@ def _export_svg(path: Path, data: dict) -> None:
             top_left, top_right, bottom_left, _ = [point * scale + offset for point in corners]
             across, down = (top_right - top_left) / sample["width"], (bottom_left - top_left) / sample["height"]
             matrix = f"{across[0]:.8f} {across[1]:.8f} {down[0]:.8f} {down[1]:.8f} {top_left[0]:.5f} {top_left[1]:.5f}"
-            output.write(f'<image width="{sample["width"]}" height="{sample["height"]}" transform="matrix({matrix})" xlink:href="data:image/png;base64,')
-            output.write(base64.b64encode((path.parent / sample["path"]).read_bytes()).decode("ascii"))
+            image_path = image_directory / sample["path"]
+            mime = "image/webp" if image_path.suffix.lower() == ".webp" else "image/png"
+            output.write(f'<image width="{sample["width"]}" height="{sample["height"]}" transform="matrix({matrix})" xlink:href="data:{mime};base64,')
+            output.write(base64.b64encode(image_path.read_bytes()).decode("ascii"))
             output.write(f'"><title>{escape(sample["id"])} | prompt revision {sample["prompt_revision"]}</title></image>\n')
         for event in data["prompts"]:
             if event["active"]:

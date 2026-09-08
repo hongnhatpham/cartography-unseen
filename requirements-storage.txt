@@ -1,0 +1,2 @@
+# Optional private journey archive uploads. Install into runtime\python when used.
+boto3==1.40.76

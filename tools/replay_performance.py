@@ -176,12 +176,14 @@ def measured_archive_task(task_name, args, output):
 
 
 def measurement_config(config: dict, normal: bool = False):
-    """Keep the source untouched; normal mode only shortens the idle-flight delay."""
+    """Keep the source untouched and performance archives outside live backup."""
     overrides = ({"autowalk_idle_seconds": 2.0} if normal else {
         "backend": "latent_walk", "diffusion_resolution": "384x256", "guidance_scale": 1.5,
         "prompt_auto_advance_seconds": 0, "random_seed_on_launch": False,
         "debug_overlay": False, "autowalk_idle_seconds": 0,
     })
+    if "map_sync_enabled" in config:
+        overrides["map_sync_enabled"] = False
     return {**config, **overrides}
 
 
@@ -474,7 +476,9 @@ def run(seconds: float, output: Path, source: Path, threshold: float, max_ai_gap
                     metadata["archive_images"] = len(images)
                     if (manifest.get("completion_reason") != "quit" or
                             len(images) != len(recorder._data["images"]) or
-                            not (recorder.archive_dir / "map.svg").is_file() or
+                            (getattr(recorder, "export_svg", False) and
+                             not (recorder.archive_dir / "map.svg").is_file()) or
+                            not (recorder.archive_dir / "complete.json").is_file() or
                             not (recorder.archive_dir / "index.html").is_file() or
                             any(not (recorder.archive_dir / item["path"]).is_file() for item in images)):
                         error = error or "Journey final export is incomplete"

@@ -15,6 +15,13 @@ def test_route_does_not_depend_on_previous_frames_or_startup():
     assert all(a != b for a, b in zip(expected[0], origin))
 
 
+@pytest.mark.parametrize("normal", [False, True])
+def test_performance_runs_never_start_live_archive_uploads(normal):
+    source = {"map_sync_enabled": True}
+    assert measurement_config(source, normal)["map_sync_enabled"] is False
+    assert source["map_sync_enabled"] is True
+
+
 @pytest.mark.parametrize("stall,passes", [(16, True), (120, False)])
 def test_replay_threshold_is_red_capable_and_writes_every_timing(tmp_path, stall, passes):
     metrics = Metrics(tmp_path, 120)

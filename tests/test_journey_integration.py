@@ -30,7 +30,8 @@ def exhibition(monkeypatch, tmp_path):
     config.update(journey_map=True, backend="proxy_passthrough", fullscreen=True,
                   debug_overlay=False, reprojection=False, prompt_caption=False,
                   autowalk_idle_seconds=0, prompt_auto_advance_seconds=0,
-                  random_seed_on_launch=False, map_capture_distance=.1)
+                  random_seed_on_launch=False, map_capture_distance=.1, map_export_svg=True,
+                  map_sync_enabled=False)
     (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
     (tmp_path / "prompts.json").write_bytes((source / "prompts.json").read_bytes())
     monkeypatch.setattr(main, "project_root", lambda: tmp_path)

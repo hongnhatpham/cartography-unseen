@@ -41,11 +41,28 @@ behavior. Escape or closing the main window saves the final map. A failed save
 keeps the application open for retry. Each archive lives in `journeys/<id>/`:
 
 - `manifest.json` contains the route, image poses, prompt history and settings.
-- `images/` contains the original PNG images.
-- `map.svg` contains the full journey as vector paths with embedded bitmap images
-  and a prompt index. Bitmap detail remains limited by the source resolution.
+- `images/` contains lossless WebP captures at their original resolution and pixel
+  quality. `map_image_format: "png"` selects PNG for new journeys instead.
 - `index.html` is an interactive viewer. Open it locally to orbit, pan, zoom and
   inspect prompts and original images. Keep it with its manifest and images.
+- `complete.json` marks a successfully finalized archive and checksums its manifest.
+  Active checkpoints have no completion marker.
+
+SVG export is now optional because it duplicates every image. To create one later,
+run `runtime/python/python.exe tools/export_journey_svg.py journeys/<id>`.
+Set `map_export_svg` to true to include it automatically on each completed save.
+The SVG preserves vector paths and embeds the images at their source resolution.
+
+Optional private R2 backup uploads completed journeys in a separate process,
+verifies remote checksums, then removes the oldest verified local copies above
+`map_cache_gib`, 5 GiB by default. Active and unsynced data stays local. Below
+`map_min_free_gib`, 1 GiB by default, path and image capture pause and resume with
+a disconnected segment when space returns. Prompt metadata continues recording.
+Uploads are disabled until configured. See [storage setup](docs/journey-storage.md)
+for credentials, recovery, and the distinction between backup and publication.
+An existing Wrangler login can back up portable ZIPs without new access keys;
+large ZIPs stream as verified parts. Scoped S3 credentials remain an option for
+storing individual viewer files directly in R2.
 
 If the browser blocks local image loading, use **Open archive** in the viewer
 and select that saved journey folder. The files stay on your computer.
@@ -80,7 +97,7 @@ Download or clone the project, then double-click `run.bat`. On its first launch 
 - A pinned fp16 SD-Turbo snapshot (`stabilityai/sd-turbo`)
 - The tiny autoencoder TAESD (`madebyollin/taesd`), used for every latent encode and decode
 
-The NVIDIA display driver must already be installed. A separate CUDA Toolkit is not required. Later launches operate offline.
+The NVIDIA display driver must already be installed. A separate CUDA Toolkit is not required. Later launches can operate offline; optional archive uploads need a connection.
 
 ## Controls
 

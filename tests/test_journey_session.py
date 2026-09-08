@@ -94,3 +94,28 @@ def test_prompt_markers_and_delayed_frames_follow_source_revision_across_reset(s
     assert session.recorder.snapshot()["images"][0]["position"] == [22., 2., 3.]
     observe(session, [23., 2., 3.], .9, interacting=True)
     assert session.window.updates[-1][0]["id"] != archived["id"]
+
+
+def test_low_disk_pauses_capture_and_resumes_with_a_disconnected_route(session):
+    camera = SimpleNamespace(position=np.zeros(3), pitch=0., yaw=0.)
+    session.prompt("forest", 0, "initial", camera, {}, timestamp=0.)
+    observe(session, [0., 0., 0.], .1, interacting=True)
+    session.offer_frame(frame(.1, 1, [0., 0., 0.], 0))
+    session.recorder.flush()
+    session._disk.available = False
+    observe(session, [20., 0., 0.], .2, interacting=True)
+    session.offer_frame(frame(.2, 2, [20., 0., 0.], 0))
+    assert not session.active
+    assert len(session.recorder.snapshot()["images"]) == 1
+    assert "MAP RECORDING PAUSED" in " ".join(session.poll())
+    assert not session.poll()
+    session._disk.available = True
+    observe(session, [40., 0., 0.], .3, interacting=True)
+    session.offer_frame(frame(.3, 3, [40., 0., 0.], 0))
+    session.recorder.flush()
+    data = session.recorder.snapshot()
+    assert len(data["images"]) == 2
+    assert len(data["segments"]) == 2
+    assert data["segments"][0]["points"][-1]["position"] == [0., 0., 0.]
+    assert data["segments"][1]["points"][0]["position"] == [40., 0., 0.]
+    assert "MAP RECORDING RESUMED" in " ".join(session.poll())

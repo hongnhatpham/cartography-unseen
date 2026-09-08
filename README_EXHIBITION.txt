@@ -12,7 +12,8 @@ QUICK START
 The first run downloads and installs a private, portable Python environment,
 CUDA-enabled PyTorch, the application libraries, the pinned SD-Turbo model and
 the pinned TAESD tiny autoencoder. Nothing is installed into the system Python.
-Later launches are offline and do not reinstall or redownload anything.
+Later launches can operate offline and do not reinstall or redownload anything.
+Optional archive uploads need an Internet connection.
 
 Allow several gigabytes of download traffic and at least 12 GB of free disk
 space. Downloads can resume after interruption. Installation time depends on
@@ -84,11 +85,20 @@ Closing only the map window leaves recording running until the main app exits.
 
 Live archive encoding runs in a separate process. Normal saves transfer new
 records to that process, keeping accumulated history off the gameplay thread.
-The map reuses image geometry as the journey grows. Original PNG quality,
+The map reuses image geometry as the journey grows. Original pixel quality,
 capture spacing and the saved route are preserved. A failed save retains its
 pending image and retries when you save/reset or quit again.
 
-Look in journeys/<id>/ for manifest.json, original images, map.svg and index.html.
+Look in journeys/<id>/ for manifest.json, lossless WebP images, complete.json
+and index.html. SVG is optional; generate it later with:
+runtime\python\python.exe tools\export_journey_svg.py journeys\<id>
+
+Private R2 backup is optional. See docs/journey-storage.md for setup. It uploads
+completed maps, verifies them, then retains a 5 GiB local cache. Active or
+unverified maps stay local. With less than 1 GiB free, path and image capture
+pause; prompts continue recording. Free space or press Space to finish the map
+and make it eligible for upload. Capture resumes as a new stroke when space returns.
+
 Open index.html for an interactive map with prompt history and original-image
 inspection. If the browser blocks local images, choose Open archive and select
 the saved journey folder. The files stay local. The SVG embeds bitmap images; those

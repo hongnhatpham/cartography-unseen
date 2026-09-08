@@ -3,6 +3,8 @@
 Status: direction A approved by Nhat on 5 September 2026. Implemented on
 6 September 2026: live map, distance capture, prompt history, archive/SVG export,
 local interactive archive viewer and coordinated projector fullscreen.
+Storage updated on 7 September 2026 with lossless WebP, optional SVG export,
+private R2 backup and verified local cache cleanup.
 Publishing archives on the Emergent Play website remains future work.
 The idle title treatment uses the approved A crossfade from the
 [transition preview](https://reports.bynhat.com/r/31fe3a0b08f5cb892e69/).
@@ -20,8 +22,9 @@ units between captures, a ten-second inactivity grace period and a three-minute
 orbit at up to 30 FPS. Inactivity crossfades the map to the project title;
 placement instructions can appear while the operator overlay is open.
 
-Archives are written under `journeys/<id>/` with original PNGs, `manifest.json`,
-an embedded-image `map.svg` and an interactive `index.html`. Five-second
+Archives are written under `journeys/<id>/` with lossless WebP captures,
+`manifest.json`, `complete.json` and an interactive `index.html`. PNG capture
+and embedded-image SVG export are optional. Five-second
 checkpoints and image saves preserve partial journeys during play. Normal quit
 and Space finish the archive; failure retains it for retry. Checkpoints are
 recovery records, not an automatic resume of a crashed exhibition session.
@@ -238,7 +241,9 @@ An archive should be readable without the diffusion model, original machine,
 or a running exhibition app. Saving a map does not promise that rerunning the
 model will reproduce its images; the saved image files preserve what was seen.
 
-For a high-quality still, export **SVG with embedded original bitmap images**.
+For a high-quality still, export **SVG with embedded original bitmap images** on
+demand. Automatic SVG export is disabled by default because it duplicates every
+captured image. Lossless WebP is the default image encoding; PNG remains available.
 Paths, markers and text can remain vectors and stay sharp when zoomed. The
 image planes retain their bitmap resolution. Embedding avoids missing linked
 images when someone moves or shares the SVG file.
@@ -274,6 +279,14 @@ archive does not require every original image to stay loaded on the GPU.
 Website design, deployment and publication are future work. Saving locally
 must not automatically publish a map. Choose the website presentation and
 which archives to publish in a later task.
+
+Private off-machine backup is separate from website publication. The approved
+storage policy uses optional SVG export, lossless image compression, verified
+background uploads of completed archives and a 5 GiB local cache. A durable
+completion marker separates completed archives from live checkpoints. Never
+remove active or unverified data to meet the cache target. Pause path and image
+capture below 1 GiB free disk space; preserve prompt history and resume with a
+disconnected segment. See [storage setup](journey-storage.md).
 
 ## Implementation direction
 

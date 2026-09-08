@@ -132,6 +132,12 @@ class AppConfig:
     journey_map: bool = False
     map_capture_distance: float = 12.0
     map_idle_seconds: float = 10.0
+    map_image_format: str = "webp"
+    map_export_svg: bool = False
+    # Upload is opt-in; credentials are read from the environment, never this file.
+    map_sync_enabled: bool = False
+    map_cache_gib: float = 5.0
+    map_min_free_gib: float = 1.0
     target_display_fps: int = 60
     conditioning_fps: int = 15
     debug_overlay: bool = False
@@ -227,6 +233,14 @@ class AppConfig:
             raise RuntimeError("map_capture_distance must be between 0.1 and 10000")
         if not 0.0 <= self.map_idle_seconds <= 300.0:
             raise RuntimeError("map_idle_seconds must be between 0 and 300")
+        if self.map_image_format not in ("webp", "png"):
+            raise RuntimeError("map_image_format must be webp or png")
+        for key in ("map_export_svg", "map_sync_enabled"):
+            if not isinstance(getattr(self, key), bool):
+                raise RuntimeError(f"{key} must be true or false")
+        for key in ("map_cache_gib", "map_min_free_gib"):
+            if not 0.0 < getattr(self, key) <= 100000.0:
+                raise RuntimeError(f"{key} must be positive and at most 100000 GiB")
 
     def backend_dict(self, project_root: Path) -> dict[str, Any]:
         """Full settings dict handed to the backend, with model paths resolved."""

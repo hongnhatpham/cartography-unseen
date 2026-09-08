@@ -2,6 +2,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from io import BytesIO
+import hashlib
 import json
 import os
 import pickle
@@ -151,7 +152,7 @@ def test_save_failure_retains_journey_and_retry_archives_same_data(tmp_path, mon
     recorder.close()
 
 
-def test_failed_png_task_retains_original_and_retry_saves_it(tmp_path, monkeypatch, archive_thread):
+def test_failed_image_task_retains_original_and_retry_saves_it(tmp_path, monkeypatch, archive_thread):
     recorder = JourneyRecorder(tmp_path, 42)
     pose(recorder, (0, 0, 0), 0.)
     prompt(recorder)
@@ -169,7 +170,7 @@ def test_failed_png_task_retains_original_and_retry_saves_it(tmp_path, monkeypat
     assert len(recorder.snapshot()["images"]) == 1
     monkeypatch.setattr(Image.Image, "save", original)
     archive = recorder.close()
-    with Image.open(archive / "images/000001.png") as image:
+    with Image.open(archive / "images/000001.webp") as image:
         np.testing.assert_array_equal(np.asarray(image), frame(0., 1).image)
 
 
@@ -194,12 +195,12 @@ def test_dead_archive_worker_retries_accepted_frame_without_losing_original(tmp_
     archive = recorder.close()
     manifest = json.loads((archive / "manifest.json").read_text(encoding="utf-8"))
     assert [image["id"] for image in manifest["images"]] == ["image-1", "image-2"]
-    with Image.open(archive / "images/000002.png") as image:
+    with Image.open(archive / "images/000002.webp") as image:
         np.testing.assert_array_equal(np.asarray(image), expected)
 
 
 def test_failed_final_export_then_worker_restart_preserves_resumed_live_history(tmp_path):
-    recorder = JourneyRecorder(tmp_path, 42)
+    recorder = JourneyRecorder(tmp_path, 42, export_svg=True)
     pose(recorder, (0, 0, 0), 0.)
     prompt(recorder)
     assert recorder.offer_frame(frame(0., 1))
@@ -225,7 +226,7 @@ def test_failed_final_export_then_worker_restart_preserves_resumed_live_history(
     recorder.close()
 
 
-def test_failed_incremental_png_job_resets_worker_before_retry_without_duplicate_images(tmp_path):
+def test_failed_incremental_image_job_resets_worker_before_retry_without_duplicate_images(tmp_path):
     recorder = JourneyRecorder(tmp_path, 42)
     pose(recorder, (0, 0, 0), 0.)
     prompt(recorder)
@@ -233,7 +234,7 @@ def test_failed_incremental_png_job_resets_worker_before_retry_without_duplicate
     recorder.flush()
 
     # The second job merges an append delta before this real filesystem failure.
-    blocked = recorder.archive_dir / "images/000002.png.tmp"
+    blocked = recorder.archive_dir / "images/000002.webp.tmp"
     blocked.mkdir()
     pose(recorder, (12, 0, 0), .2)
     assert recorder.offer_frame(frame(.2, 2, (12, 0, 0)))
@@ -247,7 +248,7 @@ def test_failed_incremental_png_job_resets_worker_before_retry_without_duplicate
     recorder.flush()
     checkpoint = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert [image["id"] for image in checkpoint["images"]] == ["image-1", "image-2"]
-    with Image.open(recorder.archive_dir / "images/000002.png") as image:
+    with Image.open(recorder.archive_dir / "images/000002.webp") as image:
         np.testing.assert_array_equal(np.asarray(image), frame(.2, 2).image)
 
     # Subsequent append deltas must continue from the successfully retried snapshot.
@@ -294,7 +295,7 @@ def test_worker_dying_after_io_failure_can_retry_again_after_failed_submission(t
     recorder = JourneyRecorder(tmp_path, 42)
     pose(recorder, (0, 0, 0), 0.)
     prompt(recorder)
-    blocked = recorder.archive_dir / "images/000001.png.tmp"
+    blocked = recorder.archive_dir / "images/000001.webp.tmp"
     blocked.mkdir(parents=True)
     assert recorder.offer_frame(frame(0., 1))
     with pytest.raises(OSError):
@@ -311,13 +312,14 @@ def test_worker_dying_after_io_failure_can_retry_again_after_failed_submission(t
     recorder.flush()
     checkpoint = json.loads((recorder.archive_dir / "manifest.json").read_text(encoding="utf-8"))
     assert [image["id"] for image in checkpoint["images"]] == ["image-1"]
-    with Image.open(recorder.archive_dir / "images/000001.png") as image:
+    with Image.open(recorder.archive_dir / "images/000001.webp") as image:
         np.testing.assert_array_equal(np.asarray(image), frame(0., 1).image)
     recorder.close()
 
 
-def test_svg_preserves_original_pixels_vectors_and_exact_prompt(tmp_path):
-    recorder = JourneyRecorder(tmp_path, 42)
+@pytest.mark.parametrize("image_format", ["png", "webp"])
+def test_svg_preserves_original_pixels_vectors_and_exact_prompt(tmp_path, image_format):
+    recorder = JourneyRecorder(tmp_path, 42, image_format=image_format, export_svg=True)
     pose(recorder, (0, 0, 0), 0.)
     prompt(recorder)
     generated = frame(0., 1)
@@ -331,7 +333,9 @@ def test_svg_preserves_original_pixels_vectors_and_exact_prompt(tmp_path):
     assert svg.find("svg:polyline", ns) is not None
     element = svg.find("svg:image", ns)
     assert "matrix(" in element.attrib["transform"]
-    encoded = element.attrib["{http://www.w3.org/1999/xlink}href"].split(",", 1)[1]
+    href = element.attrib["{http://www.w3.org/1999/xlink}href"]
+    assert href.startswith(f"data:image/{image_format};base64,")
+    encoded = href.split(",", 1)[1]
     with Image.open(BytesIO(base64.b64decode(encoded))) as image:
         assert image.size == (48, 32)
         np.testing.assert_array_equal(np.asarray(image), frame(0., 1).image)
@@ -362,7 +366,90 @@ def test_checkpoint_is_durable_and_only_one_task_is_queued(tmp_path):
     assert "completion_reason" not in manifest
     assert manifest["segments"][0]["points"][-1]["position"] == [0., 12., 0.]
     assert recorder._task is None
+    assert not (recorder.archive_dir / "complete.json").exists()
     recorder.close()
+
+
+@pytest.mark.parametrize("image_format", ["webp", "png"])
+def test_compact_archive_preserves_pixels_and_exports_svg_on_demand(tmp_path, image_format):
+    from tools.export_journey_svg import export_journey_svg
+
+    options = {} if image_format == "webp" else {"image_format": "png"}
+    recorder = JourneyRecorder(tmp_path / "journeys", 42, **options)
+    pose(recorder, (0, 0, 0), 0.)
+    prompt(recorder)
+    generated = frame(0., 1)
+    generated.image[:] = np.random.default_rng(42).integers(0, 256, generated.image.shape, dtype=np.uint8)
+    assert recorder.offer_frame(generated)
+    archive = recorder.close()
+    manifest_bytes = (archive / "manifest.json").read_bytes()
+    manifest = json.loads(manifest_bytes)
+    assert manifest["images"][0]["path"] == f"images/000001.{image_format}"
+    with Image.open(archive / manifest["images"][0]["path"]) as image:
+        assert image.format == image_format.upper()
+        np.testing.assert_array_equal(np.asarray(image), generated.image)
+    assert not (archive / "map.svg").exists()
+    assert (archive / "index.html").is_file()
+    marker_bytes = (archive / "complete.json").read_bytes()
+    assert json.loads(marker_bytes) == {
+        "schema_version": 1, "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest()}
+
+    # Legacy PNG archives did not have completion markers.
+    if image_format == "png":
+        (archive / "complete.json").unlink()
+    output = export_journey_svg(archive, tmp_path / "exports" / "map.svg")
+    element = ET.parse(output).find("{http://www.w3.org/2000/svg}image")
+    href = element.attrib["{http://www.w3.org/1999/xlink}href"]
+    assert href.startswith(f"data:image/{image_format};base64,")
+    with Image.open(BytesIO(base64.b64decode(href.split(",", 1)[1]))) as image:
+        np.testing.assert_array_equal(np.asarray(image), generated.image)
+    assert (archive / "manifest.json").read_bytes() == manifest_bytes
+    if image_format == "webp":
+        assert (archive / "complete.json").read_bytes() == marker_bytes
+
+
+@pytest.mark.parametrize("failed_artifact", ["manifest.json", "map.svg", "index.html", "complete.json"])
+def test_completion_marker_is_removed_before_retry_and_published_only_after_success(
+        tmp_path, monkeypatch, archive_thread, failed_artifact):
+    import app.journey as module
+
+    recorder = JourneyRecorder(tmp_path, 42, export_svg=True)
+    pose(recorder, (0, 0, 0), 0.)
+    prompt(recorder)
+    assert recorder.offer_frame(frame(0., 1))
+    recorder.flush()
+    marker = recorder.archive_dir / "complete.json"
+    marker.write_text('{"stale":true}', encoding="utf-8")
+    original_json, original_svg = module._atomic_json, module._export_svg
+
+    def save_json(path, data):
+        if path.name == failed_artifact:
+            raise OSError("archive failure")
+        original_json(path, data)
+
+    def save_svg(*args, **kwargs):
+        if failed_artifact == "map.svg":
+            raise OSError("archive failure")
+        original_svg(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_atomic_json", save_json)
+    monkeypatch.setattr(module, "_export_svg", save_svg)
+    blocked = recorder.archive_dir / "index.html.tmp"
+    if failed_artifact == "index.html":
+        blocked.mkdir()
+    with pytest.raises(OSError):
+        recorder.close()
+    assert not marker.exists()
+    assert recorder.nonempty
+    monkeypatch.setattr(module, "_atomic_json", original_json)
+    monkeypatch.setattr(module, "_export_svg", original_svg)
+    if failed_artifact == "index.html":
+        blocked.rmdir()
+    archive = recorder.close()
+    assert json.loads(marker.read_text())["manifest_sha256"] == hashlib.sha256(
+        (archive / "manifest.json").read_bytes()).hexdigest()
+    assert (archive / "index.html").is_file()
+    assert (archive / "map.svg").is_file()
 
 
 def test_prompt_change_tracks_first_frame_without_triggering_capture(tmp_path):
