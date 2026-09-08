@@ -49,7 +49,7 @@ def test_latent_walk_keys_are_validated_and_forwarded() -> None:
     config.validate()
     assert config.backend_settings() == {
         "steps": 1,
-        "guidance_scale": 2.0,
+        "guidance_scale": 1.8,
         "timestep_min": 780,
         "timestep_max": 900,
         "instability": 0.5,
@@ -61,7 +61,7 @@ def test_latent_walk_keys_are_validated_and_forwarded() -> None:
         "depth_shade": -0.6,
         "guide_wobble": 0.0,
         "noise_walk_seconds": 5.0,
-        "noise_jitter": 0.12,
+        "noise_jitter": 0.16,
         "prompt_walk_seconds": 6.0,
         "feedback_reprojection": False,
     }
@@ -449,3 +449,4 @@ def test_renderer_chunk_cache_stays_bounded_and_regenerates_evicted_chunks() -> 
     assert (0, 0, 0) not in renderer._chunk_instances
     renderer._update_world(origin)
     np.testing.assert_array_equal(renderer._chunk_instances[(0, 0, 0)], original_chunk)
+
