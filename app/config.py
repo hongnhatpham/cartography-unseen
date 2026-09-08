@@ -59,16 +59,14 @@ class AppConfig:
     # Diffusion
     sampler: str = ""
     steps: int = 1
-    guidance_scale: float = 2.0
+    guidance_scale: float = 1.8
     # The timestep, not the guide strength, decides how much of the proxy's
     # layout survives: at 640-720 only about a sixth of the signal entering the
-    # UNet is the guide, and the output's edges landed on the proxy's at an SSIM
-    # of 0.05 whatever the guide did. 480-580 roughly triples that while the
-    # picture still hallucinates; below about 450 it repaints the proxy.
-    timestep_min: int = 480
-    timestep_max: int = 580
-    instability: float = 0.7
-    guide_strength: float = 0.85
+    # UNet is the guide, and the output's edges landed on the proxy's at an SSIM\n    # of 0.05 whatever the guide did. 460-600 gives the walk room to introduce\n    # saturated structure while the picture still follows the proxy.
+    timestep_min: int = 460
+    timestep_max: int = 600
+    instability: float = 0.72
+    guide_strength: float = 0.82
     # How hard the memory latent is pulled back to the guide's per-channel mean
     # and spread each frame. Below about 0.8 the feedback loop drifts.
     memory_match: float = 1.0
@@ -103,10 +101,10 @@ class AppConfig:
     # and hold it for the whole keyframe; refreshing the field every couple of
     # seconds breaks that lock and is the main source of within-walk variety.
     noise_walk_seconds: float = 5.0
-    noise_jitter: float = 0.12
+    noise_jitter: float = 0.16
     prompt_walk_seconds: float = 6.0
     # Seconds between automatic library prompt changes. 0 disables auto-advance.
-    prompt_auto_advance_seconds: float = 24.0
+    prompt_auto_advance_seconds: float = 20.0
     feedback_reprojection: bool = False
     seed: int = 12345
     random_seed_on_launch: bool = False
@@ -294,3 +292,4 @@ def configure_local_environment(project_root: Path, offline: bool = True) -> Non
     # installed TensorFlow/JAX stacks from being imported by Transformers.
     os.environ.setdefault("USE_TF", "0")
     os.environ.setdefault("USE_FLAX", "0")
+
