@@ -4,8 +4,7 @@ param(
     [Parameter(Mandatory)][ValidatePattern('^[a-z][a-z0-9_-]{0,19}$')][string]$UserName,
     [Parameter(Mandatory)][string]$DeploymentPath,
     [Parameter(Mandatory)][string[]]$PublicKeyFiles,
-    [Parameter(Mandatory)][string[]]$ApprovedPeerAddresses,
-    [Parameter(Mandatory)][datetime]$ExhibitionEndDate,
+    [string[]]$ApprovedPeerAddresses = @('100.87.222.71', 'fd7a:115c:a1e0::b434:de48', '100.96.33.72', 'fd7a:115c:a1e0::9f34:2149'),
     [string]$TailscaleInterfaceAlias = 'Tailscale',
     [string]$MonitorCredentialPath,
     [string]$MonitorEndpoint,
@@ -36,13 +35,10 @@ function Set-PrivateAcl {
     }
     Set-Acl -LiteralPath $Path -AclObject $acl
 }
-function Test-SshPort {
-    param($Ports)
-    foreach ($port in @($Ports)) {
-        if ($port -eq 'Any' -or $port -eq '22') { return $true }
-        if ($port -match '^(\d+)-(\d+)$' -and 22 -ge [int]$Matches[1] -and 22 -le [int]$Matches[2]) { return $true }
-    }
-    return $false
+function Grant-ProjectAccess {
+    param([string]$Path, [string]$UserSid)
+    # Add access without resetting existing permissions or changing ownership.
+    Invoke-CheckedNative icacls.exe @($Path, '/grant', "*${UserSid}:(OI)(CI)M", '/t', '/q')
 }
 function Assert-TrustedState {
     param([string]$Path)
@@ -62,17 +58,73 @@ function Assert-TrustedState {
         }
     }
 }
-function Get-SshAllowRules {
-    param([string]$SshdPath)
-    @(Get-NetFirewallRule -PolicyStore ActiveStore -Enabled True -Direction Inbound -Action Allow | ForEach-Object {
-        $rule = $_
-        $port = $rule | Get-NetFirewallPortFilter
-        $app = $rule | Get-NetFirewallApplicationFilter
-        $svc = $rule | Get-NetFirewallServiceFilter
-        if (($port.Protocol -in @('TCP', '6', 'Any', '256')) -and (Test-SshPort $port.LocalPort) -and
-            ($app.Program -eq 'Any' -or $app.Program -eq $SshdPath -or $app.Program -like '*\sshd.exe') -and
-            ($svc.Service -in @('Any', 'sshd'))) { $rule }
-    })
+function Add-ExhibitionSshConfiguration {
+    param([string]$Existing, [string]$Account, [string]$KeyPath)
+    if ($Existing -match '(?im)^\s*Include\s') {
+        throw 'SSH configuration uses Include directives. Integrate the exhibition Match User block manually so existing policies keep their order.'
+    }
+    $begin = "# BEGIN Cartography exhibition $Account"
+    $end = "# END Cartography exhibition $Account"
+    $pattern = '(?ms)^' + [regex]::Escape($begin) + '\r?\n.*?^' + [regex]::Escape($end) + '\r?\n?'
+    $existingWithoutBlock = [regex]::Replace($Existing, $pattern, '')
+    $block = @"
+$begin
+Match User $Account
+    AllowUsers $Account
+    PubkeyAuthentication yes
+    PasswordAuthentication no
+    AuthenticationMethods publickey
+    AuthorizedKeysFile "$($KeyPath.Replace('\', '/'))"
+    PubkeyAcceptedKeyTypes ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-256,rsa-sha2-512
+    DisableForwarding yes
+    AllowTcpForwarding no
+    AllowAgentForwarding no
+    X11Forwarding no
+    PermitTunnel no
+$end
+"@
+    # Put this user's settings before existing Match blocks; leave every global directive intact.
+    $firstMatch = [regex]::Match($existingWithoutBlock, '(?im)^\s*Match\s')
+    if ($firstMatch.Success) {
+        return $existingWithoutBlock.Insert($firstMatch.Index, "$block`r`n")
+    }
+    return $existingWithoutBlock.TrimEnd() + "`r`n$block`r`n"
+}
+function Get-SshServicePaths {
+    param([string]$CommandLine)
+    $defaultExecutable = Join-Path $env:SystemRoot 'System32\OpenSSH\sshd.exe'
+    $defaultConfig = Join-Path $env:ProgramData 'ssh\sshd_config'
+    if (-not $CommandLine) { return @{ executable = $defaultExecutable; config = $defaultConfig } }
+    $expanded = [Environment]::ExpandEnvironmentVariables($CommandLine)
+    if ($expanded -notmatch '^\s*(?:"(?<exe>[^"]+sshd\.exe)"|(?<exe>\S+sshd\.exe))(?:\s+-f\s+(?:"(?<config>[^"]+)"|(?<config>\S+)))?\s*$') {
+        throw 'Existing sshd service has custom command-line options. Review its configuration manually; setup will not redirect it.'
+    }
+    return @{ executable = $Matches.exe; config = $(if ($Matches.ContainsKey('config')) { $Matches.config } else { $defaultConfig }) }
+}
+function Restore-SshFile {
+    param($Change)
+    if ($Change.existed) {
+        $restorePath = $Change.path + '.' + [Guid]::NewGuid().ToString('N') + '.restore'
+        try {
+            Copy-Item -LiteralPath $Change.backup -Destination $restorePath
+            if (Test-Path -LiteralPath $Change.path) { [IO.File]::Replace($restorePath, $Change.path, [NullString]::Value) }
+            else { [IO.File]::Move($restorePath, $Change.path) }
+        }
+        finally { if (Test-Path -LiteralPath $restorePath) { Remove-Item -LiteralPath $restorePath } }
+    }
+    elseif (Test-Path -LiteralPath $Change.path) { Remove-Item -LiteralPath $Change.path }
+}
+function Publish-SshFile {
+    param([string]$CandidatePath, [string]$Path, [string]$BackupPath)
+    $change = [pscustomobject]@{ path = $Path; backup = $BackupPath; existed = (Test-Path -LiteralPath $Path) }
+    # Finish the backup before touching the live file. Candidates share the target volume.
+    if ($change.existed) { Copy-Item -LiteralPath $Path -Destination $BackupPath -Force }
+    try {
+        if ($change.existed) { [IO.File]::Replace($CandidatePath, $Path, [NullString]::Value) }
+        else { [IO.File]::Move($CandidatePath, $Path) }
+    }
+    catch { Restore-SshFile $change; throw }
+    return $change
 }
 function Assert-ProtectedParents {
     param([string]$Path)
@@ -130,15 +182,15 @@ function Read-MonitorCredential {
     catch { throw 'Monitor credential must be a regular, non-reparse JSON file containing valid machineId and token fields.' }
 }
 function New-ExhibitionMonitorTask {
-    param([string]$Root, [string]$ConfigPath, [string]$StateDirectory)
+    param([string]$Root, [string]$ConfigPath, [string]$StateDirectory, [string]$UserId)
     $arguments = '-I -B "{0}" --config "{1}" --state-directory "{2}" --snapshot-directory "{3}"' -f
         (Join-Path $Root 'tools\monitor_agent.py'), $ConfigPath, $StateDirectory, (Join-Path $Root 'cache\monitoring')
     $action = New-ScheduledTaskAction -Execute (Join-Path $Root 'runtime\python\python.exe') -Argument $arguments -WorkingDirectory $Root
-    $principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
+    $principal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType Interactive -RunLevel Limited
     $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) `
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
-    New-ScheduledTask -Action $action -Principal $principal -Trigger (New-ScheduledTaskTrigger -AtStartup) -Settings $settings `
-        -Description 'Optional telemetry collector; starts before console logon; protected credential; no remote command execution.'
+    New-ScheduledTask -Action $action -Principal $principal -Trigger (New-ScheduledTaskTrigger -AtLogOn -User $UserId) -Settings $settings `
+        -Description 'Optional telemetry collector; starts at exhibition user logon; no stored password or remote command execution.'
 }
 
 $identity = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -152,7 +204,6 @@ if ($root -eq [IO.Path]::GetPathRoot($root).TrimEnd('\') -or $root -eq $env:USER
     throw 'DeploymentPath must be a dedicated project directory, not a drive, profile, Windows, or ProgramData root.'
 }
 if ($root.StartsWith('\\') -or $root -match '["\r\n]') { throw 'Use a local deployment path without quotes or newlines.' }
-Assert-ProtectedParents $root
 $cursor = Get-Item -LiteralPath $root
 while ($null -ne $cursor) {
     if ($cursor.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Deployment path traverses a reparse point: $($cursor.FullName)" }
@@ -164,7 +215,7 @@ if (@(Get-ChildItem -LiteralPath $root -Recurse -Force | Where-Object { $_.Attri
 foreach ($required in @('tools\run_exhibition.ps1', 'tools\exhibition_status.ps1', 'app\main.py', 'config.json')) {
     if (-not (Test-Path -LiteralPath (Join-Path $root $required) -PathType Leaf)) { throw "Missing deployment file: $required" }
 }
-if ($ExhibitionEndDate -le (Get-Date)) { throw 'ExhibitionEndDate must be in the future; include the intended local expiry time.' }
+$fleetAddresses = @('100.87.222.71', 'fd7a:115c:a1e0::b434:de48', '100.96.33.72', 'fd7a:115c:a1e0::9f34:2149')
 $peers = @($ApprovedPeerAddresses | ForEach-Object {
     $ip = $null
     if (-not [Net.IPAddress]::TryParse($_, [ref]$ip) -or $_ -match '[/%,*\s]') { throw "Expected an exact peer IP address: $_" }
@@ -172,6 +223,7 @@ $peers = @($ApprovedPeerAddresses | ForEach-Object {
     $tail4 = $bytes.Length -eq 4 -and $bytes[0] -eq 100 -and $bytes[1] -ge 64 -and $bytes[1] -le 127
     $tail6 = $bytes.Length -eq 16 -and $ip.ToString().StartsWith('fd7a:115c:a1e0:', [StringComparison]::OrdinalIgnoreCase)
     if (-not ($tail4 -or $tail6)) { throw "Not a Tailscale address: $_" }
+    if ($ip.ToString() -notin $fleetAddresses) { throw "Only aria and asus-rog are approved SSH source machines: $_" }
     $ip.ToString()
 } | Sort-Object -Unique)
 if (-not $peers.Count) { throw 'At least one approved peer is required.' }
@@ -204,6 +256,10 @@ $prior = if (Test-Path -LiteralPath $recordPath) { Get-Content -LiteralPath $rec
 $taskName = "CartographyExhibition-$UserName"
 $monitorTaskName = "CartographyExhibition-Monitor-$UserName"
 $monitorPlan = Get-MonitorPlan -CredentialPath $MonitorCredentialPath -Endpoint $MonitorEndpoint
+$existingMonitor = Get-ScheduledTask -TaskName $monitorTaskName -ErrorAction SilentlyContinue
+if ($existingMonitor -and $existingMonitor.Principal.LogonType -ne 'Interactive' -and -not $MonitorCredentialPath) {
+    throw 'An earlier monitor task runs without an interactive user. Supply MonitorCredentialPath and MonitorEndpoint to migrate it before making the project writable.'
+}
 if ($MonitorCredentialPath) {
     foreach ($required in @('runtime\python\python.exe', 'tools\monitor_agent.py', 'app\monitoring.py')) {
         if (-not (Test-Path -LiteralPath (Join-Path $root $required) -PathType Leaf)) { throw "Missing monitoring deployment file: $required" }
@@ -214,44 +270,36 @@ if ($MonitorCredentialPath) {
 $ruleName = "CartographyExhibition-SSH-$UserName"
 $user = Get-LocalUser -Name $UserName -ErrorAction SilentlyContinue
 if ($user -and (-not $prior -or $prior.userSid -ne $user.SID.Value)) { throw 'Refusing to adopt an existing unmanaged local account. Choose a new account name.' }
+$activationPending = -not $user -or ($prior -and $prior.PSObject.Properties.Name -contains 'accountActivationPending' -and $prior.accountActivationPending)
+$activateAccount = $activationPending -and (-not $user -or -not $user.Enabled)
 if ($prior -and $prior.deploymentPath -ne $root) { throw 'Existing deployment record uses a different path.' }
 if ((Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) -and -not $prior) { throw 'Unmanaged scheduled task name collision.' }
 if ($user -and @(Get-LocalGroupMember -SID 'S-1-5-32-544' | Where-Object SID -eq $user.SID).Count) { throw 'The exhibition account is an administrator; remove that membership before continuing.' }
-$sshd = Join-Path $env:SystemRoot 'System32\OpenSSH\sshd.exe'
+$service = Get-CimInstance Win32_Service -Filter "Name='sshd'"
+$sshPaths = Get-SshServicePaths -CommandLine $(if ($service) { $service.PathName } else { '' })
+$sshd = $sshPaths.executable
+$configPath = $sshPaths.config
 $capability = Get-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0'
-$existingRules = @(Get-SshAllowRules $sshd)
-$unmanagedPolicy = @($existingRules | Where-Object PolicyStoreSourceType -ne 'Local')
-if ($unmanagedPolicy.Count) { throw "SSH-capable inbound allow rules are controlled by policy: $($unmanagedPolicy.Name -join ', '). An administrator must narrow those policies first." }
-if (@(Get-NetFirewallProfile -PolicyStore ActiveStore | Where-Object { -not $_.Enabled -or $_.DefaultInboundAction -eq 'Allow' }).Count) {
-    throw 'All firewall profiles must be enabled with default inbound blocking before setup.'
+if ((Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue) -and (-not $prior -or $prior.firewallRuleName -ne $ruleName)) {
+    throw 'Unmanaged firewall rule name collision.'
 }
-$configPath = Join-Path $stateRoot 'sshd_config'
 $keyPath = Join-Path $stateRoot 'authorized_keys'
-$candidate = @"
-# Cartography exhibition managed configuration. The default sshd_config is untouched.
-Port 22
-PubkeyAuthentication yes
-PasswordAuthentication no
-AuthenticationMethods publickey
-PermitEmptyPasswords no
-AllowUsers $UserName
-AuthorizedKeysFile $($keyPath.Replace('\', '/'))
-StrictModes yes
-DisableForwarding yes
-AllowTcpForwarding no
-AllowAgentForwarding no
-X11Forwarding no
-PermitTunnel no
-Subsystem sftp sftp-server.exe
-"@
+$existingConfig = if (Test-Path -LiteralPath $configPath) { Get-Content -LiteralPath $configPath -Raw } else { "Subsystem sftp sftp-server.exe`r`n" }
+$candidate = Add-ExhibitionSshConfiguration -Existing $existingConfig -Account $UserName -KeyPath $keyPath
+$ports = @([regex]::Matches($existingConfig, '(?im)^\s*Port\s+(\d+)\s*(?:#.*)?$') | ForEach-Object { [int]$_.Groups[1].Value })
+if (-not $ports.Count) { $ports = @(22) }
+if ($ports.Count -ne 1) { throw 'Multiple SSH listener ports require a manual firewall plan.' }
+$sshPort = $ports[0]
 [pscustomobject]@{
     mode = $(if ($Apply) { 'Apply' } else { 'Read-only plan; rerun with -Apply after review' })
-    account = "$env:COMPUTERNAME\$UserName"; standardUser = $true; expiresLocal = $ExhibitionEndDate.ToString('o')
-    deployment = $root; deploymentAcl = 'SYSTEM/Administrators own all files with full control; exhibition user read+execute on code/tools/runtime/models'
-    writableDirectories = @('cache', 'logs', 'journeys', 'screenshot'); activeConfiguration = 'cache\exhibition\config.json'
+    account = "$env:COMPUTERNAME\$UserName"; standardUser = $true; accountNeverExpires = $true
+    enableAccountAfterSsh = $activateAccount
+    deployment = $root; deploymentAcl = 'Add exhibition user Modify access throughout the project; preserve existing access and ownership'
+    writableDirectories = @($root); activeConfiguration = 'cache\exhibition\config.json'
     privilegedState = $stateRoot; publicKeyCount = $keys.Count; sshConfiguration = $candidate
     installOpenSsh = ($capability.State -ne 'Installed'); task = $taskName
-    interface = $adapter.Name; approvedPeers = $peers; disableInboundRules = @($existingRules | ForEach-Object Name)
+    interface = $adapter.Name; approvedPeers = $peers; sshPort = $sshPort; sshConfigPath = $configPath
+    existingFirewallRules = 'unchanged'; existingServiceConfiguration = 'unchanged; restart running service to load the added user block'
     accountExists = [bool]$user; rollbackRecord = $recordPath
     monitoring = $monitorPlan
 } | ConvertTo-Json -Depth 5 | Write-Output
@@ -270,7 +318,6 @@ if (-not (Test-Path -LiteralPath $stateRoot)) {
 }
 Assert-TrustedState $stateRoot
 Set-PrivateAcl -Path $stateRoot -Directory
-$service = Get-CimInstance Win32_Service -Filter "Name='sshd'"
 $record = if ($prior) { $prior } else {
     [pscustomobject]@{
         version = 1; deploymentPath = $root; userName = $UserName; userSid = $null; createdUser = $false
@@ -285,6 +332,10 @@ function Save-Record {
     $record | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $recordPath -Encoding UTF8
 }
 Save-Record
+$sshChanges = @()
+$accountActivationAttempted = $false
+$candidatePath = $null
+$keyCandidate = $null
 try {
     if (-not $prior) {
         Invoke-CheckedNative icacls.exe @($root, '/save', $record.originalAclFile, '/t', '/q')
@@ -296,21 +347,23 @@ try {
     }
     if (-not $user) {
         $password = Read-Host "Local password for $UserName (never saved by this script)" -AsSecureString
-        try { $user = New-LocalUser -Name $UserName -Password $password -PasswordNeverExpires -AccountExpires $ExhibitionEndDate -Description 'Cartography exhibition standard account' }
+        try { $user = New-LocalUser -Name $UserName -Password $password -Disabled -PasswordNeverExpires -AccountNeverExpires -Description 'Cartography exhibition standard account' }
         finally { if ($password) { $password.Dispose() }; Remove-Variable password -ErrorAction SilentlyContinue }
-        $record.userSid = $user.SID.Value; $record.createdUser = $true; $record.completedPhase = 'account'; Save-Record
+        $record.userSid = $user.SID.Value; $record.createdUser = $true; $record.completedPhase = 'account'
+        $record | Add-Member -NotePropertyName accountActivationPending -NotePropertyValue $true -Force
+        Save-Record
     }
-    Set-LocalUser -Name $UserName -AccountExpires $ExhibitionEndDate -PasswordNeverExpires $true
+    Set-LocalUser -Name $UserName -AccountNeverExpires -PasswordNeverExpires $true
     $usersGroup = Get-LocalGroup -SID 'S-1-5-32-545'
     if (-not @(Get-LocalGroupMember -Group $usersGroup | Where-Object SID -eq $user.SID).Count) {
         Add-LocalGroupMember -Group $usersGroup -Member $user
     }
-    Set-PrivateAcl -Path $root -ReaderSid $user.SID.Value -Directory
-    # Ownership also matters: a previous file owner could otherwise grant themselves write access.
-    Invoke-CheckedNative icacls.exe @($root, '/setowner', '*S-1-5-32-544', '/t', '/q')
-    foreach ($child in Get-ChildItem -LiteralPath $root -Force) {
-        Invoke-CheckedNative icacls.exe @($child.FullName, '/reset', '/t', '/q')
+    if ($MonitorCredentialPath -and $existingMonitor) {
+        # Remove an earlier SYSTEM task before its executable becomes user-writable.
+        Stop-ScheduledTask -TaskName $monitorTaskName
+        Unregister-ScheduledTask -TaskName $monitorTaskName -Confirm:$false
     }
+    Grant-ProjectAccess -Path $root -UserSid $user.SID.Value
     foreach ($directory in @('cache', 'logs', 'journeys', 'screenshot')) {
         $mutablePath = Join-Path $root $directory
         if (-not (Test-Path -LiteralPath $mutablePath)) { New-Item -ItemType Directory -Path $mutablePath | Out-Null }
@@ -321,15 +374,11 @@ try {
     if (-not (Test-Path -LiteralPath $mutableConfig)) {
         Copy-Item -LiteralPath (Join-Path $root 'config.json') -Destination $mutableConfig
     }
-    foreach ($directory in @('cache', 'logs', 'journeys', 'screenshot')) {
-        Set-PrivateAcl -Path (Join-Path $root $directory) -ReaderSid $user.SID.Value -Directory -Modify
-    }
     $record.completedPhase = 'deployment-acl'; Save-Record
     if ($capability.State -ne 'Installed') {
         $installed = Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0'
         if ($installed.RestartNeeded) { throw 'OpenSSH installation requires a reboot. Reboot and rerun this command.' }
     }
-    Stop-Service sshd -ErrorAction SilentlyContinue
     # Generate host keys locally. These identify this server; they are not fleet client credentials.
     $hostKeyDirectory = Join-Path $env:ProgramData 'ssh'
     if (-not (Test-Path -LiteralPath $hostKeyDirectory)) {
@@ -339,37 +388,24 @@ try {
     Assert-TrustedState $hostKeyDirectory
     Invoke-CheckedNative (Join-Path (Split-Path $sshd) 'ssh-keygen.exe') @('-A')
     Set-PrivateAcl -Path $stateRoot -Directory -ReaderSid $user.SID.Value
-    $keyCandidate = Join-Path $stateRoot 'authorized_keys.candidate'
-    $keys | Set-Content -LiteralPath $keyCandidate -Encoding ascii
+    $keyCandidate = $keyPath + '.' + [Guid]::NewGuid().ToString('N') + '.candidate'
+    $keys | ForEach-Object { 'from="{0}" {1}' -f ($peers -join ','), $_ } | Set-Content -LiteralPath $keyCandidate -Encoding ascii
     Set-PrivateAcl -Path $keyCandidate -ReaderSid $user.SID.Value
     Invoke-CheckedNative (Join-Path (Split-Path $sshd) 'ssh-keygen.exe') @('-l', '-f', $keyCandidate)
-    if (Test-Path -LiteralPath $keyPath) { Copy-Item -LiteralPath $keyPath -Destination (Join-Path $stateRoot 'authorized_keys.previous') -Force }
-    Move-Item -LiteralPath $keyCandidate -Destination $keyPath -Force
-    $candidatePath = Join-Path $stateRoot 'sshd_config.candidate'
-    $candidate | Set-Content -LiteralPath $candidatePath -Encoding ascii
+    $candidatePath = $configPath + '.' + [Guid]::NewGuid().ToString('N') + '.candidate'
+    [IO.File]::WriteAllText($candidatePath, $candidate, (New-Object Text.UTF8Encoding($false)))
     Set-PrivateAcl -Path $candidatePath
     Invoke-CheckedNative $sshd @('-t', '-f', $candidatePath)
-    if (Test-Path -LiteralPath $configPath) { Copy-Item -LiteralPath $configPath -Destination (Join-Path $stateRoot 'sshd_config.previous') -Force }
-    Move-Item -LiteralPath $candidatePath -Destination $configPath -Force
-    # Catch the broad default rule that capability installation may just have created.
-    foreach ($rule in @(Get-SshAllowRules $sshd)) {
-        if ($rule.Name -eq $ruleName) { continue }
-        if ($rule.PolicyStoreSourceType -ne 'Local') { throw "Cannot narrow policy-owned rule $($rule.Name)" }
-        if ($record.disabledFirewallRules -notcontains $rule.Name) {
-            $record.disabledFirewallRules = @($record.disabledFirewallRules) + $rule.Name; Save-Record
-        }
-        Disable-NetFirewallRule -Name $rule.Name | Out-Null
-    }
+    $configBackup = Join-Path $stateRoot 'sshd_config.previous'
+    $record | Add-Member -NotePropertyName sshConfigPath -NotePropertyValue $configPath -Force
+    $record | Add-Member -NotePropertyName sshConfigBackup -NotePropertyValue $configBackup -Force
+    Save-Record
     if (Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue) { Remove-NetFirewallRule -Name $ruleName }
     New-NetFirewallRule -Name $ruleName -DisplayName "Exhibition SSH ($UserName): approved Tailscale peers" `
-        -Direction Inbound -Action Allow -Enabled True -Profile Any -Protocol TCP -LocalPort 22 `
+        -Direction Inbound -Action Allow -Enabled True -Profile Any -Protocol TCP -LocalPort $sshPort `
         -RemoteAddress $peers -InterfaceAlias $adapter.Name -Program $sshd -Service sshd | Out-Null
-    $serviceChange = Invoke-CimMethod -InputObject (Get-CimInstance Win32_Service -Filter "Name='sshd'") -MethodName Change `
-        -Arguments @{ PathName = ('"{0}" -f "{1}"' -f $sshd, $configPath); StartMode = 'Automatic' }
-    if ($serviceChange.ReturnValue -ne 0) { throw "Could not configure sshd service: Win32 error $($serviceChange.ReturnValue)" }
-    Invoke-CheckedNative sc.exe @('failure', 'sshd', 'reset=', '86400', 'actions=', 'restart/5000/restart/15000/restart/60000')
-    Invoke-CheckedNative sc.exe @('failureflag', 'sshd', '1')
-    $record.completedPhase = 'ssh'; Save-Record
+    if (-not $service) { Set-Service sshd -StartupType Automatic }
+    $record.completedPhase = 'ssh-staged'; Save-Record
     $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
         -Argument ('-NoLogo -NoProfile -ExecutionPolicy Bypass -File "{0}" -DeploymentPath "{1}"' -f (Join-Path $root 'tools\run_exhibition.ps1'), $root) -WorkingDirectory $root
     $principal = New-ScheduledTaskPrincipal -UserId $user.SID.Value -LogonType Interactive -RunLevel Limited
@@ -384,36 +420,64 @@ try {
     $registered = $scheduler.GetFolder('\').GetTask($taskName)
     $registered.SetSecurityDescriptor("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;$($user.SID.Value))", 0)
     if ($MonitorCredentialPath) {
-        # Never put the credential or privileged SQLite outbox in the user's writable cache.
-        $monitorDirectory = Join-Path $stateRoot 'monitor'
+        $monitorDirectory = Join-Path $root 'cache\exhibition-monitor'
         if (-not (Test-Path -LiteralPath $monitorDirectory)) { New-Item -ItemType Directory -Path $monitorDirectory | Out-Null }
-        Set-PrivateAcl -Path $monitorDirectory -Directory
+        Set-PrivateAcl -Path $monitorDirectory -Directory -ReaderSid $user.SID.Value -Modify
         $monitorConfig = Join-Path $monitorDirectory 'config.json'
         $monitorCandidate = Join-Path $monitorDirectory 'config.pending.json'
         try {
             [IO.File]::WriteAllText($monitorCandidate, (@{ endpoint = $MonitorEndpoint; token = $monitorToken } | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
-            Set-PrivateAcl -Path $monitorCandidate
+            Set-PrivateAcl -Path $monitorCandidate -ReaderSid $user.SID.Value -Modify
             Stop-ScheduledTask -TaskName $monitorTaskName -ErrorAction SilentlyContinue
             if (Test-Path -LiteralPath $monitorConfig) { [IO.File]::Replace($monitorCandidate, $monitorConfig, [NullString]::Value) }
             else { [IO.File]::Move($monitorCandidate, $monitorConfig) }
-            Set-PrivateAcl -Path $monitorConfig
+            Set-PrivateAcl -Path $monitorConfig -ReaderSid $user.SID.Value -Modify
         }
         finally { $monitorToken = $null }
         $record | Add-Member -NotePropertyName monitorTaskName -NotePropertyValue $monitorTaskName -Force
         $record | Add-Member -NotePropertyName monitorConfigPath -NotePropertyValue $monitorConfig -Force
         Save-Record
-        $monitorTask = New-ExhibitionMonitorTask -Root $root -ConfigPath $monitorConfig -StateDirectory $monitorDirectory
+        $monitorTask = New-ExhibitionMonitorTask -Root $root -ConfigPath $monitorConfig -StateDirectory $monitorDirectory -UserId $user.SID.Value
         Register-ScheduledTask -TaskName $monitorTaskName -InputObject $monitorTask -Force | Out-Null
-        $scheduler.GetFolder('\').GetTask($monitorTaskName).SetSecurityDescriptor('D:P(A;;FA;;;SY)(A;;FA;;;BA)', 0)
+        $scheduler.GetFolder('\').GetTask($monitorTaskName).SetSecurityDescriptor("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;$($user.SID.Value))", 0)
     }
-    Start-Service sshd
-    if ($MonitorCredentialPath) { Start-ScheduledTask -TaskName $monitorTaskName }
+    # Activate only after validation and task setup succeed. Retain both originals for recovery.
+    $sshChanges += Publish-SshFile -CandidatePath $keyCandidate -Path $keyPath -BackupPath (Join-Path $stateRoot 'authorized_keys.previous')
+    $sshChanges += Publish-SshFile -CandidatePath $candidatePath -Path $configPath -BackupPath $configBackup
+    if ($service -and $service.State -eq 'Running') { Restart-Service sshd }
+    elseif (-not $service) { Start-Service sshd }
+    if ($activateAccount) {
+        $accountActivationAttempted = $true
+        Enable-LocalUser -Name $UserName
+    }
+    if ($activationPending) {
+        $record | Add-Member -NotePropertyName accountActivationPending -NotePropertyValue $false -Force
+    }
+    # Both tasks start at the user's next console logon. No interactive token is required during setup.
     $record.completedPhase = 'complete'; Save-Record
     Write-Output "Configured. Log on locally as $UserName to start the interactive task. Rollback record: $recordPath"
 }
 catch {
-    # Fail closed if provisioning did not complete. Local console access remains available.
-    Stop-Service sshd -ErrorAction SilentlyContinue
+    # Disable an account we just activated before rolling back its SSH restrictions.
+    # If disabling fails, leave those restrictions in place rather than expose global login policy.
+    if ($accountActivationAttempted) {
+        Disable-LocalUser -Name $UserName
+        $record | Add-Member -NotePropertyName accountActivationPending -NotePropertyValue $true -Force
+    }
+    # Never stop a pre-existing SSH service when another setup phase fails.
+    [array]::Reverse($sshChanges)
+    foreach ($change in $sshChanges) {
+        try { Restore-SshFile $change }
+        catch { Write-Warning "Could not restore $($change.path). Original backup retained at $($change.backup)." }
+    }
+    if ($sshChanges.Count -and $service -and $service.State -eq 'Running' -and (Get-Service sshd).Status -ne 'Running') {
+        Start-Service sshd
+    }
     Save-Record
     throw
+}
+finally {
+    foreach ($stagedPath in @($candidatePath, $keyCandidate)) {
+        if ($stagedPath -and (Test-Path -LiteralPath $stagedPath)) { Remove-Item -LiteralPath $stagedPath }
+    }
 }

@@ -175,22 +175,72 @@ async function readApi(url: URL, env: Env, now: number) {
   return fail(404, 'Not found');
 }
 
-const alertConditions: Record<string, string> = {
-  offline: 'last_seen_at IS NOT NULL AND last_seen_at < ? - 180000',
-  app_error: "last_seen_at >= ? - 90000 AND json_extract(latest_json, '$.app.state') IN ('error','stalled','stopped')",
-  archive_error: "last_seen_at >= ? - 90000 AND json_extract(latest_json, '$.archiveSync.state') IN ('error','retrying')",
-  disk_low: "last_seen_at >= ? - 90000 AND json_extract(latest_json, '$.system.diskFreeBytes') < 10737418240",
-  gpu_hot: "last_seen_at >= ? - 90000 AND json_extract(latest_json, '$.system.gpuTemperatureC') >= 85",
+async function alertFeed(request: Request, url: URL, env: Env, now: number) {
+  const authorization = request.headers.get('Authorization') ?? '';
+  if (!/^Bearer [A-Za-z0-9_-]{43}$/.test(authorization)) fail(401, 'Invalid alert reader credential');
+  const reader = await env.DB.prepare('SELECT id FROM alert_readers WHERE token_hash = ? AND revoked_at IS NULL')
+    .bind(await tokenHash(authorization.slice(7))).first<{ id: string }>();
+  if (!reader) fail(401, 'Invalid alert reader credential');
+  await rate(env.REQUEST_LIMIT, `alert-reader:${reader!.id}`);
+  queryParams(url, ['after']);
+  const cursor = url.searchParams.get('after') ?? '0';
+  const after = Number(cursor);
+  if (!/^(0|[1-9][0-9]*)$/.test(cursor) || !Number.isSafeInteger(after)) fail(400, 'Invalid alert feed cursor');
+  const { results } = await env.DB.prepare(`SELECT id, alert_id AS alertId, machine_id AS machineId,
+    machine_label AS machineLabel, code, transition, occurred_at AS occurredAt, reason, evidence_json
+    FROM alert_events WHERE id > ? ORDER BY id LIMIT 201`).bind(after).all<{
+      id: number; alertId: number; machineId: string; machineLabel: string; code: string;
+      transition: 'opened' | 'resolved'; occurredAt: number; reason: string | null; evidence_json: string | null;
+    }>();
+  const events = results.slice(0, 200).map(({ evidence_json, ...event }) => ({
+    ...event, evidence: evidence_json ? JSON.parse(evidence_json) : null,
+  }));
+  return json({ schemaVersion: 1, serverTime: now, events,
+    nextCursor: events.at(-1)?.id ?? after, hasMore: results.length > 200 });
+}
+
+const alertConditions: Record<string, { open: string; recover: string }> = {
+  offline: {
+    open: 'last_seen_at IS NOT NULL AND last_seen_at < ? - 180000',
+    recover: 'last_seen_at >= ? - 90000',
+  },
+  app_error: {
+    open: "last_seen_at >= ? - 90000 AND json_extract(latest_json, '$.app.state') IN ('error','stalled','stopped')",
+    recover: `last_seen_at >= ? - 90000 AND json_extract(latest_json, '$.app.state') = 'running'
+      AND json_extract(latest_json, '$.app.processRunning') = 1
+      AND json_extract(latest_json, '$.app.statusAgeSeconds') <= 20
+      AND json_extract(latest_json, '$.app.displayFps') > 0
+      AND json_extract(latest_json, '$.app.lastFrameAgeSeconds') <= 20`,
+  },
+  archive_error: {
+    open: "last_seen_at >= ? - 90000 AND json_extract(latest_json, '$.archiveSync.state') IN ('error','retrying')",
+    recover: `last_seen_at >= ? - 90000 AND json_extract(latest_json, '$.archiveSync.enabled') = 1
+      AND json_extract(latest_json, '$.archiveSync.statusAgeSeconds') <= 1800
+      AND json_extract(latest_json, '$.archiveSync.state') IN ('idle','scanning','packing','uploading','verifying','pruning')
+      AND (json_extract(latest_json, '$.archiveSync.processRunning') = 1 OR json_extract(latest_json, '$.archiveSync.state') = 'idle')`,
+  },
+  disk_low: {
+    open: "last_seen_at >= ? - 90000 AND json_extract(latest_json, '$.system.diskFreeBytes') < 10737418240",
+    recover: "last_seen_at >= ? - 90000 AND json_extract(latest_json, '$.system.diskFreeBytes') >= 10737418240",
+  },
+  gpu_hot: {
+    open: "last_seen_at >= ? - 90000 AND json_extract(latest_json, '$.system.gpuTemperatureC') >= 85",
+    recover: "last_seen_at >= ? - 90000 AND json_extract(latest_json, '$.system.gpuTemperatureC') < 85",
+  },
 };
 
 export async function maintain(env: Env, now: number) {
   const statements: D1PreparedStatement[] = [];
   for (const [code, condition] of Object.entries(alertConditions)) {
     statements.push(env.DB.prepare(`INSERT OR IGNORE INTO alerts(machine_id, code, opened_at)
-      SELECT id, ?, ? FROM machines WHERE revoked_at IS NULL AND (${condition})`).bind(code, now, now));
-    statements.push(env.DB.prepare(`UPDATE alerts SET resolved_at = ? WHERE code = ? AND resolved_at IS NULL
-      AND machine_id NOT IN (SELECT id FROM machines WHERE revoked_at IS NULL AND (${condition}))`).bind(now, code, now));
+      SELECT id, ?, ? FROM machines WHERE revoked_at IS NULL AND (${condition.open})`).bind(code, now, now));
+    // Silence and null readings are not evidence of recovery.
+    statements.push(env.DB.prepare(`UPDATE alerts SET resolved_at = ?, resolution_reason = 'recovered'
+      WHERE code = ? AND resolved_at IS NULL AND machine_id IN
+      (SELECT id FROM machines WHERE revoked_at IS NULL AND (${condition.recover}))`).bind(now, code, now));
   }
+  statements.push(env.DB.prepare(`UPDATE alerts SET resolved_at = ?, resolution_reason = 'revoked'
+    WHERE resolved_at IS NULL AND machine_id IN (SELECT id FROM machines WHERE revoked_at IS NOT NULL)`).bind(now));
   statements.push(env.DB.prepare('DELETE FROM samples WHERE sampled_at < ?').bind(now - RAW_RETENTION_MS));
   statements.push(env.DB.prepare('DELETE FROM machine_boots WHERE last_received_at < ?').bind(now - RAW_RETENTION_MS));
   statements.push(env.DB.prepare('DELETE FROM alerts WHERE resolved_at IS NOT NULL AND resolved_at < ?').bind(now - 30 * 86400_000));
@@ -215,6 +265,10 @@ export function createWorker(options: { humanVerifier?: HumanVerifier; now?: () 
           if (request.method !== 'POST') fail(405, 'Method not allowed');
           queryParams(url, []);
           return secure(await ingest(request, env, url.pathname.endsWith('/history'), now));
+        }
+        if (url.pathname === '/api/v1/alert-feed') {
+          if (request.method !== 'GET') fail(405, 'Method not allowed');
+          return secure(await alertFeed(request, url, env, now));
         }
         if (request.method !== 'GET' && request.method !== 'HEAD') fail(405, 'Method not allowed');
         let user: string;

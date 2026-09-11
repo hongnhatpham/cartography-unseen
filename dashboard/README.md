@@ -1,7 +1,7 @@
 # Hosted monitor
 
 One Cloudflare Worker receives machine health samples, serves the dashboard assets,
-and exposes read-only human APIs. D1 stores credentials as SHA-256 hashes and keeps
+and exposes read-only human APIs and an ARIA alert feed. D1 stores credentials as SHA-256 hashes and keeps
 seven days of raw samples. Nothing in this service runs commands on machines.
 The dashboard uses the selected Projection desk design with plain-language incident
 messages. It separates machine contact, artwork rendering and verified map backups.
@@ -118,6 +118,7 @@ prompts, screenshots, file paths, hostnames, or exception text.
 | `GET /api/v1/machines` | Human Access JWT | Latest snapshot and receipt age, 200 machines per page, optional `after` cursor. |
 | `GET /api/v1/series` | Human Access JWT | Required `machineId`; optional epoch-ms `from`, `to`, and `resolution=raw` or `5m`. |
 | `GET /api/v1/alerts` | Human Access JWT | Latest 200 alert events; optional `machineId` and numeric `before` cursor. |
+| `GET /api/v1/alert-feed` | Alert-reader bearer token | Ordered incident transitions, at most 200 per page; optional exclusive `after` event ID. |
 
 Ingestion returns HTTP 202 with `{accepted,receivedAt,history}`. `accepted` counts
 valid records in an idempotent request, including duplicates. Clients may retry
@@ -144,10 +145,129 @@ not claim to retain aggregates beyond seven days.
 
 The every-minute scheduled task opens or resolves offline, app error/stalled/stopped,
 archive error/retrying, disk under 10 GiB, and GPU at least 85 C alerts. Hardware and
-app alerts use only heartbeats received within 90 seconds. Resolved events last
-30 days. Unknown machine health does not create a fabricated offline event.
+app alerts open only from heartbeats received within 90 seconds. Recovery requires
+fresh healthy evidence. Silence, null readings, artwork startup, and disabled
+uploads do not resolve those incidents. Artwork recovery requires a running process,
+status and frame observations at most 20 seconds old, and positive display FPS.
+Upload recovery requires enabled uploads, a healthy upload phase and a status
+observation at most 30 minutes old. An idle uploader may have exited normally.
+Revoking a machine closes its incidents with reason `revoked`, not `recovered`.
+Resolved dashboard incidents last 30 days. Unknown machine health does not create
+a fabricated offline event.
 Alert evaluation can lag receipt by a minute. Connection status is calculated on
 each machines request, so it does not depend on cron timing.
+
+## ARIA/Hermes Discord alerts
+
+ARIA polls the Worker and uses its existing Discord integration to send notices.
+It needs no public intake endpoint. The Worker does not hold a Discord credential
+or send messages. An alert-reader credential can read only `/api/v1/alert-feed`;
+it cannot ingest telemetry, read the dashboard, or call the human APIs. Reader
+credentials grant access to incidents for all monitored machines.
+
+Apply migration `0002_alert_feed.sql` before deploying this Worker version. It adds
+the reader table, an incident journal and transactional triggers. It backfills
+existing incident transitions, preserving incident IDs. Historical evidence is
+`null`, and historical resolutions have reason `unknown` because older cron logic
+could resolve an incident when reports stopped. Neither migration edits telemetry
+nor replaces machine credentials.
+
+Create ARIA's credential on the administrator computer:
+
+```powershell
+pnpm credential --alert-reader aria "ARIA Discord alerts"
+pnpm exec wrangler d1 execute monitor --local --file credentials/alert-reader-aria.sql
+```
+
+For an authorized production setup, apply migrations and bootstrap SQL with
+`--remote`. Privately install `credentials/alert-reader-aria.json` for ARIA/Hermes
+and restrict its filesystem permissions. The JSON has `readerId`, `role` and
+`token`; SQL contains only the hash. The generator never prints the token or
+overwrites a file. Use `Authorization: Bearer <token>` from ARIA's secret storage,
+never a query string. Revoke with:
+
+```sql
+UPDATE alert_readers SET revoked_at = unixepoch() * 1000 WHERE id = 'aria';
+```
+
+For rotation, generate a fresh reader credential in a private working directory
+and update that reader's `token_hash` and `revoked_at = NULL`. Preserve ARIA's
+cursor and dedupe state across rotation.
+
+`GET /api/v1/alert-feed?after=0` returns:
+
+```json
+{
+  "schemaVersion": 1,
+  "serverTime": 1789106400000,
+  "events": [{
+    "id": 1,
+    "alertId": 1,
+    "machineId": "gallery-a",
+    "machineLabel": "Gallery A",
+    "code": "gpu_hot",
+    "transition": "opened",
+    "occurredAt": 1789106400000,
+    "reason": null,
+    "evidence": {
+      "lastSeenAt": 1789106400000,
+      "appState": "running",
+      "appErrorCode": null,
+      "archiveState": "idle",
+      "archiveErrorCode": null,
+      "diskFreeBytes": 21474836480,
+      "gpuTemperatureC": 90
+    }
+  }],
+  "nextCursor": 1,
+  "hasMore": false
+}
+```
+
+Times are epoch milliseconds. Event `id` is immutable and strictly increasing,
+but IDs need not be contiguous. `alertId` links an opening and its eventual
+resolution. A recurrence gets a new `alertId`. The journal snapshots the machine
+label and listed evidence when cron records each transition. Evidence can be stale
+for offline and revoked incidents; it is not a current health report.
+
+The exclusive `after` cursor defaults to `0`. Follow `nextCursor` while `hasMore`
+is true, then poll again after 60 seconds using the same cursor. An empty page
+keeps the supplied cursor. Persist only a returned cursor after processing its
+events. Retries return the same event IDs. Opening and recovery between polls
+remain separate events, so ARIA cannot miss a recovery by querying only open rows.
+The compact journal has no automatic expiry, even after dashboard incidents are
+pruned. Keep it when backing up or migrating D1. An explicit future archival
+policy must also define how consumers reset; do not manually prune this table.
+
+Configure ARIA's recurring task with these rules:
+
+1. Keep a durable cursor, event dedupe records and incident state scoped to this
+   monitor URL. Use a single poller or a lock so runs do not overlap. On first use,
+   replay all pages from `0` to reconstruct incident state, then announce only
+   incidents still open. This avoids sending a backlog of historical recoveries.
+2. On subsequent polls, process events in ID order. Send one Discord notice per
+   `opened` event. Use the monitor URL and event ID as the dedupe key, and group
+   follow-up notices by `alertId`. Include the machine label, incident code,
+   occurrence time and relevant evidence, plus the human dashboard URL.
+3. Send a recovery notice only for `resolved` with reason `recovered`. Say that
+   an upload error cleared when its healthy phase returns; do not claim pending
+   maps are backed up. Reason `revoked` means monitoring was administratively
+   disabled, and `unknown` must never produce a healthy-recovery claim.
+4. Save delivery results and advance the cursor after successful processing.
+   Retry failures without advancing past an undelivered event. Respect HTTP 429
+   `Retry-After`; retry network and 5xx errors with backoff. A 401 requires fixing
+   the reader credential. A feed failure is a monitoring failure, never evidence
+   that the exhibition recovered.
+5. Check the target Discord channel's recent messages for the same event marker
+   when delivery success is uncertain. Discord delivery and local checkpointing
+   are not one transaction, so a crash after sending can otherwise duplicate a
+   notice. The feed supports durable replay, not exactly-once Discord delivery.
+
+Incident codes are `offline`, `app_error`, `archive_error`, `disk_low`, and
+`gpu_hot`. Dedupe holds while a condition remains active. Threshold crossings after
+a confirmed recovery are new incidents. Allow roughly one cron interval plus one
+poll interval after a condition becomes eligible. An offline incident becomes
+eligible after more than 180 seconds without a heartbeat.
 
 ## Cloudflare deployment checklist
 
@@ -162,14 +282,15 @@ Before an authorized deployment:
    with an explicit human allow policy. Set its team hostname in
    `ACCESS_TEAM_DOMAIN` and audience in `ACCESS_AUD`. These are public identifiers,
    not secrets. The Worker validates signature, issuer, audience, expiry and human
-   identity for static assets and every read API. It never trusts an email header.
+   identity for static assets and human read APIs. It never trusts an email header.
 4. Configure Access path bypass applications for exactly `/api/v1/heartbeat` and
-   `/api/v1/history`, so collectors can reach the Worker using their own bearer
-   credentials. Keep the rest of the hostname behind human Access. These two paths
-   still require machine authentication inside the Worker.
+   `/api/v1/history`, and `/api/v1/alert-feed` when enabling ARIA. Collectors and
+   ARIA reach these routes using their distinct bearer credentials. Keep the rest
+   of the hostname behind human Access. Each bypassed path still requires its
+   matching credential inside the Worker. Do not bypass `/api/v1/*` as a group.
 5. Choose unused rate-limit namespace IDs in the account. The defaults allow 180
    requests per minute per client IP before authentication, 180 human requests per
-   minute per identity, 10 ingest requests per minute per machine, and 2 history
+   minute per human or alert-reader identity, 10 ingest requests per minute per machine, and 2 history
    requests per minute per machine. Cloudflare counters are per location, not a
    global billing cap. Add account-level WAF limits if your exposure needs them.
 6. Run `pnpm test`, `pnpm typecheck`, `pnpm build`, and `pnpm build:worker`.

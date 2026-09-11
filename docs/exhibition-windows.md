@@ -1,188 +1,124 @@
 # Windows exhibition host
 
-Use a dedicated Windows installation and deployment directory. The exhibition runs as a new standard local user. Approved fleet machines connect inbound through Tailscale to Windows OpenSSH using public keys. The host receives public keys only. It does not need fleet private keys, an outbound SSH configuration, or a Tailscale enrollment key in the project.
+Create a clean, standard local Windows account for the one-week exhibition starting November 19, 2026. The account and password have no expiry date. Setup leaves existing accounts and administrator membership alone and gives the exhibition user Modify access throughout the project, so ordinary editing and troubleshooting work normally. There is no kiosk mode or date-based shutdown.
 
-The setup script prints a read-only plan by default. `-Apply` creates the account, changes the dedicated deployment ACLs, configures OpenSSH and its firewall rules, and registers an interactive logon task. Run it from the local console so a failed SSH change cannot strand you. Keep a separate administrator login available.
+`tools/setup_exhibition_windows.ps1` prints a read-only plan by default. `-Apply` creates the account, grants project access, configures inbound OpenSSH, and registers tasks that run at the exhibition user's logon. Run setup from an elevated, 64-bit Windows PowerShell console on the target machine. It does not enable autologon or change Windows Update, sleep, display timeout, lock policy, or Defender.
 
-Privileged apply and commissioning require the actual target Windows machine.
-Building or reviewing a package on another computer does not provision the host.
-The normal `tools/pack_exhibition.ps1 -Zip` package downloads its runtime and
-models on first launch. For offline deployment, complete `setup_first_run.bat`
-in a trusted source checkout, install any optional monitoring/storage dependencies,
-then build with `tools/pack_exhibition.ps1 -PreparedOffline -Zip`. That mode copies
-the prepared runtime and pinned model files and writes a fresh installation marker
-only after the copied runtime passes CUDA imports and a real offline generation.
-It never copies source caches, operator credentials or personal archives. Repeat
-verification on the target GPU as described below.
+## Prepare the project and keys
 
-## Before setup
+1. Install the NVIDIA driver and Tailscale. Enroll the machine in the fleet manually and confirm its Tailscale device/key lifetime covers the show. Use Windows OpenSSH for remote access. Setup does not enroll devices or change tailnet grants.
+2. Put a clean project copy in `C:\Exhibition\Cartography`, outside anyone's personal profile. Include no personal files, credentials, or fleet private keys. This short, shared path is easy to open in Explorer or a terminal. Setup adds the exhibition user's access without replacing existing project permissions or file ownership. Choose a parent directory that the new user can browse.
+3. Complete `setup_first_run.bat` before the show and run `runtime\python\python.exe tools\verify_offline.py --root C:\Exhibition\Cartography` on the target GPU. The supervisor never installs missing dependencies or downloads models. Test the artwork offline, including the display, controller, generation and journey saving.
+4. Obtain the intended OpenSSH public key from aria and asus-rog as `aria.pub` and `asus-rog.pub`. Transfer only `.pub` files to the exhibition host. Each private key stays on its original fleet machine. Confirm these are the keys used by those machines before applying setup.
 
-1. Install Windows updates, the NVIDIA driver, and Tailscale. Enroll Tailscale manually with the appropriate exhibition device identity. The script neither enrolls the host nor changes tailnet policy. Arrange tailnet ACLs/grants and device/key expiry with the fleet administrator before the exhibition. Use Windows OpenSSH, not Tailscale SSH.
-2. Copy the application from a trusted release to a dedicated administrator-controlled directory such as `C:\Exhibition\Cartography`. Include the runtime, models, `tools`, and installation marker after completing `setup_first_run.bat`. Do not deploy a personal checkout with credentials, private keys, or unrelated files. Setup assigns file ownership to Administrators, resets child ACLs and grants the exhibition user read+execute on the deployment, including code, tools, runtime, models and the root configuration template. Only `cache`, `logs`, `journeys` and `screenshot` receive Modify access. Keep the deployment's parent directory administrator-controlled too, so the standard user cannot replace the entire deployment. Other ordinary users lose project access.
-3. Run the existing offline verification on this machine. Disconnect internet access for the final graphics/input test. The supervisor will never run an installer or download missing models. Model cache flags do not prohibit optional journey uploads when credentials and application settings enable them.
-4. Obtain one OpenSSH `.pub` file for each approved fleet operator key, and the exact Tailscale IPv4 and/or IPv6 addresses of approved source machines. Include both families if clients may use either. Subnets, DNS names, wildcards, and addresses outside Tailscale ranges are rejected. Keys and source machines form independent allowlists: any approved key can authenticate from any approved address.
-5. Use elevated, 64-bit Windows PowerShell 5.1. All Windows firewall profiles must be enabled with inbound blocking. OpenSSH capability installation can require Windows Update or an administrator-provided Features on Demand source. If policy owns an inbound rule that permits SSH, narrow it through that policy before running setup.
+The source addresses default to this fixed fleet allowlist. An explicit `ApprovedPeerAddresses` parameter may narrow it, but cannot add other machines.
 
-For a new deployment parent, create it at the administrator console before copying the release. This example refuses to reuse an existing directory. If the parent already exists, inspect and secure its ACLs deliberately instead. Setup checks ancestor ownership and permissions that could allow another user to replace the deployment.
+| Machine | Tailscale IPv4 | Tailscale IPv6 |
+| --- | --- | --- |
+| aria | `100.87.222.71` | `fd7a:115c:a1e0::b434:de48` |
+| asus-rog | `100.96.33.72` | `fd7a:115c:a1e0::9f34:2149` |
 
-```powershell
-$parent = 'C:\Exhibition'
-if (Test-Path -LiteralPath $parent) { throw 'Choose a new dedicated parent or review the existing directory ACLs.' }
-New-Item -ItemType Directory -Path $parent
-icacls $parent /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX'
-# Copy the trusted release into C:\Exhibition\Cartography, then complete commissioning.
-```
+Public keys and addresses are independent allowlists. Either approved key can authenticate from either approved machine. Password authentication is disabled for SSH; the account's local password still works at the console.
 
-Use actual fleet addresses and public key paths in place of the examples:
+The normal `tools/pack_exhibition.ps1 -Zip` package downloads runtime and models on first launch. For an offline package, complete setup in a trusted source checkout, install optional monitoring/storage dependencies, and build with `tools/pack_exhibition.ps1 -PreparedOffline -Zip`. This copies the prepared runtime and pinned models and verifies the copied runtime with a real offline generation. It excludes source caches, operator credentials and personal archives. Verify again on the target GPU.
+
+## Preview and apply
 
 ```powershell
 $setup = @{
     UserName = 'exhibition'
     DeploymentPath = 'C:\Exhibition\Cartography'
-    PublicKeyFiles = @('C:\Commissioning\operator-a.pub', 'C:\Commissioning\operator-b.pub')
-    ApprovedPeerAddresses = @('100.101.102.103', 'fd7a:115c:a1e0::1234')
-    ExhibitionEndDate = [datetime]'2026-12-01T00:00:00'
+    PublicKeyFiles = @('C:\Commissioning\aria.pub', 'C:\Commissioning\asus-rog.pub')
     TailscaleInterfaceAlias = 'Tailscale'
 }
 & C:\Exhibition\Cartography\tools\setup_exhibition_windows.ps1 @setup
-# Review the account, directory, ACL change, and firewall rules printed above.
+# Review the account, project grant, added SSH user block and Tailscale firewall rule.
 & C:\Exhibition\Cartography\tools\setup_exhibition_windows.ps1 @setup -Apply
 ```
 
-The expiry is local Windows time and prevents subsequent account logons after that instant. The password has no separate age expiry, so password aging does not interrupt an approved show period. Account expiry does not terminate an existing exhibition session or disable the SSH listener. Schedule teardown separately. Enter the local password only at the secure prompt. The script does not store it or enable autologon. Existing unmanaged accounts and task-name collisions are rejected. Repeating setup for its own recorded account updates the peer/key allowlists, expiry and task without creating another user. A failed apply stops `sshd`; inspect the error, repair the prerequisite, and rerun locally.
+Enter a local password at the secure prompt. Setup never stores it. It creates a new account disabled, installs and activates its SSH restrictions, then enables it after SSH activation succeeds. A failure leaves that new account disabled. The rollback record tracks pending activation, so a successful rerun can finish enabling an account created by an interrupted setup. Existing accounts otherwise keep their enabled or disabled state. Setup rejects unmanaged accounts or task names. Repeating setup for its recorded account updates SSH access and tasks, preserves application settings, and clears any expiry left by an older setup.
 
-The supervisor uses `cache\exhibition\config.json`. Setup copies the administrator-managed root `config.json` there only if the mutable copy is absent. UI tuning and remote configuration edits target that mutable copy; its writable directory supports atomic temporary-file replacement. Repeating setup preserves it. Root `config.json` and `prompts.json` remain release templates that require administrator access to change. Do not run code placed in writable cache/output directories with elevation. Sign the exhibition user out before applying or repairing the deployment, and run setup from a trusted administrator-controlled copy. If an earlier setup granted the account write access to code, restore those files from a trusted release before running anything elevated.
+Keep the exhibition user signed out while applying setup. Run a trusted copy of the setup script when elevated, because the exhibition user can edit project code. Existing protected deployments receive an added Modify grant on all files. The active application configuration remains `cache\exhibition\config.json`; setup copies root `config.json` there only when it is absent. Edit the active copy when tuning the show.
 
-The script keeps `%ProgramData%\ssh\sshd_config` intact and points the `sshd` service to an administrator-owned configuration under `%ProgramData%\CartographyExhibition\exhibition`. It permits only this local user, requires public-key authentication, and disables SSH forwarding and tunneling. The user can read the authorized public keys but cannot replace them. A separate Windows firewall rule allows TCP 22 only on the selected Tailscale adapter from the exact approved peer addresses. Other enabled local inbound rules capable of admitting this SSH service are disabled, including the default OpenSSH rule. This can affect other services if they depended on a broad inbound allow rule, so read the plan.
+Setup keeps the existing SSH service executable, config path, start mode and recovery settings. It inserts a marked `Match User exhibition` block into the active config before existing Match blocks. Existing global settings and administrator authentication remain intact. Only the new exhibition user requires the approved public keys and has SSH forwarding disabled. Its administrator-owned key file and config backup live beside the rollback record at `%ProgramData%\CartographyExhibition\exhibition`.
 
-This is an inbound access policy, not an egress sandbox. Shell access permits ordinary programs under the standard account. No outbound SSH is configured or used by this workflow. Locally generated SSH host private keys belong to this server and are distinct from fleet client credentials.
+Setup adds a firewall allow rule on the current SSH port, normally TCP 22, scoped to the Tailscale adapter and the two approved machines. All other firewall rules and profiles remain unchanged. Existing rules may still admit connections for existing users. The exhibition user's public keys carry `from=` source-address restrictions, so a broader existing firewall rule does not let that account authenticate from other machines. Certificates are excluded for that account to keep authorization tied to the supplied public keys. This follows OpenSSH's [per-user configuration](https://man.openbsd.org/sshd_config) and [authorized-key restrictions](https://man.openbsd.org/sshd#AUTHORIZED_KEYS_FILE_FORMAT).
 
-## Console logon and unattended startup
+Apply stages both the config and public keys, validates them, and completes task setup before activating either file. Each live file is replaced atomically after its original is backed up. A failure during activation or service restart restores both originals. The config uses `PubkeyAcceptedKeyTypes`, which also works with older inbox Windows OpenSSH versions. Apply restarts an already-running service to load the addition. Run at the local console because this brief restart can interrupt SSH sessions. A stopped existing service stays stopped and its startup policy stays unchanged; start it manually when ready. A newly installed service is set to Automatic and started. Configurations with Include directives, multiple listener ports or custom service command-line options need manual integration. Existing deny and group-access policies still apply to the new account; resolve any conflict explicitly during commissioning.
 
-Sign in locally as `exhibition`. Task Scheduler runs `CartographyExhibition-exhibition` with that interactive user's token and limited privileges. The task does not store a password and cannot create a visible desktop before console logon. Close the first-login privacy/setup prompts, verify the correct display arrangement and controller, and confirm the artwork appears. Sign out of other graphical sessions to avoid an unattended display landing on the wrong session.
+## Log on and run
 
-For unattended reboot recovery, manually configure [Microsoft Sysinternals Autologon](https://learn.microsoft.com/en-us/sysinternals/downloads/autologon) at the physical console after commissioning. Use the local account, this computer's name, and its password. Do not pass the password on a command line or put it in a script, task XML, transcript, or registry `DefaultPassword` value. Autologon uses an LSA secret; an administrator can recover it, so it is not protection against someone who already controls the machine. Test a complete reboot. Autologon is optional and is not installed or enabled by setup.
+Sign in locally as `exhibition`. `CartographyExhibition-exhibition` starts the artwork supervisor in that user's desktop with limited privileges. Open `C:\Exhibition\Cartography` in Explorer and create a desktop shortcut there if useful. Confirm the user can open, edit and save project files. No task stores a password or runs project code as SYSTEM.
 
-Decide power and update settings with the venue. Setup does not change sleep, display timeout, lock policy, Windows Update, Defender, or reboot policy. If approved for a mains-powered exhibition, an administrator can explicitly choose:
+For recovery after a reboot, either sign in manually or configure [Microsoft Sysinternals Autologon](https://learn.microsoft.com/en-us/sysinternals/downloads/autologon) at the physical console. Autologon is optional and setup does not enable it. Enter the password in its UI, never in a command line or script. Test a full reboot through the exhibition user's desktop. An administrator can recover the stored Autologon secret.
 
-```powershell
-# Optional. Record the current values first and restore after the exhibition.
-powercfg /query SCHEME_CURRENT SUB_SLEEP STANDBYIDLE
-powercfg /query SCHEME_CURRENT SUB_VIDEO VIDEOIDLE
-powercfg /change standby-timeout-ac 0
-powercfg /change monitor-timeout-ac 0
-```
+Choose the venue's power and update settings in Windows Settings. Record manual changes so they can be restored afterward. Check BIOS power-after-loss behavior if unattended recovery from a power cut matters.
 
-Set an update/maintenance window through supported Windows Settings or the venue's management policy. Do not disable security updates indefinitely. Check BIOS power-after-loss behavior separately if the venue expects recovery from a power cut.
+## Optional monitoring
 
-## Optional monitoring before console logon
+Monitoring uses a second task, `CartographyExhibition-Monitor-exhibition`, under the same exhibition user at logon. It has its own process and remains active when the artwork task stops. Both tasks require the exhibition user to be logged on. The dashboard becomes stale while the machine is off or signed out; a successful SSH connection is a separate check that Windows is reachable.
 
-Monitoring is opt-in. Omitting `-MonitorCredentialPath` leaves any existing monitor task and its protected configuration unchanged. The artwork remains independent of monitoring and network availability.
-
-On a trusted administrator computer with the dashboard source checkout, use the dashboard credential generator described in [the dashboard runbook](../dashboard/README.md). The exhibition package includes that README for reference, but does not contain dashboard server code or credentials. The generator writes a JSON file containing `machineId` and `token` and a separate SQL file containing only the token hash. Register that hash with the intended deployed dashboard during an authorized commissioning session. A machine token permits telemetry ingestion only. It cannot read the dashboard, open SSH, or execute commands.
-
-Copy the generated credential JSON through your approved private channel into an administrator-only directory on the exhibition host, outside the project and journey archive tree. Install `requirements-monitor.txt` into the deployed runtime during commissioning. Pass the exact dashboard heartbeat URL separately; the generator's credential JSON does not contain an endpoint. From the local administrator console:
+Generate a machine credential using [the dashboard runbook](../dashboard/README.md), register its token hash with the dashboard, and transfer the credential JSON through an approved private channel. Install `requirements-monitor.txt` into the deployed runtime before setup. The token can submit telemetry only and does not grant SSH or remote command access.
 
 ```powershell
-# Reuse the account/deployment/peer parameters in $setup from the setup example.
 $monitor = @{
     MonitorCredentialPath = 'C:\Commissioning\gallery-a.json'
     MonitorEndpoint = 'https://monitor.example.org/api/v1/heartbeat'
 }
 & C:\Exhibition\Cartography\tools\setup_exhibition_windows.ps1 @setup @monitor
-# The plan reports the credential source path and endpoint host, without reading the token.
 & C:\Exhibition\Cartography\tools\setup_exhibition_windows.ps1 @setup @monitor -Apply
-Get-ScheduledTask -TaskName 'CartographyExhibition-Monitor-exhibition'
-Get-ScheduledTaskInfo -TaskName 'CartographyExhibition-Monitor-exhibition'
+# Sign in as exhibition to start both tasks.
 ```
 
-Apply validates the credential as a regular JSON file with no reparse points in its path, then writes `{endpoint,token}` to `%ProgramData%\CartographyExhibition\exhibition\monitor\config.json`. Only SYSTEM and Administrators can read that file or directory. The rollback record contains the config path and task name, never the token. Setup does not print the token or put it in task arguments. Remove the administrator's extra credential copy after verifying installation, according to your credential-handling policy.
+The plan reports only the credential source path and endpoint host without reading the token. Apply writes `{endpoint,token}` to `cache\exhibition-monitor\config.json`. The exhibition user, SYSTEM and Administrators can access this directory; other users receive no access grant. Its SQLite outbox lives beside the config. Keep that directory out of shared archives. Credentials never appear in task arguments or the rollback record. Remove the extra commissioning copy according to your credential-handling policy after verifying installation.
 
-`CartographyExhibition-Monitor-exhibition` starts at boot under SYSTEM, uses no stored password, and restarts a failed process after one minute. Apply also starts it immediately. It runs the protected deployment's Python in isolated mode and calls `tools\monitor_agent.py` with a protected state directory and the project snapshot directory. Its SQLite outbox stays under the protected ProgramData monitor directory. It reads artwork and uploader snapshots from `cache\monitoring`; it does not write privileged state into that user-writable directory. The task continues reporting machine health when nobody is logged on or the artwork task is stopped.
+The monitor reads snapshots from `cache\monitoring` and restarts after process failures. Sign in and check the dashboard receipt time, stop the artwork and confirm machine telemetry continues, then disconnect/reconnect networking and confirm reporting resumes with one collector. To rotate a token, update the dashboard machine's token hash, then rerun setup with the replacement credential and endpoint. The new collector starts at the next exhibition logon, or use `Start-ScheduledTask` while that user is already logged on.
 
-Verify this behavior with a reboot before console logon. Check the machine's dashboard receipt time and confirm the artwork is reported as stopped or unknown until its interactive session starts. Stop and restart the artwork and confirm the collector task remains Running. Then disconnect networking and verify the local artwork continues; reconnect and confirm collection resumes without starting a second collector.
+Omitting the monitor parameters leaves an existing interactive monitor task unchanged. To migrate an older SYSTEM monitor task, supply the credential and endpoint again. Setup removes the old task before granting project write access and registers the user task. Any old protected credential/outbox under ProgramData can be removed manually after verifying migration; setup preserves it for recovery.
 
-For rotation, generate a replacement credential in a separate private directory and update the existing dashboard machine row's token hash as described in the dashboard runbook. Preserve that row and its history. Rerun setup with the new `-MonitorCredentialPath` and `-MonitorEndpoint`. This explicitly replaces the protected config and restarts the collector. Reruns without a credential path do not rotate, create, or restart the monitor task. `-MonitorEndpoint` alone is rejected.
+To remove monitoring, stop and unregister its named task and remove `cache\exhibition-monitor\config.json`. Revoke the machine credential in the dashboard separately. The outbox may be retained for investigation. Removing monitoring does not stop the artwork or SSH.
 
-To remove monitoring while keeping the exhibition running, use the administrator console:
+## Observe, stop and restart
 
-```powershell
-Stop-ScheduledTask -TaskName 'CartographyExhibition-Monitor-exhibition'
-Unregister-ScheduledTask -TaskName 'CartographyExhibition-Monitor-exhibition' -Confirm:$false
-Remove-Item -LiteralPath 'C:\ProgramData\CartographyExhibition\exhibition\monitor\config.json'
-```
-
-Revoke the machine credential in the dashboard as a separate authorized operation. The local deletion removes the token copy; the bounded SQLite outbox may be retained for investigation or removed later during teardown. Omitting monitoring parameters does not remove an existing installation.
-
-## Observe, stop, and restart
-
-From an approved fleet machine, verify the server host-key fingerprint using the physical console before trusting the first connection. Then connect to the host's Tailscale address:
+Check the server host-key fingerprint at the physical console before trusting the first SSH connection. From aria or asus-rog:
 
 ```text
-ssh -i <fleet-private-key-on-this-fleet-machine> exhibition@<exhibition-tailscale-address>
+ssh -i <private-key-already-on-this-fleet-machine> exhibition@<exhibition-tailscale-address>
 ```
 
-Windows OpenSSH normally opens `cmd.exe`. Enter `powershell -NoProfile` in the remote shell before these commands:
+Windows OpenSSH normally opens `cmd.exe`; enter `powershell -NoProfile` before these commands.
 
 ```powershell
 $project = 'C:\Exhibition\Cartography'
+Set-Location $project
 & "$project\tools\exhibition_status.ps1" -DeploymentPath $project -UserName exhibition -Json
 # Exit codes: 0 process healthy; 1 SSH/disk warning; 2 app/task/heartbeat unhealthy;
 # 3 maintenance flag present; 4 status inspection failed.
 
-# Gracefully stop the owned app. The supervisor checks this flag within five seconds.
 New-Item -ItemType File -Path "$project\cache\monitoring\maintenance.stop" -Force
-# Wait until childPid is null and the task is no longer Running before changing files.
+# The supervisor checks the flag within five seconds. Wait for childPid to become null.
 Get-Content "$project\cache\monitoring\supervisor.json"
 Get-ScheduledTask -TaskName 'CartographyExhibition-exhibition'
+# Edit files after the child exits and the task is no longer Running.
 
-# Restart in the already logged-on exhibition desktop, not in the SSH session.
 Remove-Item -LiteralPath "$project\cache\monitoring\maintenance.stop"
 Start-ScheduledTask -TaskName 'CartographyExhibition-exhibition'
 ```
 
-Do not launch `run.bat` or `app.main` from SSH for the public display. The scheduled task is bound to the existing interactive session. The setup grants the exhibition user read/run rights on that task. If the supervisor is stuck, use `Stop-ScheduledTask -TaskName 'CartographyExhibition-exhibition'` before restarting; verify this permission during commissioning. An administrator can always stop it locally. A Windows Job Object kills the owned renderer when the supervisor process closes, including forced task stops.
+Restart through the task so the artwork appears in the existing local desktop. Launching `run.bat` or `app.main` from SSH does not target that desktop. The exhibition user receives read/run/stop rights on its tasks. If needed, stop the supervisor with `Stop-ScheduledTask`; its Windows Job Object closes the owned renderer too. Verify task permissions from SSH during commissioning.
 
-The supervisor checks the install marker, mutable configuration, configured model files, Python imports and CUDA availability before it starts `python.exe -m app.main --config cache/exhibition/config.json`. It remains alive as the foreground task owner. App exits trigger exponential backoff capped at 60 seconds. Eight consecutive runs shorter than five minutes latch a maintenance stop, requiring an operator to inspect and restart. A run lasting five minutes resets that short-run count. Task Scheduler can restart a failed supervisor up to three times at one-minute intervals.
+App exits trigger restart delays capped at 60 seconds. Eight consecutive runs shorter than five minutes latch a maintenance stop. Inspect the error, clear the flag, and start the task after repair. `cache\monitoring\supervisor.json` holds current status and `logs\supervisor\supervisor.log` rotates at 1 MiB with five retained files. Status makes no network calls. A live process and heartbeat do not prove rendering or input works; inspect the display too.
 
-`cache\monitoring\supervisor.json` is replaced atomically and contains bounded status fields, child PID, restart count and timestamp. `logs\supervisor\supervisor.log` rotates at 1 MiB with five retained files. These logs describe supervision; application logs retain the application's own retention policy. A fresh heartbeat and live child prove process liveness only. They do not prove that the display is rendering, input works, or image generation is progressing. Inspect the display and application telemetry during commissioning and after repairs. Status itself makes no network calls.
+## Commission and recover
 
-## Commissioning checklist
+- Verify existing administrator SSH access still works. For the exhibition account, test a successful connection from aria and asus-rog, a rejected key from an approved address, and rejected authentication from another tailnet machine or the ordinary LAN. Check IPv4 and IPv6, password rejection and forwarding. Other accounts retain their existing SSH policy.
+- Verify offline artwork operation, file editing under the exhibition account, journey/screenshot writes, maintenance stop/restart, child recovery and the optional monitor. Reboot and verify the chosen logon flow.
+- Keep the existing administrator login available to the venue operator. Record the deployment version, server host-key fingerprint and approved public keys.
 
-- Complete a real offline generation with `runtime\python\python.exe tools\verify_offline.py --root C:\Exhibition\Cartography`, then run the interactive task with the network disconnected. Confirm fullscreen display, controller input, model output, journey saving and the expected optional upload behavior.
-- Test a connection from each approved fleet address, a denied key from an approved address, and a connection from an unapproved tailnet machine. Verify ordinary LAN/public-interface access to TCP 22 fails. Test IPv4 and IPv6 explicitly where both are deployed.
-- Confirm password authentication fails, other usernames fail, and forwarding is refused. Inspect `Get-NetFirewallRule -Name 'CartographyExhibition-SSH-exhibition'` and its address/interface filters as administrator. The script validates SSH syntax before startup; these live tests verify the whole access path.
-- Stop/start through the maintenance flag and scheduled task. Kill the child once and confirm bounded restart. Stop the task and confirm its child disappears. Verify `exhibition_status.ps1` returns the documented codes for running, maintenance and stopped states.
-- As the standard user, confirm edits to `tools\setup_exhibition_windows.ps1`, app code and root `config.json` fail. Change one UI setting and confirm atomic persistence in `cache\exhibition\config.json`; check journey and screenshot writes still succeed. Never run a user-supplied permissions test script elevated.
-- Reboot from the console. Confirm manual logon or the approved Autologon configuration reaches the artwork, status becomes fresh, and SSH recovers. Repeat a network disconnect/reconnect without interrupting the artwork. Check that the end date and Tailscale key expiry cover the required show period.
-- Keep a local administrator credential and this runbook with the venue's authorized operator. Keep it outside the standard user's readable project. Record the host-key fingerprint, deployment version, peer/key approvals, and commissioning results.
+Before repairs, stop the artwork and preserve journeys, settings and relevant logs. After dependency/model changes, run offline verification before restarting the show. There is no automatic end-of-show action. Keep using the account afterward or remove the setup when you choose.
 
-## Recovery and teardown
+Each apply records its phases in `%ProgramData%\CartographyExhibition\exhibition\rollback.json`, including the account SID, task names, the added firewall rule, active SSH config and backup paths, previous service state and original project ACL backup. The record has no passwords or tokens. If cleanup is wanted, stop and unregister the named project and monitor tasks, disable Autologon if enabled, then archive data. Account deletion is a separate decision.
 
-Before repair, create the maintenance flag and wait for the task to stop. Preserve `journeys`, relevant logs and application settings. Repair runtime/models through the commissioning workflow with a local administrator, rerun offline verification, and only then clear the flag and start the task. Do not let startup attempt downloads while the exhibition is open.
+For SSH cleanup, remove the marked exhibition Match User block and the named exhibition firewall rule, then validate the config with `sshd.exe -t` before restarting the service. Preserve any unrelated changes made since setup. The backup is available for immediate recovery; restoring it later could overwrite newer SSH edits. If SSH was installed solely for the show, it may be stopped/disabled or uninstalled. Keep the rollback record until recovery is complete. Restore the original project ACL backup only if the same deployment still occupies the path and restoring its earlier permissions is intended.
 
-Every apply writes an administrator-controlled rollback record at `%ProgramData%\CartographyExhibition\exhibition\rollback.json`. It records the account SID, original OpenSSH capability/service state, disabled firewall rule names, original deployment ACL backup, and last completed phase. It contains no password or fleet private key. The original default SSH configuration is untouched; the previous managed configuration is retained as `sshd_config.previous`. Setup intentionally does not perform automatic broad rollback after a failure because restoring permissive firewall rules could reopen SSH.
-
-At the end, perform teardown from the local administrator console. Use the recorded names and paths, not an unrelated account or deployment:
-
-```powershell
-$state = 'C:\ProgramData\CartographyExhibition\exhibition'
-$record = Get-Content "$state\rollback.json" -Raw | ConvertFrom-Json
-if ($record.PSObject.Properties.Name -contains 'monitorTaskName') {
-    Stop-ScheduledTask -TaskName $record.monitorTaskName -ErrorAction SilentlyContinue
-    Unregister-ScheduledTask -TaskName $record.monitorTaskName -Confirm:$false -ErrorAction SilentlyContinue
-}
-Stop-ScheduledTask -TaskName $record.taskName -ErrorAction SilentlyContinue
-Unregister-ScheduledTask -TaskName $record.taskName -Confirm:$false
-Stop-Service sshd
-Remove-NetFirewallRule -Name $record.firewallRuleName
-Disable-LocalUser -Name $record.userName
-# Restore the saved deployment ACLs only if the same deployment still occupies this path.
-icacls (Split-Path -Parent $record.deploymentPath) /restore $record.originalAclFile
-```
-
-Disable Sysinternals Autologon manually before removing the account. Archive exhibition data before deleting any project/profile files. Account deletion and Tailscale device removal are separate administrator decisions. Remove the host from the tailnet and revoke its fleet approvals through the normal fleet process. Restore any approved power/update changes from your commissioning record.
-
-If OpenSSH existed before setup, restore its recorded service executable/configuration path, start mode, and recovery settings using Services/`sc.exe`, validate that configuration with `sshd.exe -t`, and review the old firewall rules before re-enabling them. If setup installed OpenSSH solely for this exhibition, leave it stopped/disabled or remove the `OpenSSH.Server~~~~0.0.1.0` capability. Do not blindly re-enable a broad SSH rule. Retain the rollback record until recovery is complete, then remove the managed state directory after confirming no service refers to it.
-
-Windows behavior references: [OpenSSH server configuration](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh-server-configuration), [interactive scheduled-task principals](https://learn.microsoft.com/en-us/powershell/module/scheduledtasks/new-scheduledtaskprincipal), and [Sysinternals Autologon](https://learn.microsoft.com/en-us/sysinternals/downloads/autologon).
+Windows references: [OpenSSH server configuration](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh-server-configuration) and [interactive scheduled-task principals](https://learn.microsoft.com/en-us/powershell/module/scheduledtasks/new-scheduledtaskprincipal).

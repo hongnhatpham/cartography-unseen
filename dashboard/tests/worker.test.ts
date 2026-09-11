@@ -37,6 +37,7 @@ function database(sqlite: DatabaseSync): D1Database {
 
 const TOKEN_A = 'a'.repeat(43);
 const TOKEN_B = 'b'.repeat(43);
+const READER_TOKEN = 'r'.repeat(43);
 let now: number;
 let sqlite: DatabaseSync;
 let env: Env;
@@ -79,8 +80,10 @@ beforeEach(async () => {
   now = Date.parse('2026-09-11T06:00:00Z');
   sqlite = new DatabaseSync(':memory:');
   sqlite.exec(readFileSync(new URL('../migrations/0001_monitor.sql', import.meta.url), 'utf8'));
+  sqlite.exec(readFileSync(new URL('../migrations/0002_alert_feed.sql', import.meta.url), 'utf8'));
   sqlite.prepare('INSERT INTO machines(id,label,token_hash,created_at) VALUES(?,?,?,?)').run('a', 'Machine A', await tokenHash(TOKEN_A), now);
   sqlite.prepare('INSERT INTO machines(id,label,token_hash,created_at) VALUES(?,?,?,?)').run('b', 'Machine B', await tokenHash(TOKEN_B), now);
+  sqlite.prepare('INSERT INTO alert_readers(id,label,token_hash,created_at) VALUES(?,?,?,?)').run('aria', 'ARIA', await tokenHash(READER_TOKEN), now);
   const limiter = { limit: async () => ({ success: true }) } as RateLimit;
   env = { DB: database(sqlite), PUBLIC_ORIGIN: 'https://monitor.test',
     ACCESS_TEAM_DOMAIN: 'test.cloudflareaccess.com', ACCESS_AUD: 'test-aud',
@@ -235,5 +238,184 @@ describe('series and retention', () => {
     now += RAW_RETENTION_MS + 1;
     await maintain(env, now);
     expect(sqlite.prepare('SELECT count(*) AS n FROM samples').get()?.n).toBe(0);
+  });
+});
+
+type Feed = {
+  nextCursor: number; hasMore: boolean;
+  events: { id: number; alertId: number; machineId: string; machineLabel: string; code: string;
+    transition: string; reason: string | null; evidence: Record<string, unknown> | null }[];
+};
+function feedRequest(query = '', token = READER_TOKEN, method = 'GET') {
+  return worker.fetch(new Request(`https://monitor.test/api/v1/alert-feed${query}`, {
+    method, headers: { Authorization: `Bearer ${token}` },
+  }), env);
+}
+async function feed(after = 0) {
+  const response = await feedRequest(`?after=${after}`);
+  expect(response.status).toBe(200);
+  return await response.json() as Feed;
+}
+
+describe('ARIA alert feed', () => {
+  it('isolates reader, collector and human privileges and supports immediate revocation', async () => {
+    expect((await feedRequest()).status).toBe(200);
+    for (const token of ['', 'wrong', TOKEN_A, 'z'.repeat(43)]) {
+      expect((await feedRequest('', token)).status).toBe(401);
+    }
+    expect((await worker.fetch(new Request('https://monitor.test/api/v1/alert-feed', {
+      headers: { 'Cf-Access-Jwt-Assertion': 'test-human' },
+    }), env)).status).toBe(401);
+    for (const path of ['/', '/api/v1/machines', '/api/v1/series', '/api/v1/alerts']) {
+      expect((await worker.fetch(new Request(`https://monitor.test${path}`, {
+        headers: { Authorization: `Bearer ${READER_TOKEN}` },
+      }), env)).status).toBe(401);
+    }
+    expect((await post(sample(), { token: READER_TOKEN })).status).toBe(401);
+    expect((await post({ schemaVersion: 1, samples: [sample()] }, { token: READER_TOKEN, path: '/api/v1/history' })).status).toBe(401);
+    expect((await feedRequest('', READER_TOKEN, 'POST')).status).toBe(405);
+    const response = await feedRequest();
+    expect(response.headers.get('Cache-Control')).toBe('no-store');
+    expect(JSON.stringify(await response.json())).not.toContain('token');
+    sqlite.prepare('UPDATE alert_readers SET revoked_at = ? WHERE id = ?').run(now, 'aria');
+    expect((await feedRequest()).status).toBe(401);
+  });
+
+  it('preserves both transitions between polls and replays stable IDs without duplicates', async () => {
+    await post({ ...sample(), system: { ...sample().system, gpuTemperatureC: 90 } });
+    await maintain(env, now);
+    await maintain(env, now);
+    now += 30_000;
+    await post(sample(1));
+    await maintain(env, now);
+    await maintain(env, now);
+    const result = await feed();
+    expect(result.events.map(event => [event.code, event.transition, event.reason])).toEqual([
+      ['gpu_hot', 'opened', null], ['gpu_hot', 'resolved', 'recovered'],
+    ]);
+    expect(result.events[0].alertId).toBe(result.events[1].alertId);
+    expect(result.events[0].evidence?.gpuTemperatureC).toBe(90);
+    expect(result.events[1].evidence?.gpuTemperatureC).toBe(55);
+    expect(result.events[0].machineLabel).toBe('Machine A');
+    expect((await feed()).events).toEqual(result.events);
+    expect(await feed(result.nextCursor)).toMatchObject({ events: [], nextCursor: result.nextCursor, hasMore: false });
+    now += 30_000;
+    await post({ ...sample(2), system: { ...sample().system, gpuTemperatureC: 90 } });
+    await maintain(env, now);
+    const recurrence = await feed(result.nextCursor);
+    expect(recurrence.events).toHaveLength(1);
+    expect(recurrence.events[0].alertId).not.toBe(result.events[0].alertId);
+  });
+
+  it('pages an exclusive cursor in ID order and rejects ambiguous cursors', async () => {
+    const insert = sqlite.prepare('INSERT INTO alerts(machine_id,code,opened_at,resolved_at) VALUES(?,?,?,?)');
+    for (let i = 0; i < 205; i++) insert.run('a', `test_${i}`, now, null);
+    const first = await feed();
+    expect(first.events).toHaveLength(200);
+    expect(first.hasMore).toBe(true);
+    const second = await feed(first.nextCursor);
+    expect(second.events).toHaveLength(5);
+    expect(second.hasMore).toBe(false);
+    expect(second.events[0].id).toBeGreaterThan(first.nextCursor);
+    expect(new Set([...first.events, ...second.events].map(event => event.id)).size).toBe(205);
+    for (const query of ['?after=-1', '?after=1.2', '?after=', '?after=01', '?after=1e2', '?after=9007199254740992', '?after=1&after=2', '?limit=1']) {
+      expect((await feedRequest(query)).status).toBe(400);
+    }
+  });
+
+  it('retains recovery events after the dashboard alert is pruned', async () => {
+    await post(sample());
+    now += 180_001;
+    await maintain(env, now);
+    await post(sample(1));
+    await maintain(env, now);
+    const original = await feed();
+    now += 31 * 86400_000;
+    await maintain(env, now);
+    expect(sqlite.prepare('SELECT id FROM alerts WHERE id = ?').get(original.events[0].alertId)).toBeUndefined();
+    expect((await feed()).events.slice(0, 2)).toEqual(original.events);
+  });
+
+  it('holds incidents through silence and unknown observations until fresh positive recovery', async () => {
+    const bad = sample();
+    bad.app.state = 'stopped';
+    bad.system.diskFreeBytes = 1;
+    bad.system.gpuTemperatureC = 90;
+    bad.archiveSync = { ...bad.archiveSync, enabled: true, processRunning: true, state: 'retrying', statusAgeSeconds: 0 };
+    await post(bad);
+    await maintain(env, now);
+    now += 180_001;
+    await maintain(env, now);
+    expect((await feed()).events.map(event => event.transition)).toEqual(Array(5).fill('opened'));
+    const unknown = sample(1);
+    unknown.app.state = 'unknown';
+    unknown.system.diskFreeBytes = null;
+    unknown.system.gpuTemperatureC = null;
+    unknown.archiveSync.state = 'unknown';
+    await post(unknown);
+    await maintain(env, now);
+    expect((await feed()).events.filter(event => event.transition === 'resolved').map(event => event.code)).toEqual(['offline']);
+    now += 30_000;
+    const healthy = sample(2);
+    healthy.archiveSync = { ...healthy.archiveSync, enabled: true, processRunning: false, state: 'idle', statusAgeSeconds: 0 };
+    await post(healthy);
+    await maintain(env, now);
+    const result = await feed();
+    expect(result.events.filter(event => event.transition === 'resolved')).toHaveLength(5);
+    expect(sqlite.prepare('SELECT count(*) AS n FROM alerts WHERE resolved_at IS NULL').get()?.n).toBe(0);
+  });
+
+  it.each(['error', 'stalled', 'stopped'] as const)('opens an artwork alert for %s and does not recover during startup', async state => {
+    await post({ ...sample(), app: { ...sample().app, state } });
+    await maintain(env, now);
+    await post({ ...sample(1), app: { ...sample().app, state: 'starting' } });
+    await maintain(env, now);
+    expect((await feed()).events.map(event => [event.code, event.transition])).toEqual([['app_error', 'opened']]);
+  });
+
+  it('classifies revoked-machine closures separately from healthy recovery', async () => {
+    await post({ ...sample(), app: { ...sample().app, state: 'error' } });
+    await maintain(env, now);
+    sqlite.prepare('UPDATE machines SET revoked_at = ? WHERE id = ?').run(now, 'a');
+    await maintain(env, now);
+    expect((await feed()).events.map(event => [event.transition, event.reason])).toEqual([
+      ['opened', null], ['resolved', 'revoked'],
+    ]);
+  });
+
+  it('does not clear artwork or uploader errors from stale observations or disabled uploads', async () => {
+    const bad = sample();
+    bad.app.state = 'error';
+    bad.archiveSync = { ...bad.archiveSync, enabled: true, processRunning: true, state: 'error', statusAgeSeconds: 0 };
+    await post(bad);
+    await maintain(env, now);
+    const stale = sample(1);
+    stale.app.statusAgeSeconds = 21;
+    stale.archiveSync = { ...bad.archiveSync, state: 'uploading', statusAgeSeconds: 1801 };
+    await post(stale);
+    await maintain(env, now);
+    const disabled = sample(2);
+    disabled.app.displayFps = 0;
+    await post(disabled);
+    await maintain(env, now);
+    expect((await feed()).events.map(event => [event.code, event.transition])).toEqual([
+      ['app_error', 'opened'], ['archive_error', 'opened'],
+    ]);
+  });
+
+  it('backfills existing incidents without labelling legacy resolutions as recovery', () => {
+    const legacy = new DatabaseSync(':memory:');
+    try {
+      legacy.exec(readFileSync(new URL('../migrations/0001_monitor.sql', import.meta.url), 'utf8'));
+      legacy.prepare('INSERT INTO machines(id,label,token_hash,created_at) VALUES(?,?,?,?)').run('a', 'Machine A', 'a'.repeat(64), now);
+      legacy.prepare('INSERT INTO alerts(machine_id,code,opened_at,resolved_at) VALUES(?,?,?,?)').run('a', 'offline', now - 1000, now);
+      legacy.prepare('INSERT INTO alerts(machine_id,code,opened_at) VALUES(?,?,?)').run('a', 'app_error', now - 500);
+      legacy.exec(readFileSync(new URL('../migrations/0002_alert_feed.sql', import.meta.url), 'utf8'));
+      expect(legacy.prepare('SELECT code, transition, reason, evidence_json FROM alert_events ORDER BY id').all()).toEqual([
+        { code: 'offline', transition: 'opened', reason: null, evidence_json: null },
+        { code: 'app_error', transition: 'opened', reason: null, evidence_json: null },
+        { code: 'offline', transition: 'resolved', reason: 'unknown', evidence_json: null },
+      ]);
+    } finally { legacy.close(); }
   });
 });

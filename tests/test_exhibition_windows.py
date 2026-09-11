@@ -111,8 +111,8 @@ try {{
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_readonly_code_and_atomic_mutable_config(tmp_path: Path) -> None:
-    """Exercise production DACLs as an ordinary token without changing file ownership."""
+def test_project_access_preserves_permissions_and_allows_edits(tmp_path: Path) -> None:
+    """Grant project access using the real ACL command, confined to a temporary directory."""
     script_path = str(ROOT / "tools/setup_exhibition_windows.ps1").replace("'", "''")
     deployment = str(tmp_path).replace("'", "''")
     command = rf"""
@@ -120,33 +120,37 @@ $ErrorActionPreference = 'Stop'
 $testSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile('{script_path}', [ref]$tokens, [ref]$errors)
-$function = $ast.Find({{ param($node)
-    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Set-PrivateAcl'
-}}, $true)
-Invoke-Expression $function.Extent.Text
-function Set-Acl {{
-    param($LiteralPath, $AclObject)
-    if ($AclObject.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne 'S-1-5-32-544') {{ throw 'Production owner must be Administrators' }}
-    # Ownership assignment needs elevation. Assert the requested owner above and apply
-    # only the DACL so ordinary-token writes exercise the real file access rules.
-    $accessOnly = New-Object Security.AccessControl.DirectorySecurity
-    $accessOnly.SetSecurityDescriptorSddlForm($AclObject.GetSecurityDescriptorSddlForm('Access'), 'Access')
-    [IO.Directory]::SetAccessControl($LiteralPath, $accessOnly)
+foreach ($name in @('Invoke-CheckedNative', 'Grant-ProjectAccess')) {{
+    $function = $ast.Find({{ param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+    }}, $true)
+    Invoke-Expression $function.Extent.Text
 }}
 $code = Join-Path '{deployment}' 'setup.ps1'
 $cache = Join-Path '{deployment}' 'cache'
 $null = New-Item -ItemType Directory -Path $cache
-[IO.File]::WriteAllText($code, 'trusted code')
+[IO.File]::WriteAllText($code, 'original code')
 $saved = Get-Acl -LiteralPath '{deployment}'
 try {{
-    Set-PrivateAcl -Path '{deployment}' -ReaderSid $testSid.Value -Directory
-    Set-PrivateAcl -Path $cache -ReaderSid $testSid.Value -Directory -Modify
-    $denied = $false
-    try {{ [IO.File]::WriteAllText($code, 'replacement') }} catch [UnauthorizedAccessException] {{ $denied = $true }}
-    if (-not $denied) {{ throw 'Code replacement was allowed' }}
-    $denied = $false
-    try {{ [IO.File]::WriteAllText((Join-Path '{deployment}' 'new-code.ps1'), 'replacement') }} catch [UnauthorizedAccessException] {{ $denied = $true }}
-    if (-not $denied) {{ throw 'Root file creation was allowed' }}
+    Grant-ProjectAccess -Path '{deployment}' -UserSid $testSid.Value
+    $after = Get-Acl -LiteralPath '{deployment}'
+    if ($after.Owner -ne $saved.Owner) {{ throw 'Owner changed' }}
+    foreach ($rule in $saved.Access) {{
+        if (-not @($after.Access | Where-Object {{ $_.IdentityReference -eq $rule.IdentityReference -and
+            $_.AccessControlType -eq $rule.AccessControlType -and
+            ($_.FileSystemRights -band $rule.FileSystemRights) -eq $rule.FileSystemRights }}).Count) {{
+            throw 'Existing access was removed'
+        }}
+    }}
+    foreach ($path in @('{deployment}', $cache, $code)) {{
+        $rules = (Get-Acl -LiteralPath $path).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
+        if (-not @($rules | Where-Object {{ $_.IdentityReference -eq $testSid -and
+            ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::Modify) -eq [Security.AccessControl.FileSystemRights]::Modify }}).Count) {{
+            throw "Project Modify access missing: $path"
+        }}
+    }}
+    [IO.File]::WriteAllText($code, 'replacement')
+    [IO.File]::WriteAllText((Join-Path '{deployment}' 'new-code.ps1'), 'replacement')
     $config = Join-Path $cache 'config.json'
     [IO.File]::WriteAllText($config, '{{"version":1}}')
     [IO.File]::WriteAllText("$config.tmp", '{{"version":2}}')
@@ -156,10 +160,6 @@ try {{
     $restore = New-Object Security.AccessControl.DirectorySecurity
     $restore.SetSecurityDescriptorSddlForm($saved.GetSecurityDescriptorSddlForm('Access'), 'Access')
     [IO.Directory]::SetAccessControl('{deployment}', $restore)
-    # Remove the protected test cache ACL so the temporary-directory fixture can clean up.
-    $cacheAcl = Get-Acl -LiteralPath $cache
-    $cacheAcl.SetAccessRuleProtection($false, $false)
-    [IO.Directory]::SetAccessControl($cache, $cacheAcl)
 }}
 """
     result = subprocess.run(
@@ -219,13 +219,13 @@ if (Test-Path -LiteralPath '{protected_path}') {{ throw 'Ancestor validation cre
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def monitor_function_command(body: str) -> subprocess.CompletedProcess[str]:
+def setup_function_command(body: str) -> subprocess.CompletedProcess[str]:
     script_path = str(ROOT / "tools/setup_exhibition_windows.ps1").replace("'", "''")
     command = rf"""
 $ErrorActionPreference = 'Stop'
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile('{script_path}', [ref]$tokens, [ref]$errors)
-foreach ($name in @('Get-MonitorPlan', 'Read-MonitorCredential', 'New-ExhibitionMonitorTask')) {{
+foreach ($name in @('Get-MonitorPlan', 'Read-MonitorCredential', 'New-ExhibitionMonitorTask', 'Add-ExhibitionSshConfiguration', 'Get-SshServicePaths', 'Publish-SshFile', 'Restore-SshFile')) {{
     $function = $ast.Find({{ param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
     }}, $true)
@@ -242,7 +242,7 @@ foreach ($name in @('Get-MonitorPlan', 'Read-MonitorCredential', 'New-Exhibition
 
 
 def test_monitor_plan_does_not_read_credentials() -> None:
-    result = monitor_function_command(r"""
+    result = setup_function_command(r"""
 function Read-MonitorCredential { throw 'Plan attempted to read token' }
 $omitted = Get-MonitorPlan
 if ($omitted.action -ne 'unchanged') { throw 'Omitted monitor configuration must remain unchanged' }
@@ -256,7 +256,7 @@ $plan | ConvertTo-Json -Compress
 
 @pytest.mark.parametrize("endpoint", ["http://monitor.example/api/v1/heartbeat", "https://a:b@monitor.example/api/v1/heartbeat", "https://monitor.example/api/v1/heartbeat?token=secret", "https://monitor.example/api/v1/other"])
 def test_monitor_rejects_unsafe_endpoint(endpoint: str) -> None:
-    result = monitor_function_command(f"Get-MonitorPlan -CredentialPath 'credential.json' -Endpoint '{endpoint}'")
+    result = setup_function_command(f"Get-MonitorPlan -CredentialPath 'credential.json' -Endpoint '{endpoint}'")
     assert result.returncode != 0
     # Endpoint validation does not include the supplied URL in the error message.
     assert endpoint not in result.stdout
@@ -271,16 +271,19 @@ def test_monitor_credential_validation_never_prints_token(tmp_path: Path, invali
         encoding="utf-8",
     )
     path = str(credential).replace("'", "''")
-    result = monitor_function_command(f"$credentialToken = Read-MonitorCredential '{path}'; Write-Output 'validated'")
+    result = setup_function_command(f"$credentialToken = Read-MonitorCredential '{path}'; Write-Output 'validated'")
     assert (result.returncode != 0) == invalid, result.stdout + result.stderr
     assert token not in result.stdout + result.stderr
 
 
-def test_monitor_task_is_system_startup_with_protected_paths() -> None:
-    result = monitor_function_command(r"""
-$task = New-ExhibitionMonitorTask -Root 'C:\Exhibition\Cartography' -ConfigPath 'C:\ProgramData\CartographyExhibition\exhibition\monitor\config.json' -StateDirectory 'C:\ProgramData\CartographyExhibition\exhibition\monitor'
-if ($task.Principal.UserId -notin @('SYSTEM', 'S-1-5-18', 'NT AUTHORITY\SYSTEM')) { throw 'Collector must run as SYSTEM' }
-if ($task.Triggers[0].CimClass.CimClassName -ne 'MSFT_TaskBootTrigger') { throw 'Collector must start at boot' }
+def test_monitor_task_uses_exhibition_logon_and_project_paths() -> None:
+    result = setup_function_command(r"""
+$testUser = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$task = New-ExhibitionMonitorTask -Root 'C:\Exhibition\Cartography' -ConfigPath 'C:\Exhibition\Cartography\cache\exhibition-monitor\config.json' -StateDirectory 'C:\Exhibition\Cartography\cache\exhibition-monitor' -UserId $testUser
+$principalSid = ([Security.Principal.NTAccount]$task.Principal.UserId).Translate([Security.Principal.SecurityIdentifier]).Value
+if ($principalSid -ne $testUser -or $task.Principal.LogonType -ne 'Interactive' -or $task.Principal.RunLevel -ne 'Limited') { throw 'Collector must run as the interactive exhibition user' }
+if ($task.Triggers[0].CimClass.CimClassName -ne 'MSFT_TaskLogonTrigger' -or $task.Triggers[0].UserId -ne $testUser) { throw 'Collector must start at exhibition user logon' }
+if ($task.Triggers[0].EndBoundary) { throw 'Collector logon trigger must not expire' }
 if ($task.Settings.RestartCount -lt 1) { throw 'Collector must recover from process failure' }
 $task.Actions[0] | Select-Object Execute, Arguments, WorkingDirectory | ConvertTo-Json -Compress
 """)
@@ -288,6 +291,210 @@ $task.Actions[0] | Select-Object Execute, Arguments, WorkingDirectory | ConvertT
     action = json.loads(result.stdout)
     assert action["Execute"].endswith(r"runtime\python\python.exe")
     assert "-I -B" in action["Arguments"]
-    assert '--state-directory "C:\\ProgramData\\CartographyExhibition\\exhibition\\monitor"' in action["Arguments"]
+    assert '--state-directory "C:\\Exhibition\\Cartography\\cache\\exhibition-monitor"' in action["Arguments"]
     assert '--snapshot-directory "C:\\Exhibition\\Cartography\\cache\\monitoring"' in action["Arguments"]
     assert "--config" in action["Arguments"]
+
+
+def test_setup_account_creation_and_update_have_no_expiry() -> None:
+    script_path = str(ROOT / "tools/setup_exhibition_windows.ps1").replace("'", "''")
+    command = rf"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile('{script_path}', [ref]$tokens, [ref]$errors)
+if ($errors.Count) {{ throw ($errors | Out-String) }}
+if ($ast.ParamBlock.Parameters.Name.VariablePath.UserPath -contains 'ExhibitionEndDate') {{ throw 'Setup still requires a show date' }}
+$UserName = 'exhibition'
+$password = ConvertTo-SecureString 'temporary-test-password' -AsPlainText -Force
+function New-LocalUser {{
+    param($Name, $Password, [switch]$Disabled, [switch]$PasswordNeverExpires, [switch]$AccountNeverExpires, $Description, $AccountExpires)
+    if (-not $AccountNeverExpires -or -not $PasswordNeverExpires -or $AccountExpires) {{ throw 'New account would expire' }}
+    if (-not $Disabled) {{ throw 'New account could log in before SSH restrictions activate' }}
+    Write-Output 'created'
+}}
+function Set-LocalUser {{
+    param($Name, [bool]$PasswordNeverExpires, [switch]$AccountNeverExpires, $AccountExpires)
+    if (-not $AccountNeverExpires -or -not $PasswordNeverExpires -or $AccountExpires) {{ throw 'Existing account expiry would not be cleared' }}
+    Write-Output 'updated'
+}}
+try {{
+    $commands = $ast.FindAll({{ param($node)
+        $node -is [System.Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -in @('New-LocalUser', 'Set-LocalUser')
+    }}, $true)
+    foreach ($command in $commands) {{ Invoke-Expression $command.Extent.Text }}
+}} finally {{ $password.Dispose() }}
+"""
+    result = subprocess.run(
+        [str(POWERSHELL), "-NoProfile", "-Command", command],
+        text=True, capture_output=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.split() == ["created", "updated"]
+
+
+@pytest.mark.parametrize("existing", [
+    "Port 22\nPasswordAuthentication yes\nSubsystem sftp sftp-server.exe\n",
+    "Port 2222\nAllowUsers admin\nPasswordAuthentication yes\n"
+    "Match Group administrators\n    AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys\n"
+    "Match all\n    AllowTcpForwarding yes\n",
+])
+def test_ssh_addition_preserves_existing_global_and_admin_settings(existing: str) -> None:
+    escaped = existing.replace("'", "''")
+    result = setup_function_command(rf"""
+$existing = '{escaped}'
+$candidate = Add-ExhibitionSshConfiguration -Existing $existing -Account exhibition -KeyPath 'C:\ProgramData\CartographyExhibition\exhibition\authorized_keys'
+$again = Add-ExhibitionSshConfiguration -Existing $candidate -Account exhibition -KeyPath 'C:\ProgramData\CartographyExhibition\exhibition\authorized_keys'
+if ($again -ne $candidate) {{ throw 'Rerun changed or duplicated the user block' }}
+$candidate
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    candidate = result.stdout
+    begin = candidate.index("# BEGIN Cartography exhibition exhibition")
+    end = candidate.index("# END Cartography exhibition exhibition")
+    block = candidate[begin:end]
+    assert block.splitlines()[1] == "Match User exhibition"
+    assert "    AllowUsers exhibition\n" in block
+    assert "    PasswordAuthentication no\n" in block
+    assert "    AuthenticationMethods publickey\n" in block
+    assert "    PubkeyAcceptedKeyTypes ssh-ed25519," in block
+    assert "PubkeyAcceptedAlgorithms" not in block
+    assert '    AuthorizedKeysFile "C:/ProgramData/CartographyExhibition/exhibition/authorized_keys"' in block
+    assert "-cert-" not in block
+    restored = candidate[:begin] + candidate[end:].split("\n", 1)[1]
+    assert restored.strip() == existing.strip()
+    if "Match Group administrators" in existing:
+        assert begin < candidate.index("Match Group administrators")
+
+
+@pytest.mark.parametrize("custom", [False, True])
+def test_existing_ssh_service_keeps_executable_and_config_paths(custom: bool) -> None:
+    command_line = (
+        '"C:\\Tools\\OpenSSH\\sshd.exe" -f "C:\\SSH config\\sshd_config"'
+        if custom else r"C:\Windows\System32\OpenSSH\sshd.exe"
+    )
+    result = setup_function_command(f"Get-SshServicePaths -CommandLine '{command_line}' | ConvertTo-Json -Compress")
+    assert result.returncode == 0, result.stdout + result.stderr
+    paths = json.loads(result.stdout)
+    assert paths["executable"] == (r"C:\Tools\OpenSSH\sshd.exe" if custom else r"C:\Windows\System32\OpenSSH\sshd.exe")
+    assert paths["config"].lower() == (r"C:\SSH config\sshd_config" if custom else r"C:\ProgramData\ssh\sshd_config").lower()
+
+
+@pytest.mark.parametrize("failure", ["staging", "activation", "after_activation"])
+def test_ssh_failure_preserves_existing_config_and_keys(tmp_path: Path, failure: str) -> None:
+    deployment = str(tmp_path).replace("'", "''")
+    result = setup_function_command(rf"""
+$root = '{deployment}'
+$config = Join-Path $root 'sshd_config'
+$keys = Join-Path $root 'authorized_keys'
+$configCandidate = "$config.candidate"
+$keyCandidate = "$keys.candidate"
+[IO.File]::WriteAllText($config, 'original admin configuration')
+[IO.File]::WriteAllText($keys, 'original exhibition public keys')
+$changes = @()
+$failed = $false
+$heldFile = $null
+try {{
+    [IO.File]::WriteAllText($configCandidate, 'new configuration')
+    [IO.File]::WriteAllText($keyCandidate, 'new exhibition public keys')
+    if ('{failure}' -eq 'staging') {{
+        $heldFile = [IO.File]::Open($configCandidate, 'Open', 'ReadWrite', 'None')
+        [IO.File]::WriteAllText($configCandidate, 'staging write must fail')
+    }}
+    $changes += Publish-SshFile -CandidatePath $keyCandidate -Path $keys -BackupPath "$keys.previous"
+    if ('{failure}' -eq 'activation') {{
+        # A missing candidate makes atomic activation fail after the first file was published.
+        Remove-Item -LiteralPath $configCandidate
+    }}
+    $changes += Publish-SshFile -CandidatePath $configCandidate -Path $config -BackupPath "$config.previous"
+    throw 'simulated service restart failure'
+}} catch {{
+    $failed = $true
+    [array]::Reverse($changes)
+    foreach ($change in $changes) {{ Restore-SshFile $change }}
+}} finally {{ if ($heldFile) {{ $heldFile.Dispose() }} }}
+if (-not $failed) {{ throw 'Failure injection did not run' }}
+if ([IO.File]::ReadAllText($config) -ne 'original admin configuration') {{ throw 'Existing SSH configuration changed after failure' }}
+if ([IO.File]::ReadAllText($keys) -ne 'original exhibition public keys') {{ throw 'Existing authorized keys changed after failure' }}
+if (@(Get-ChildItem -LiteralPath $root -Filter '*.restore').Count) {{ throw 'Recovery left a temporary file' }}
+Write-Output 'restored'
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "restored"
+
+
+@pytest.mark.parametrize("account_state,failure", [
+    ("new", "none"), ("new", "keys"), ("new", "config"),
+    ("new", "restart"), ("new", "save"),
+    ("pending", "none"), ("pending", "restart"),
+    ("enabled", "none"), ("enabled", "restart"), ("disabled", "none"),
+])
+def test_account_activation_waits_for_ssh_and_preserves_existing_state(account_state: str, failure: str) -> None:
+    result = setup_function_command(rf"""
+$pending = '{account_state}' -in @('new', 'pending')
+$script:accountEnabled = '{account_state}' -eq 'enabled'
+$user = if ('{account_state}' -eq 'new') {{ $null }} else {{ [pscustomobject]@{{ Enabled = $script:accountEnabled }} }}
+$record = [pscustomobject]@{{ accountActivationPending = $pending; completedPhase = 'ssh-staged' }}
+$prior = if ('{account_state}' -eq 'new') {{ $null }} else {{ $record }}
+foreach ($variable in @('$activationPending', '$activateAccount')) {{
+    $assignment = $ast.Find({{ param($node)
+        $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq $variable
+    }}, $true)
+    Invoke-Expression $assignment.Extent.Text
+}}
+$UserName = 'exhibition'; $keyPath = 'keys'; $configPath = 'config'
+$keyCandidate = 'keys.candidate'; $candidatePath = 'config.candidate'
+$stateRoot = 'C:\state'; $configBackup = 'config.previous'; $recordPath = 'unused'
+$service = [pscustomobject]@{{ State = 'Running' }}
+$sshChanges = @(); $accountActivationAttempted = $false
+$script:published = 0; $script:restarted = $false; $script:saveFailed = $false
+$script:disableCount = 0; $script:restoreCount = 0
+function Publish-SshFile {{
+    param($CandidatePath, $Path, $BackupPath)
+    if ('{failure}' -eq $Path) {{ throw 'Injected file activation failure' }}
+    $script:published++
+    return [pscustomobject]@{{ path = $Path; backup = $BackupPath }}
+}}
+function Restart-Service {{
+    param($Name)
+    if ('{failure}' -eq 'restart') {{ throw 'Injected service failure' }}
+    $script:restarted = $true
+}}
+function Enable-LocalUser {{
+    param($Name)
+    if ($script:published -ne 2 -or -not $script:restarted) {{ throw 'Account enabled before SSH was ready' }}
+    $script:accountEnabled = $true
+}}
+function Disable-LocalUser {{ param($Name); $script:accountEnabled = $false; $script:disableCount++ }}
+function Get-Service {{ param($Name); return [pscustomobject]@{{ Status = 'Running' }} }}
+function Restore-SshFile {{
+    param($Change)
+    if ($pending -and $script:accountEnabled) {{ throw 'SSH policy restored while new account was enabled' }}
+    $script:restoreCount++
+}}
+function Save-Record {{
+    if ('{failure}' -eq 'save' -and -not $script:saveFailed) {{ $script:saveFailed = $true; throw 'Injected record failure' }}
+}}
+$outerTry = $ast.Find({{ param($node)
+    $node -is [System.Management.Automation.Language.TryStatementAst] -and
+    $node.Body.Extent.Text.Contains('$sshChanges += Publish-SshFile')
+}}, $true)
+$tail = @(); $capture = $false
+foreach ($statement in $outerTry.Body.Statements) {{
+    if ($statement.Extent.Text.StartsWith('$sshChanges += Publish-SshFile')) {{ $capture = $true }}
+    if ($capture) {{ $tail += $statement.Extent.Text }}
+}}
+$caught = $false
+try {{ Invoke-Expression ($tail -join "`n") }} catch {{
+    try {{ Invoke-Expression ($outerTry.CatchClauses[0].Body.Statements.Extent.Text -join "`n") }} catch {{ $caught = $true }}
+}}
+if ($caught -ne ('{failure}' -ne 'none')) {{ throw 'Unexpected transaction result' }}
+$expectedEnabled = '{account_state}' -eq 'enabled' -or ($pending -and '{failure}' -eq 'none')
+if ($script:accountEnabled -ne $expectedEnabled) {{ throw 'Wrong final account enabled state' }}
+if (-not $pending -and $script:disableCount) {{ throw 'Pre-existing account was disabled' }}
+if ($pending -and '{failure}' -ne 'none' -and -not $record.accountActivationPending) {{ throw 'Failed setup lost its pending activation record' }}
+if ('{failure}' -eq 'save' -and ($script:disableCount -ne 1 -or $script:restoreCount -ne 2)) {{ throw 'Late failure did not disable before restoring both files' }}
+Write-Output 'state verified'
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip().endswith("state verified")
