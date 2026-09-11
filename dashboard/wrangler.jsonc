@@ -7,14 +7,14 @@
   "preview_urls": false,
   "send_metrics": false,
   "assets": { "directory": "./dist", "binding": "ASSETS", "run_worker_first": true },
-  "d1_databases": [{ "binding": "DB", "database_name": "monitor", "database_id": "00000000-0000-0000-0000-000000000000", "migrations_dir": "migrations" }],
+  "d1_databases": [{ "binding": "DB", "database_name": "monitor", "database_id": "8608cd35-342e-4cfb-9a8a-8ae214ada012", "migrations_dir": "migrations" }],
   "ratelimits": [
     { "name": "REQUEST_LIMIT", "namespace_id": "10201", "simple": { "limit": 180, "period": 60 } },
     { "name": "INGEST_LIMIT", "namespace_id": "10202", "simple": { "limit": 10, "period": 60 } },
     { "name": "HISTORY_LIMIT", "namespace_id": "10203", "simple": { "limit": 2, "period": 60 } }
   ],
   "vars": {
-    "PUBLIC_ORIGIN": "https://monitor.example.invalid",
+    "PUBLIC_ORIGIN": "https://monitor.bynhat.com",
     "ACCESS_TEAM_DOMAIN": "configure-me.cloudflareaccess.com",
     "ACCESS_AUD": "configure-before-deployment"
   },
