@@ -11,5 +11,5 @@
     "types": ["@cloudflare/workers-types", "node"],
     "lib": ["ES2022", "DOM"]
   },
-  "include": ["worker/**/*.ts", "src/**/*.ts", "tests/**/*.ts", "vite.config.ts"]
+  "include": ["worker/**/*.ts", "tests/**/*.ts", "vite.config.ts"]
 }

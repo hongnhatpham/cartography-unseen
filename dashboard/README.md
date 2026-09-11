@@ -3,7 +3,9 @@
 One Cloudflare Worker receives machine health samples, serves the dashboard assets,
 and exposes read-only human APIs. D1 stores credentials as SHA-256 hashes and keeps
 seven days of raw samples. Nothing in this service runs commands on machines.
-The HTML entry is temporary while the dashboard design is selected.
+The dashboard uses the selected Projection desk design with plain-language incident
+messages. It separates machine contact, artwork rendering and verified map backups.
+See [`DESIGN.md`](DESIGN.md) for the approved visual and state conventions.
 
 ## Run locally
 
@@ -25,8 +27,43 @@ pnpm dev:worker
 The Worker listens on `http://127.0.0.1:8787`. `.dev.vars` sets that exact origin.
 Human requests still require a valid Access assertion, including local requests.
 Only tests inject a verifier. There is no production authentication bypass or
-development password. `pnpm dev` serves only the temporary static frontend on
-loopback for design work; it does not supply the API.
+development password. `pnpm dev` serves the frontend on loopback for development;
+it does not supply the API. Use the built assets through the Worker for an
+authenticated integration. Opening Vite alone displays an unavailable/session
+state because it cannot return authenticated telemetry.
+
+## Dashboard behavior
+
+The browser polls the read-only machines, series and alerts APIs every 15 seconds.
+Machine contact ages from the server's receipt time using elapsed browser time,
+so changing the browser's wall clock does not make a machine appear online.
+Select a machine to inspect its latest sample, 24-hour generation trend and alerts.
+The dashboard validates API payloads and keeps all requests on the same origin.
+Machine credentials never enter the browser.
+
+A live host does not prove that the artwork or uploader is healthy. Rendering
+requires a recent artwork status observation, display activity and frame evidence.
+Artwork status older than 20 seconds and uploader status older than 30 minutes at
+the sample are treated as unknown, matching the collector's observation windows.
+Late host reports, revoked credentials and failed monitor requests make current
+artwork and upload health unknown. Last-known readings remain labelled as history.
+Refresh now retries a failed request; a new successful check shows recovery.
+
+The API does not report map capture activity, projector output, resolution,
+uptime, machine hardware names or per-transfer percentage. The paired map readout
+therefore says recording is not measured and shows the uploader's open/incomplete
+map count. Transfer and verified byte counters are uploader-session totals, not
+progress percentages. A past verification receipt does not verify pending maps.
+No dashboard action runs a command on a machine.
+
+`tests/ui.test.ts` covers freshness boundaries, independent signal states, null
+measurements, stale uploader evidence, safe text rendering, history gaps and API
+failure handling. Browser TypeScript uses `tsconfig.app.json` to keep DOM types
+separate from Cloudflare's Worker globals; `pnpm typecheck` checks both targets.
+Run `pnpm exec playwright install chromium` once, then `pnpm test:ui` for the real
+browser focus regression. It checks authentication links and the refresh action
+across periodic renders and automatic retries. Set `PLAYWRIGHT_CHROMIUM_EXECUTABLE`
+to use an existing Chrome executable instead of downloading the test browser.
 
 ## Provision a machine credential
 

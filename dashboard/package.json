@@ -8,15 +8,20 @@
     "dev:worker": "wrangler dev --ip 127.0.0.1",
     "build": "vite build",
     "build:worker": "wrangler deploy --dry-run --outdir .worker-build",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.app.json",
     "test": "vitest run",
+    "test:ui": "pnpm build && node tests/ui-browser.mjs",
     "db:local": "wrangler d1 migrations apply monitor --local",
     "credential": "node scripts/credential.mjs"
   },
-  "dependencies": { "jose": "^6.1.3", "zod": "^4.3.6" },
+  "dependencies": {
+    "jose": "^6.1.3",
+    "zod": "^4.3.6"
+  },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260911.1",
     "@types/node": "^24.0.0",
+    "playwright": "1.58.2",
     "typescript": "^5.9.3",
     "vite": "^7.3.1",
     "vitest": "^4.0.18",

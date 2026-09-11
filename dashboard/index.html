@@ -1,5 +1,25 @@
 <!doctype html>
 <html lang="en">
-  <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Cartography monitor</title></head>
-  <body><main><h1>Cartography monitor</h1><p>Temporary dashboard entry. The authenticated monitoring API is ready for the selected dashboard design.</p></main></body>
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#14202d">
+    <title>Cartography Unseen · Exhibition monitor</title>
+    <script type="module" src="/src/main.ts"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to machine status</a>
+    <div class="desk">
+      <header class="topbar">
+        <div class="brand">CARTOGRAPHY UNSEEN<small>EXHIBITION / OPERATOR VIEW</small></div>
+        <div class="poll"><span id="refresh-status">Connecting to the monitor</span><button id="refresh" type="button">Refresh now</button></div>
+      </header>
+      <div class="machine-bar"><label for="machine">Machine</label><select id="machine" disabled><option>Loading machines…</option></select><span id="fleet" class="muted"></span></div>
+      <div id="notice" role="status" aria-live="polite"></div>
+      <main id="main" tabindex="-1"><section class="empty-state"><span class="eyebrow">Exhibition monitor</span><h1>Waiting for the first response.</h1><p>Loading machine contact, artwork activity and map verification.</p></section></main>
+      <footer class="footer"><span>Remote observation · No machine controls</span><span>Checks every 15 seconds · Times shown in your local timezone</span></footer>
+    </div>
+    <div id="announcer" class="sr-only" role="status" aria-live="polite"></div>
+    <noscript><p class="noscript">Enable JavaScript to read live exhibition status.</p></noscript>
+  </body>
 </html>
