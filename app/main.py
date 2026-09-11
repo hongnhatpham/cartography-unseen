@@ -24,6 +24,7 @@ from app.config import (
 from app.utils.timing import ExponentialAverage, RateMeter
 from app.idle_instructions import IdleInstructions
 from app.screenshots import ScreenshotWriter
+from app.monitoring import SnapshotPublisher
 
 # Smoke mode also waits for the first generated frame; the model load alone is
 # longer than the display-frame budget. This caps that extra wait.
@@ -354,6 +355,8 @@ def _run() -> int:
     renderer: ProxyRenderer | None = None
     worker: DiffusionWorker | None = None
     journey = None
+    monitoring = SnapshotPublisher(root / "cache/monitoring/artwork.json", "artwork")
+    monitoring.update(state="loading", displayed_frames=0)
     screenshots = ScreenshotWriter(root / "screenshot")
     try:
         renderer = ProxyRenderer(
@@ -412,6 +415,7 @@ def _run() -> int:
         autowalking = False
         config_mtime = config_path.stat().st_mtime
         displayed_frames = 0
+        next_monitoring_update = 0.0
         conditioning = None
         last_conditioning_capture = 0.0
         prompt_editing = False
@@ -1081,6 +1085,14 @@ def _run() -> int:
                 )
             display_rate.tick()
             displayed_frames += 1
+            # Publish only scalar counters after the display call succeeded.
+            if now >= next_monitoring_update:
+                monitoring.update(state="error" if status.state == "error" else
+                                  "loading" if latest_ai is None else "running",
+                                  displayed_frames=displayed_frames, display_fps=display_rate.fps,
+                                  generation_fps=stats.get("diffusion_fps"),
+                                  frame_age_ms=frame_age_ms.value if latest_ai is not None else None)
+                next_monitoring_update = now + 1.0
 
             # Automatic prompt walking keeps the world it is walking through
             # intact while sampling a fresh prompt and tuning combination.
@@ -1196,12 +1208,15 @@ def _run() -> int:
             display_rate.fps,
             proxy_rate.fps,
         )
+        monitoring.update(state="stopped")
         return 0
     except Exception as exc:
+        monitoring.update(state="error")
         logging.exception("Fatal application error")
         print(f"Fatal application error: {exc}", file=sys.stderr)
         return 4
     finally:
+        monitoring.close()
         screenshots.close()
         if worker is not None:
             worker.stop()

@@ -1,7 +1,7 @@
 LATENT SPACE — INSTALLATION AND OPERATOR GUIDE
 ==============================================
 
-QUICK START
+QUICK START, NORMAL DOWNLOAD-ON-FIRST-RUN PACKAGE
 -----------
 1. Copy this entire folder to a local drive on the new Windows PC.
 2. Connect the PC to the Internet.
@@ -15,6 +15,9 @@ the pinned TAESD tiny autoencoder. Nothing is installed into the system Python.
 Later launches can operate offline and do not reinstall or redownload anything.
 Optional archive uploads need an Internet connection.
 
+For a prepared offline package or a managed exhibition account, use the
+MANAGED WINDOWS EXHIBITION section below and docs/exhibition-windows.md.
+
 Allow several gigabytes of download traffic and at least 12 GB of free disk
 space. Downloads can resume after interruption. Installation time depends on
 the Internet connection and disk speed.
@@ -25,7 +28,7 @@ SYSTEM REQUIREMENTS
 - Windows 10 or Windows 11, 64-bit
 - NVIDIA GPU with a current NVIDIA display driver
 - 6 GB VRAM minimum; 2.5 GB is used at the default 512x512 mode
-- Internet connection for the first run only
+- Internet connection for first-run downloads unless using a prepared offline package
 - At least 12 GB free disk space during setup
 
 The setup installs PyTorch 2.6 with its bundled CUDA 12.4 runtime. A separate
@@ -49,6 +52,42 @@ run_debug.bat
 setup_first_run.bat
   Runs or repairs the installation without launching the artwork afterward.
   It is normally called automatically by run.bat.
+
+
+MANAGED WINDOWS EXHIBITION
+--------------------------
+Read docs/exhibition-windows.md before provisioning a dedicated host. It covers
+a standard local exhibition account, supervised startup after console logon,
+status checks, recovery, and inbound Windows OpenSSH restricted to exact approved
+Tailscale peer addresses and public keys. Fleet private keys stay on fleet PCs.
+Setup prints a plan by default. Privileged -Apply requires the actual target
+Windows machine and its local administrator console; packaging does not apply it.
+
+The normal package downloads Python and models on first run. A prepared offline
+package already contains a verified runtime, model weights and a fresh install
+marker. Build it on a prepared NVIDIA Windows machine with:
+powershell -ExecutionPolicy Bypass -File tools\pack_exhibition.ps1 -PreparedOffline -Zip
+This packaging command runs from the source checkout, not the deployed release.
+Prepared packages still need the target's NVIDIA driver and commissioning checks:
+runtime\python\python.exe tools\verify_offline.py --root C:\Exhibition\Cartography
+
+Use the runbook's full parameter example for tools\setup_exhibition_windows.ps1.
+It registers tools\run_exhibition.ps1 as the supervised interactive logon task.
+From an approved fleet machine, verify the server fingerprint, then connect:
+ssh -i <private-key-on-fleet-PC> exhibition@<host-private-Tailscale-address>
+In that remote shell, enter powershell -NoProfile and check:
+& C:\Exhibition\Cartography\tools\exhibition_status.ps1 -DeploymentPath C:\Exhibition\Cartography -UserName exhibition -Json
+Restart through the scheduled task as documented; the artwork needs the logged-on
+console session to appear on the public displays.
+
+Telemetry is optional and never grants remote commands. Before provisioning it:
+runtime\python\python.exe -m pip install -r requirements-monitor.txt
+Use the runbook's MonitorCredentialPath and MonitorEndpoint setup parameters
+to install the protected collector task. Obtain the credential from the trusted
+dashboard administrator and keep it outside this folder. dashboard/README.md
+describes server-side credential provisioning from the dashboard source checkout.
+For offline deployment, install optional dependencies before building the prepared
+package. Neither package includes credentials, personal archives or source caches.
 
 
 TWO-PROJECTOR PLACEMENT AND ARCHIVES

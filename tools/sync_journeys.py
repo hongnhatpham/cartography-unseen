@@ -13,6 +13,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.journey_sync import S3Store, sync_lock, sync_once
 from app.journey_storage import sync_environment
+from app.monitoring import SnapshotPublisher, UploadProgress, read_snapshot
 
 
 def main() -> int:
@@ -31,6 +32,8 @@ def main() -> int:
         parser.error("--cache-gib must be finite and nonnegative")
     if args.watch is not None and (not math.isfinite(args.watch) or args.watch <= 0):
         parser.error("--watch must be finite and positive")
+    publisher = None
+    progress = UploadProgress()
     try:
         os.environ.update(sync_environment(PROJECT_ROOT))
         transport = args.transport or os.environ.get("JOURNEY_STORAGE_TRANSPORT", "s3")
@@ -40,15 +43,19 @@ def main() -> int:
             def synchronize():
                 return sync_bundles_once(args.root, store,
                     prefix=os.environ.get("JOURNEY_S3_PREFIX", "journeys"),
-                    cache_bytes=int(args.cache_gib * 1024 ** 3), prune=args.prune)
+                    cache_bytes=int(args.cache_gib * 1024 ** 3), prune=args.prune, progress=progress)
         elif transport == "s3":
             store = S3Store.from_env()
             def synchronize():
                 return sync_once(args.root, store, cache_bytes=int(args.cache_gib * 1024 ** 3),
-                                 prune=args.prune)
+                                 prune=args.prune, progress=progress)
         else:
             raise ValueError("Journey storage transport must be s3 or wrangler")
         with sync_lock(args.root):
+            previous = read_snapshot(PROJECT_ROOT / "cache/monitoring/uploader.json", "uploader")
+            publisher = SnapshotPublisher(PROJECT_ROOT / "cache/monitoring/uploader.json", "uploader")
+            progress.publisher = publisher
+            progress.update(phase="scan", last_verified_at=previous["last_verified_at"])
             while True:
                 result = synchronize()
                 print(f"Verified receipts: {len(result.uploaded)}; removed: {len(result.pruned)}; "
@@ -60,12 +67,19 @@ def main() -> int:
                           file=sys.stderr, flush=True)
                 if args.watch is None:
                     return 1 if result.errors else 0
+                if result.errors:
+                    progress.update(phase="retry")
                 time.sleep(args.watch)
     except KeyboardInterrupt:
+        progress.update(phase="stopped")
         return 0
     except Exception as error:
+        progress.failed()
         print(f"Journey sync stopped: {error}", file=sys.stderr)
         return 1
+    finally:
+        if publisher is not None:
+            publisher.close()
 
 
 if __name__ == "__main__":

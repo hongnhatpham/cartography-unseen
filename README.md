@@ -442,6 +442,37 @@ powershell -ExecutionPolicy Bypass -File tools\pack_exhibition.ps1 -Zip
 
 Output: `dist\RealtimeDiffusionArt.zip`
 
-The archive intentionally excludes Python, wheels, caches, and model weights. `run.bat` downloads them on the target PC's first launch.
+The normal archive excludes Python, wheels, caches, and model weights. `run.bat` downloads them on the target PC's first launch. It is not an offline deployment.
+
+To build a prepared offline package from a trusted checkout whose runtime and
+pinned models have already been installed with `setup_first_run.bat`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\pack_exhibition.ps1 -PreparedOffline -Zip
+```
+
+This copies `runtime/python` and the required SD-Turbo/TAESD files, then checks
+CUDA imports and generates an image with the copied offline verifier before
+writing a new `cache/INSTALL_COMPLETE.txt`. It needs a working NVIDIA GPU on
+the packaging machine; `-SkipVerify` cannot be combined with `-PreparedOffline`.
+Configured model paths must remain `models/sd_turbo` and `models/taesd`.
+Both modes replace only `dist/RealtimeDiffusionArt` and, with `-Zip`, its ZIP.
+Prepared packages are several gigabytes. Neither mode copies source caches,
+journeys, logs, screenshots, dashboard credentials, private keys, or `.git`.
+Use a clean, trusted runtime; packaging cannot identify secrets hidden in
+arbitrary application or dependency files. Optional monitoring and storage
+dependencies must be installed before packaging if they are needed offline:
+
+```powershell
+runtime\python\python.exe -m pip install -r requirements-monitor.txt -r requirements-storage.txt
+```
+
+Both packages include the Windows setup, supervisor, status and telemetry tools,
+journey upload/restore/export tools, and operator runbooks. Dashboard server code
+and credentials are not deployed; its README is included for commissioning reference.
+Follow [the Windows host runbook](docs/exhibition-windows.md) for the standard
+exhibition account, private Tailscale inbound SSH, optional telemetry and startup.
+Privileged `-Apply` must run on the actual target machine. Recheck offline
+generation and the interactive display there before opening the exhibition.
 
 See [README_EXHIBITION.txt](README_EXHIBITION.txt) for complete deployment, monitor-selection, offline-operation, and troubleshooting instructions.

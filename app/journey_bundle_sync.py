@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 from typing import Protocol
 import zipfile
+from app.monitoring import UploadProgress
 
 from app.journey_sync import (
     Archive, ArchiveError, SyncResult, _files, _no_links, _relative_file,
@@ -82,7 +83,8 @@ class WranglerTransport:
 class _PartWriter:
     """Stream an unseekable ZIP into one temporary part, uploading and verifying each."""
 
-    def __init__(self, path: Path, transport: BundleTransport, prefix: str):
+    def __init__(self, path: Path, transport: BundleTransport, prefix: str, progress=None):
+        self.progress = progress or UploadProgress()
         self.path, self.transport, self.prefix = path, transport, prefix
         self.handle = path.open("wb")
         self.digest = hashlib.sha256()
@@ -127,12 +129,17 @@ class _PartWriter:
         checksum = _sha256(self.path)
         key = (f"{self.prefix}/{checksum}.zip" if final and not self.parts else
                f"{self.prefix}/parts/{checksum}.part")
+        self.progress.update(phase="uploading")
         self.transport.put(key, self.path)
+        self.progress.add("completed_bytes", self.part_size)
         # Reuse the same pathname, so verification needs no second part on disk.
+        self.progress.update(phase="verifying")
         self.transport.get(key, self.path)
         if self.path.stat().st_size != self.part_size or _sha256(self.path) != checksum:
             raise ArchiveError("Remote bundle part checksum mismatch; local originals were retained")
         self.parts.append({"key": key, "sha256": checksum, "size": self.part_size})
+        self.progress.verified(self.part_size)
+        self.progress.update(phase="packing")
         self.part_size = 0
         self.handle = self.path.open("wb")
 
@@ -214,12 +221,15 @@ def _read_receipt(root: Path, directory: Path, destination: dict) -> dict | None
     return receipt
 
 
-def _verify(transport: BundleTransport, receipt: dict, temporary: Path) -> None:
+def _verify(transport: BundleTransport, receipt: dict, temporary: Path, progress=None) -> None:
+    progress = progress or UploadProgress()
     digest = hashlib.sha256()
     for part in receipt["parts"]:
+        progress.update(phase="verifying")
         transport.get(part["key"], temporary)
         if temporary.stat().st_size != part["size"] or _sha256(temporary) != part["sha256"]:
             raise ArchiveError("Remote bundle part checksum mismatch; local originals were retained")
+        progress.verified(part["size"])
         with temporary.open("rb") as source:
             while chunk := source.read(1024 * 1024):
                 digest.update(chunk)
@@ -231,14 +241,16 @@ def _descriptor(receipt: dict) -> dict:
     return {key: value for key, value in receipt.items() if key != "pruning"}
 
 
-def _verify_descriptor(transport: BundleTransport, receipt: dict, temporary: Path) -> None:
+def _verify_descriptor(transport: BundleTransport, receipt: dict, temporary: Path) -> int:
     transport.get(receipt["key"], temporary)
     if json.loads(temporary.read_text(encoding="utf-8")) != _descriptor(receipt):
         raise ArchiveError("Remote bundle descriptor differs from its receipt")
+    return temporary.stat().st_size
 
 
 def _upload(root: Path, archive: Archive, transport: BundleTransport, destination: dict,
-            receipt: dict | None) -> dict:
+            receipt: dict | None, progress=None) -> dict:
+    progress = progress or UploadProgress()
     if receipt is not None:
         if receipt["files"] != archive.inventory:
             raise ArchiveError("Local archive differs from its verified bundle receipt")
@@ -250,7 +262,8 @@ def _upload(root: Path, archive: Archive, transport: BundleTransport, destinatio
         if shutil.disk_usage(temporary).free < PART_BYTES + TEMP_RESERVE_BYTES:
             raise ArchiveError("Insufficient temporary space for one bundle part and 64 MiB reserve; local originals were retained")
         object_prefix = f"{destination['prefix']}/{archive.directory.name}"
-        output = _PartWriter(part_path, transport, object_prefix)
+        progress.update(phase="packing")
+        output = _PartWriter(part_path, transport, object_prefix, progress)
         try:
             _bundle(archive, output)
             output.finish()
@@ -265,23 +278,33 @@ def _upload(root: Path, archive: Archive, transport: BundleTransport, destinatio
         descriptor = Path(temporary) / "descriptor.json"
         descriptor.write_text(json.dumps(receipt, sort_keys=True), encoding="utf-8")
         # Publish discovery metadata only after every part verifies.
+        descriptor_size = descriptor.stat().st_size
+        progress.update(phase="uploading")
         transport.put(receipt["key"], descriptor)
-        _verify_descriptor(transport, receipt, descriptor)
+        progress.add("completed_bytes", descriptor_size)
+        progress.update(phase="verifying")
+        verified_size = _verify_descriptor(transport, receipt, descriptor)
+        progress.verified(verified_size)
     if inspect_archive(root, archive.directory).inventory != archive.inventory:
         raise ArchiveError("Local archive changed during upload")
     _write_receipt(_receipt_path(root, archive.directory.name), receipt)
+    progress.committed()
     return receipt
 
 
-def _prune(root: Path, archive: Archive, transport: BundleTransport, receipt: dict) -> None:
+def _prune(root: Path, archive: Archive, transport: BundleTransport, receipt: dict, progress=None) -> None:
     """Verify the complete remote bundle again before deleting a known local subset."""
+    progress = progress or UploadProgress()
     partial = receipt.get("pruning", False)
     _remaining_files(root, archive, partial=partial)
     with tempfile.TemporaryDirectory(prefix="journey-verify-") as temporary:
-        _verify(transport, receipt, Path(temporary) / "download.part")
-        _verify_descriptor(transport, receipt, Path(temporary) / "descriptor.json")
+        _verify(transport, receipt, Path(temporary) / "download.part", progress)
+        verified_size = _verify_descriptor(transport, receipt, Path(temporary) / "descriptor.json")
+        progress.verified(verified_size)
+    progress.committed()
     remaining = _remaining_files(root, archive, partial=partial)
     _write_receipt(_receipt_path(root, archive.directory.name), {**receipt, "pruning": True})
+    progress.update(phase="pruning")
     for path in remaining:
         _no_links(path)
         if not path.resolve().is_relative_to(archive.directory.resolve()):
@@ -299,7 +322,7 @@ def _prune(root: Path, archive: Archive, transport: BundleTransport, receipt: di
 
 
 def sync_bundles_once(root: Path, transport: BundleTransport, *, prefix: str = "journeys",
-                      cache_bytes: int = 5 * 1024 ** 3, prune: bool = False) -> SyncResult:
+                      cache_bytes: int = 5 * 1024 ** 3, prune: bool = False, progress=None) -> SyncResult:
     """Upload completed journeys and bound verified local storage. Caller holds sync_lock."""
     if not math.isfinite(cache_bytes) or cache_bytes < 0:
         raise ValueError("Cache size must be finite and nonnegative")
@@ -307,44 +330,57 @@ def sync_bundles_once(root: Path, transport: BundleTransport, *, prefix: str = "
     root = Path(root).absolute()
     _no_links(root)
     root.mkdir(parents=True, exist_ok=True)
+    progress = progress or UploadProgress()
+    progress.begin(root)
     result, available = SyncResult(), []
     for directory in sorted(root.iterdir()):
         if directory.name == ".sync":
             continue
+        validated = completed = False
         try:
             _no_links(directory)
             if not directory.is_dir():
                 result.local_bytes += directory.stat().st_size
                 continue
+            completed = (directory / "complete.json").exists()
             result.local_bytes += sum(path.stat().st_size for path in _files(directory))
             receipt = _read_receipt(root, directory, destination)
             if receipt and receipt.get("pruning"):
+                validated = True
                 if not prune:
                     raise ArchiveError("Interrupted pruning is pending; rerun with --prune to finish")
                 archive = Archive(directory, 0, receipt["files"])
                 remaining_size = sum(path.stat().st_size for path in _remaining_files(root, archive, partial=True))
-                _prune(root, archive, transport, receipt)
+                _prune(root, archive, transport, receipt, progress)
                 result.local_bytes -= remaining_size
                 result.pruned.append(directory.name)
+                progress.resumed_prune_done(completed)
                 continue
             if not (directory / "complete.json").exists():
                 continue
             archive = inspect_archive(root, directory)
+            validated = True
             existing = receipt is not None
-            receipt = _upload(root, archive, transport, destination, receipt)
+            receipt = _upload(root, archive, transport, destination, receipt, progress)
+            progress.archive_done()
             if not existing:
                 result.uploaded.append(directory.name)
             available.append((archive, receipt))
         except Exception as error:
+            progress.failed(invalid=not validated, completed=completed)
             result.errors.append(f"{directory.name}: {error}")
     if prune:
         for archive, receipt in sorted(available, key=lambda item: (item[0].ended, item[0].directory.name)):
             if result.local_bytes <= cache_bytes:
                 break
             try:
-                _prune(root, archive, transport, receipt)
+                _prune(root, archive, transport, receipt, progress)
                 result.local_bytes -= archive.size
                 result.pruned.append(archive.directory.name)
+                progress.add("pruned_archives", 1)
+                progress.add("verified_archives", -1)
             except Exception as error:
+                progress.failed()
                 result.errors.append(f"{archive.directory.name}: {error}")
+    progress.update(phase="error" if result.errors else "idle", local_bytes=result.local_bytes)
     return result

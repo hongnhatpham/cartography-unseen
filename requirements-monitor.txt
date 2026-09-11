@@ -1,0 +1,2 @@
+# Optional collector metrics only; never installed into the rendering hot path.
+psutil>=5.9,<8

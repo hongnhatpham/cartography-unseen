@@ -1,0 +1,13 @@
+{
+  "projectId": "cartography-unseen",
+  "reportId": "cartography-exhibition-monitor-options",
+  "publicId": "0c89f5f040ec34611838",
+  "revision": 5,
+  "fileCount": 1,
+  "isPublic": false,
+  "url": "https://reports.bynhat.com/r/0c89f5f040ec34611838/",
+  "localFile": "exhibition-monitor-options.html",
+  "bytes": 52694,
+  "localSha256": "72d87f4f19fe823a6bd7acd0b6cd0acf5bbca8ffc0b0646a7eb21f6dcb2dff65",
+  "verification": "Authenticated HTTP 200 text/html. Published document matches the local artifact after removing the hosting service's injected Cloudflare analytics script. Desktop appearances inspected for A, B and C. After stale-evidence and mobile fleet-count repairs, browser checks passed healthy, upload-delay, offline and recovery states at 1280px and 390px with disclosures expanded. All four machine/artwork/storage disclosures explicitly identify the historical 16:39:49 report offline and restore fresh evidence on recovery. No page overflow outside the intentionally scrollable fleet table; both fleet counts occupy one line and sit below the headline at 390px. Mobile screenshot capture unavailable. Inline JavaScript syntax, artifact size, prohibited-content scan and git diff whitespace check passed."
+}

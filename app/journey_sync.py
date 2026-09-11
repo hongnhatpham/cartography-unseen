@@ -13,6 +13,7 @@ from pathlib import Path, PurePosixPath
 import stat
 from typing import Protocol
 from urllib.parse import urlsplit
+from app.monitoring import UploadProgress
 
 
 class ArchiveError(ValueError):
@@ -210,7 +211,8 @@ def _write_receipt(path: Path, data: dict) -> None:
     temporary.replace(path)
 
 
-def upload_archive(root: Path, archive: Archive, store: ObjectStore) -> None:
+def upload_archive(root: Path, archive: Archive, store: ObjectStore, progress=None) -> None:
+    progress = progress or UploadProgress()
     path = _receipt_path(root, archive)
     expected = _receipt(store, archive)
     if path.exists():
@@ -224,13 +226,18 @@ def upload_archive(root: Path, archive: Archive, store: ObjectStore) -> None:
         key, checksum = _key(store, archive, name), archive.inventory[name]["sha256"]
         existing = store.head_sha256(key)
         if existing is None:
+            progress.update(phase="uploading")
             store.upload(key, archive.directory / name, checksum)
+            progress.add("completed_bytes", archive.inventory[name]["size"])
         elif existing != checksum:
             raise ArchiveError(f"Remote object conflicts with this archive: {key}")
+        progress.update(phase="verifying")
         store.verify(key, checksum)
+        progress.verified(archive.inventory[name]["size"])
     if inspect_archive(root, archive.directory).inventory != archive.inventory:
         raise ArchiveError("Local archive changed during upload")
     _write_receipt(path, expected)
+    progress.committed()
 
 
 def _remaining_files(root: Path, archive: Archive, *, partial: bool) -> list[Path]:
@@ -275,8 +282,9 @@ def _pending_prune(root: Path, directory: Path, store: ObjectStore) -> Archive |
     return archive
 
 
-def prune_archive(root: Path, archive: Archive, store: ObjectStore) -> None:
+def prune_archive(root: Path, archive: Archive, store: ObjectStore, progress=None) -> None:
     """Recheck every local and remote byte before removing only the known files."""
+    progress = progress or UploadProgress()
     receipt_path = _receipt_path(root, archive)
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     expected = _receipt(store, archive)
@@ -286,11 +294,15 @@ def prune_archive(root: Path, archive: Archive, store: ObjectStore) -> None:
         raise ArchiveError("Receipt differs from the archive or destination")
     _remaining_files(root, archive, partial=partial)
     for name, item in archive.inventory.items():
+        progress.update(phase="verifying")
         store.verify(_key(store, archive, name), item["sha256"])
+        progress.verified(item["size"])
+    progress.committed()
     remaining = _remaining_files(root, archive, partial=partial)
     # Persist intent before the first unlink, so crashes can resume a known subset.
     _write_receipt(receipt_path, pruning)
     # No recursive deletion. Unknown additions make rmdir fail and remain untouched.
+    progress.update(phase="pruning")
     for path in remaining:
         name = path.relative_to(archive.directory).as_posix()
         _no_links(path)
@@ -316,50 +328,63 @@ class SyncResult:
 
 
 def sync_once(root: Path, store: ObjectStore, *, cache_bytes: int = 5 * 1024 ** 3,
-              prune: bool = False) -> SyncResult:
+              prune: bool = False, progress=None) -> SyncResult:
     """Synchronize completed archives. Caller must hold sync_lock for this root."""
     if not math.isfinite(cache_bytes) or cache_bytes < 0:
         raise ValueError("Cache size must be finite and nonnegative")
     root = Path(root).absolute()
     _no_links(root)
     root.mkdir(parents=True, exist_ok=True)
+    progress = progress or UploadProgress()
+    progress.begin(root)
     result, available = SyncResult(), []
     for directory in sorted(root.iterdir()):
         if directory.name == ".sync":
             continue
+        validated = completed = False
         try:
             _no_links(directory)
             if not directory.is_dir():
                 result.local_bytes += directory.stat().st_size
                 continue
+            completed = (directory / "complete.json").exists()
             result.local_bytes += sum(path.stat().st_size for path in _files(directory))
             pending = _pending_prune(root, directory, store)
             if pending is not None:
+                validated = True
                 if not prune:
                     raise ArchiveError("Interrupted pruning is pending; rerun with --prune to finish")
                 remaining_size = sum(path.stat().st_size for path in _remaining_files(root, pending, partial=True))
-                prune_archive(root, pending, store)
+                prune_archive(root, pending, store, progress)
                 result.local_bytes -= remaining_size
                 result.pruned.append(directory.name)
+                progress.resumed_prune_done(completed)
                 continue
             if not (directory / "complete.json").exists():
                 continue
             archive = inspect_archive(root, directory)
-            upload_archive(root, archive, store)
+            validated = True
+            upload_archive(root, archive, store, progress)
+            progress.archive_done()
             result.uploaded.append(directory.name)
             available.append(archive)
         except Exception as error:
+            progress.failed(invalid=not validated, completed=completed)
             result.errors.append(f"{directory.name}: {error}")
     if prune:
         for archive in sorted(available, key=lambda item: (item.ended, item.directory.name)):
             if result.local_bytes <= cache_bytes:
                 break
             try:
-                prune_archive(root, archive, store)
+                prune_archive(root, archive, store, progress)
                 result.local_bytes -= archive.size
                 result.pruned.append(archive.directory.name)
+                progress.add("pruned_archives", 1)
+                progress.add("verified_archives", -1)
             except Exception as error:
+                progress.failed()
                 result.errors.append(f"{archive.directory.name}: {error}")
+    progress.update(phase="error" if result.errors else "idle", local_bytes=result.local_bytes)
     return result
 
 
