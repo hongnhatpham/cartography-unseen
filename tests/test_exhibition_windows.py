@@ -305,25 +305,35 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile('{script_path}'
 if ($errors.Count) {{ throw ($errors | Out-String) }}
 if ($ast.ParamBlock.Parameters.Name.VariablePath.UserPath -contains 'ExhibitionEndDate') {{ throw 'Setup still requires a show date' }}
 $UserName = 'exhibition'
-$password = ConvertTo-SecureString 'temporary-test-password' -AsPlainText -Force
+$user = $null
+$record = [pscustomobject]@{{ userSid = $null; createdUser = $false; completedPhase = 'begin' }}
+function Save-Record {{ }}
+function Read-Host {{ throw 'Passwordless setup must not prompt' }}
 function New-LocalUser {{
-    param($Name, $Password, [switch]$Disabled, [switch]$PasswordNeverExpires, [switch]$AccountNeverExpires, $Description, $AccountExpires)
-    if (-not $AccountNeverExpires -or -not $PasswordNeverExpires -or $AccountExpires) {{ throw 'New account would expire' }}
+    param($Name, $Password, [switch]$NoPassword, [switch]$Disabled, [switch]$AccountNeverExpires, $Description, $AccountExpires)
+    if (-not $AccountNeverExpires -or $AccountExpires) {{ throw 'New account would expire' }}
+    if (-not $NoPassword -or $Password) {{ throw 'New account must be passwordless' }}
     if (-not $Disabled) {{ throw 'New account could log in before SSH restrictions activate' }}
-    Write-Output 'created'
+    Write-Host 'created'
+    return [pscustomobject]@{{ SID = [Security.Principal.SecurityIdentifier]'S-1-5-21-1-2-3-1001' }}
 }}
 function Set-LocalUser {{
     param($Name, [bool]$PasswordNeverExpires, [switch]$AccountNeverExpires, $AccountExpires)
     if (-not $AccountNeverExpires -or -not $PasswordNeverExpires -or $AccountExpires) {{ throw 'Existing account expiry would not be cleared' }}
     Write-Output 'updated'
 }}
-try {{
-    $commands = $ast.FindAll({{ param($node)
+$creation = $ast.Find({{ param($node)
+    $node -is [System.Management.Automation.Language.IfStatementAst] -and
+    $node.Extent.Text.StartsWith('if (-not $user)') -and $node.Extent.Text.Contains('New-LocalUser')
+}}, $true)
+if (-not $creation) {{ throw 'Missing production account creation seam' }}
+Invoke-Expression $creation.Extent.Text
+if (-not $record.createdUser -or -not $record.accountActivationPending) {{ throw 'New account was not recorded for pending activation' }}
+$commands = $ast.FindAll({{ param($node)
         $node -is [System.Management.Automation.Language.CommandAst] -and
-        $node.GetCommandName() -in @('New-LocalUser', 'Set-LocalUser')
+        $node.GetCommandName() -eq 'Set-LocalUser' -and $node.Extent.Text.Contains('-AccountNeverExpires')
     }}, $true)
-    foreach ($command in $commands) {{ Invoke-Expression $command.Extent.Text }}
-}} finally {{ $password.Dispose() }}
+foreach ($command in $commands) {{ Invoke-Expression $command.Extent.Text }}
 """
     result = subprocess.run(
         [str(POWERSHELL), "-NoProfile", "-Command", command],
@@ -331,6 +341,109 @@ try {{
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.split() == ["created", "updated"]
+
+
+@pytest.mark.parametrize("outcome", ["added", "already", "denied", "trust"])
+def test_setup_users_membership_never_enumerates_unrelated_sids(outcome: str) -> None:
+    """Run the real account-update statements with the reported enumeration failure injected."""
+    result = setup_function_command(rf"""
+Import-Module Microsoft.PowerShell.LocalAccounts
+$UserName = 'exhibition'
+$user = [pscustomobject]@{{ SID = [Security.Principal.SecurityIdentifier]'S-1-5-21-1-2-3-1001' }}
+$script:addCalls = 0
+function Set-LocalUser {{ param($Name, [switch]$AccountNeverExpires, $PasswordNeverExpires) }}
+function Get-LocalGroup {{ param($SID); return [pscustomobject]@{{ SID = $SID }} }}
+function Get-LocalGroupMember {{ throw [ComponentModel.Win32Exception]::new(1789) }}
+function Add-LocalGroupMember {{
+    [CmdletBinding()]param($SID, $Member)
+    if ($SID -ne 'S-1-5-32-545' -or $Member -ne $user.SID.Value) {{ throw 'Membership target must use exact group and local account SIDs' }}
+    if ($ErrorActionPreference -ne 'Stop') {{ throw 'Membership errors must terminate' }}
+    $script:addCalls++
+    if ('{outcome}' -eq 'already') {{ throw [Microsoft.PowerShell.Commands.MemberExistsException]::new('already a member') }}
+    if ('{outcome}' -eq 'denied') {{ throw [ComponentModel.Win32Exception]::new(5) }}
+    if ('{outcome}' -eq 'trust') {{ throw [ComponentModel.Win32Exception]::new(1789) }}
+}}
+$outerTry = $ast.Find({{ param($node)
+    $node -is [System.Management.Automation.Language.TryStatementAst] -and
+    $node.Body.Extent.Text.Contains('$sshChanges += Publish-SshFile')
+}}, $true)
+$capture = $false; $statements = @()
+foreach ($statement in $outerTry.Body.Statements) {{
+    if ($statement.Extent.Text.StartsWith('Set-LocalUser')) {{ $capture = $true }}
+    if ($statement.Extent.Text.StartsWith('if ($MonitorCredentialPath')) {{ break }}
+    if ($capture) {{ $statements += $statement.Extent.Text }}
+}}
+if (-not $statements.Count) {{ throw 'Missing production membership seam' }}
+$caughtCode = 0
+try {{ Invoke-Expression ($statements -join "`n") }} catch {{
+    if ($_.Exception -isnot [ComponentModel.Win32Exception]) {{ throw }}
+    $caughtCode = $_.Exception.NativeErrorCode
+}}
+$expectedCode = switch ('{outcome}') {{ 'denied' {{ 5 }} 'trust' {{ 1789 }} default {{ 0 }} }}
+if ($caughtCode -ne $expectedCode -or $script:addCalls -ne 1) {{ throw "Wrong membership result: code=$caughtCode calls=$script:addCalls" }}
+Write-Output 'membership verified'
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "membership verified"
+
+
+@pytest.mark.parametrize("membership", ["standard", "admin", "error"])
+def test_setup_admin_guard_checks_only_the_local_account(membership: str) -> None:
+    result = setup_function_command(rf"""
+$function = $ast.Find({{ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-LocalAdministrator'
+}}, $true)
+if (-not $function) {{ throw 'Missing exact-member administrator check' }}
+Invoke-Expression $function.Extent.Text
+$UserName = 'exhibition'; $user = [pscustomobject]@{{ SID = 'S-1-5-21-1-2-3-1001' }}
+$script:checked = $false; $script:disposed = $false
+function Get-LocalGroupMember {{ throw [ComponentModel.Win32Exception]::new(1789) }}
+function Get-LocalGroup {{
+    param($SID)
+    if ($SID -ne 'S-1-5-32-544') {{ throw 'Wrong administrator group' }}
+    return [pscustomobject]@{{ Name = 'Localized administrators' }}
+}}
+$fakeGroup = [pscustomobject]@{{}}
+$fakeGroup | Add-Member ScriptMethod Invoke {{
+    param($Method, $Arguments)
+    if ($Method -ne 'IsMember' -or $Arguments.Count -ne 1 -or
+        $Arguments[0] -ne "WinNT://DOMAIN/$env:COMPUTERNAME/exhibition") {{ throw 'Guard must use the resolved local account path' }}
+    $script:checked = $true
+    if ('{membership}' -eq 'error') {{ throw 'Injected membership lookup failure' }}
+    return '{membership}' -eq 'admin'
+}}
+$fakeGroup | Add-Member ScriptMethod Dispose {{ $script:disposed = $true }}
+$fakeMember = [pscustomobject]@{{}}
+$fakeMember | Add-Member ScriptMethod InvokeGet {{
+    param($Property)
+    if ($Property -ne 'ADsPath') {{ throw 'Wrong local account property' }}
+    return "WinNT://DOMAIN/$env:COMPUTERNAME/exhibition"
+}}
+$fakeMember | Add-Member ScriptMethod Dispose {{ }}
+function New-Object {{
+    param($TypeName, $ArgumentList)
+    if ($TypeName -eq 'DirectoryServices.DirectoryEntry' -and
+        $ArgumentList -eq "WinNT://$env:COMPUTERNAME/exhibition,user") {{ return $fakeMember }}
+    if ($TypeName -ne 'DirectoryServices.DirectoryEntry' -or
+        $ArgumentList -ne "WinNT://$env:COMPUTERNAME/Localized administrators,group") {{ throw 'Wrong local group binding' }}
+    return $fakeGroup
+}}
+$guard = $ast.Find({{ param($node)
+    $node -is [System.Management.Automation.Language.IfStatementAst] -and
+    $node.Extent.Text.Contains("throw 'The exhibition account is an administrator;")
+}}, $true)
+if (-not $guard) {{ throw 'Missing production administrator guard' }}
+$caught = $false
+try {{ Invoke-Expression $guard.Extent.Text }} catch {{
+    if ('{membership}' -eq 'admin' -and $_.Exception.Message -notlike '*account is an administrator*') {{ throw }}
+    if ('{membership}' -eq 'error' -and $_.Exception.Message -notlike '*Injected membership lookup failure*') {{ throw }}
+    $caught = $true
+}}
+if ($caught -ne ('{membership}' -ne 'standard') -or -not $script:checked -or -not $script:disposed) {{ throw 'Wrong administrator guard result' }}
+Write-Output 'guard verified'
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "guard verified"
 
 
 @pytest.mark.parametrize("existing", [
@@ -356,6 +469,8 @@ $candidate
     assert block.splitlines()[1] == "Match User exhibition"
     assert "    AllowUsers exhibition\n" in block
     assert "    PasswordAuthentication no\n" in block
+    assert "    KbdInteractiveAuthentication no\n" in block
+    assert "ChallengeResponseAuthentication" not in block
     assert "    AuthenticationMethods publickey\n" in block
     assert "    PubkeyAcceptedKeyTypes ssh-ed25519," in block
     assert "PubkeyAcceptedAlgorithms" not in block
@@ -426,14 +541,15 @@ Write-Output 'restored'
 @pytest.mark.parametrize("account_state,failure", [
     ("new", "none"), ("new", "keys"), ("new", "config"),
     ("new", "restart"), ("new", "save"),
-    ("pending", "none"), ("pending", "restart"),
-    ("enabled", "none"), ("enabled", "restart"), ("disabled", "none"),
+    ("pending", "none"), ("pending", "restart"), ("pending", "password"),
+    ("enabled", "none"), ("enabled", "restart"), ("enabled", "password"),
+    ("enabled", "save"), ("disabled", "none"),
 ])
 def test_account_activation_waits_for_ssh_and_preserves_existing_state(account_state: str, failure: str) -> None:
     result = setup_function_command(rf"""
 $pending = '{account_state}' -in @('new', 'pending')
 $script:accountEnabled = '{account_state}' -eq 'enabled'
-$user = if ('{account_state}' -eq 'new') {{ $null }} else {{ [pscustomobject]@{{ Enabled = $script:accountEnabled }} }}
+$user = if ('{account_state}' -eq 'new') {{ $null }} else {{ [pscustomobject]@{{ Enabled = $script:accountEnabled; SID = 'S-1-5-21-1-2-3-1001' }} }}
 $record = [pscustomobject]@{{ accountActivationPending = $pending; completedPhase = 'ssh-staged' }}
 $prior = if ('{account_state}' -eq 'new') {{ $null }} else {{ $record }}
 foreach ($variable in @('$activationPending', '$activateAccount')) {{
@@ -446,7 +562,10 @@ $UserName = 'exhibition'; $keyPath = 'keys'; $configPath = 'config'
 $keyCandidate = 'keys.candidate'; $candidatePath = 'config.candidate'
 $stateRoot = 'C:\state'; $configBackup = 'config.previous'; $recordPath = 'unused'
 $service = [pscustomobject]@{{ State = 'Running' }}
-$sshChanges = @(); $accountActivationAttempted = $false
+$sshChanges = @(); $accountActivationAttempted = $false; $passwordResetAttempted = $false
+$script:passwordCleared = $false
+# The production tail runs after a new account has been created and recorded.
+if (-not $user) {{ $user = [pscustomobject]@{{ Enabled = $false; SID = 'S-1-5-21-1-2-3-1001' }} }}
 $script:published = 0; $script:restarted = $false; $script:saveFailed = $false
 $script:disableCount = 0; $script:restoreCount = 0
 function Publish-SshFile {{
@@ -462,8 +581,15 @@ function Restart-Service {{
 }}
 function Enable-LocalUser {{
     param($Name)
-    if ($script:published -ne 2 -or -not $script:restarted) {{ throw 'Account enabled before SSH was ready' }}
+    if ($script:published -ne 2 -or -not $script:restarted -or -not $script:passwordCleared) {{ throw 'Account enabled before SSH and passwordless sign-in were ready' }}
     $script:accountEnabled = $true
+}}
+function Set-LocalUser {{
+    [CmdletBinding()]param($SID, [Security.SecureString]$Password)
+    if ($SID -ne $user.SID -or $Password.Length -ne 0) {{ throw 'Password reset must clear only the managed local account' }}
+    if ($script:published -ne 2 -or -not $script:restarted) {{ throw 'Password cleared before SSH activation' }}
+    if ('{failure}' -eq 'password') {{ throw 'Injected password reset failure' }}
+    $script:passwordCleared = $true
 }}
 function Disable-LocalUser {{ param($Name); $script:accountEnabled = $false; $script:disableCount++ }}
 function Get-Service {{ param($Name); return [pscustomobject]@{{ Status = 'Running' }} }}
@@ -493,7 +619,9 @@ $expectedEnabled = '{account_state}' -eq 'enabled' -or ($pending -and '{failure}
 if ($script:accountEnabled -ne $expectedEnabled) {{ throw 'Wrong final account enabled state' }}
 if (-not $pending -and $script:disableCount) {{ throw 'Pre-existing account was disabled' }}
 if ($pending -and '{failure}' -ne 'none' -and -not $record.accountActivationPending) {{ throw 'Failed setup lost its pending activation record' }}
-if ('{failure}' -eq 'save' -and ($script:disableCount -ne 1 -or $script:restoreCount -ne 2)) {{ throw 'Late failure did not disable before restoring both files' }}
+if ($pending -and '{failure}' -eq 'save' -and ($script:disableCount -ne 1 -or $script:restoreCount -ne 2)) {{ throw 'Late failure did not disable before restoring both files' }}
+if ('{account_state}' -eq 'enabled' -and '{failure}' -in @('password', 'save') -and $script:restoreCount -ne 0) {{ throw 'SSH restrictions rolled back after password reset on enabled account' }}
+if ('{failure}' -eq 'none' -and -not $script:passwordCleared) {{ throw 'Successful setup left a password' }}
 Write-Output 'state verified'
 """)
     assert result.returncode == 0, result.stdout + result.stderr

@@ -40,6 +40,19 @@ function Grant-ProjectAccess {
     # Add access without resetting existing permissions or changing ownership.
     Invoke-CheckedNative icacls.exe @($Path, '/grant', "*${UserSid}:(OI)(CI)M", '/t', '/q')
 }
+function Test-LocalAdministrator {
+    param([string]$Account)
+    $administrators = Get-LocalGroup -SID 'S-1-5-32-544'
+    $group = New-Object DirectoryServices.DirectoryEntry -ArgumentList "WinNT://$env:COMPUTERNAME/$($administrators.Name),group"
+    # IsMember checks this local account without resolving unrelated domain members.
+    try {
+        $member = New-Object DirectoryServices.DirectoryEntry -ArgumentList "WinNT://$env:COMPUTERNAME/$Account,user"
+        # WinNT may canonicalize the path to domain/computer/user on domain-joined machines.
+        try { return [bool]$group.Invoke('IsMember', @($member.InvokeGet('ADsPath'))) }
+        finally { $member.Dispose() }
+    }
+    finally { $group.Dispose() }
+}
 function Assert-TrustedState {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return }
@@ -73,6 +86,7 @@ Match User $Account
     AllowUsers $Account
     PubkeyAuthentication yes
     PasswordAuthentication no
+    KbdInteractiveAuthentication no
     AuthenticationMethods publickey
     AuthorizedKeysFile "$($KeyPath.Replace('\', '/'))"
     PubkeyAcceptedKeyTypes ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-256,rsa-sha2-512
@@ -274,7 +288,7 @@ $activationPending = -not $user -or ($prior -and $prior.PSObject.Properties.Name
 $activateAccount = $activationPending -and (-not $user -or -not $user.Enabled)
 if ($prior -and $prior.deploymentPath -ne $root) { throw 'Existing deployment record uses a different path.' }
 if ((Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) -and -not $prior) { throw 'Unmanaged scheduled task name collision.' }
-if ($user -and @(Get-LocalGroupMember -SID 'S-1-5-32-544' | Where-Object SID -eq $user.SID).Count) { throw 'The exhibition account is an administrator; remove that membership before continuing.' }
+if ($user -and (Test-LocalAdministrator -Account $UserName)) { throw 'The exhibition account is an administrator; remove that membership before continuing.' }
 $service = Get-CimInstance Win32_Service -Filter "Name='sshd'"
 $sshPaths = Get-SshServicePaths -CommandLine $(if ($service) { $service.PathName } else { '' })
 $sshd = $sshPaths.executable
@@ -294,6 +308,7 @@ $sshPort = $ports[0]
     mode = $(if ($Apply) { 'Apply' } else { 'Read-only plan; rerun with -Apply after review' })
     account = "$env:COMPUTERNAME\$UserName"; standardUser = $true; accountNeverExpires = $true
     enableAccountAfterSsh = $activateAccount
+    localSignIn = 'No password; clear any existing password after SSH activation'
     deployment = $root; deploymentAcl = 'Add exhibition user Modify access throughout the project; preserve existing access and ownership'
     writableDirectories = @($root); activeConfiguration = 'cache\exhibition\config.json'
     privilegedState = $stateRoot; publicKeyCount = $keys.Count; sshConfiguration = $candidate
@@ -334,6 +349,7 @@ function Save-Record {
 Save-Record
 $sshChanges = @()
 $accountActivationAttempted = $false
+$passwordResetAttempted = $false
 $candidatePath = $null
 $keyCandidate = $null
 try {
@@ -346,18 +362,15 @@ try {
         }
     }
     if (-not $user) {
-        $password = Read-Host "Local password for $UserName (never saved by this script)" -AsSecureString
-        try { $user = New-LocalUser -Name $UserName -Password $password -Disabled -PasswordNeverExpires -AccountNeverExpires -Description 'Cartography exhibition standard account' }
-        finally { if ($password) { $password.Dispose() }; Remove-Variable password -ErrorAction SilentlyContinue }
+        $user = New-LocalUser -Name $UserName -NoPassword -Disabled -AccountNeverExpires -Description 'Cartography exhibition standard account'
         $record.userSid = $user.SID.Value; $record.createdUser = $true; $record.completedPhase = 'account'
         $record | Add-Member -NotePropertyName accountActivationPending -NotePropertyValue $true -Force
         Save-Record
     }
     Set-LocalUser -Name $UserName -AccountNeverExpires -PasswordNeverExpires $true
-    $usersGroup = Get-LocalGroup -SID 'S-1-5-32-545'
-    if (-not @(Get-LocalGroupMember -Group $usersGroup | Where-Object SID -eq $user.SID).Count) {
-        Add-LocalGroupMember -Group $usersGroup -Member $user
-    }
+    # Add only the known local SID. Enumerating Users can fail on unrelated stale domain SIDs.
+    try { Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $user.SID.Value -ErrorAction Stop }
+    catch [Microsoft.PowerShell.Commands.MemberExistsException] { }
     if ($MonitorCredentialPath -and $existingMonitor) {
         # Remove an earlier SYSTEM task before its executable becomes user-writable.
         Stop-ScheduledTask -TaskName $monitorTaskName
@@ -446,6 +459,13 @@ try {
     $sshChanges += Publish-SshFile -CandidatePath $candidatePath -Path $configPath -BackupPath $configBackup
     if ($service -and $service.State -eq 'Running') { Restart-Service sshd }
     elseif (-not $service) { Start-Service sshd }
+    # Windows PowerShell 5.1 accepts an empty SecureString; no plaintext password or prompt is needed.
+    $blankPassword = New-Object Security.SecureString
+    try {
+        $passwordResetAttempted = $true
+        Set-LocalUser -SID $user.SID -Password $blankPassword -ErrorAction Stop
+    }
+    finally { $blankPassword.Dispose() }
     if ($activateAccount) {
         $accountActivationAttempted = $true
         Enable-LocalUser -Name $UserName
@@ -463,6 +483,12 @@ catch {
     if ($accountActivationAttempted) {
         Disable-LocalUser -Name $UserName
         $record | Add-Member -NotePropertyName accountActivationPending -NotePropertyValue $true -Force
+    }
+    # Clearing a password cannot be undone. Keep the new SSH restrictions for an already-enabled
+    # account if a later step fails, without disabling that pre-existing account.
+    if ($passwordResetAttempted -and -not $activateAccount -and $user.Enabled) {
+        Save-Record
+        throw
     }
     # Never stop a pre-existing SSH service when another setup phase fails.
     [array]::Reverse($sshChanges)
