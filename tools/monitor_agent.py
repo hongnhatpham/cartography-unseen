@@ -94,6 +94,16 @@ def main():
         snapshot_directory = local_directory(args.snapshot_directory)
         state_directory.mkdir(parents=True, exist_ok=True)
         state_directory = local_directory(state_directory)
+        if os.name == 'nt' and not args.once:
+            # The scheduled collector must survive closing unrelated console
+            # windows. Keep bounded, redacted diagnostics before detaching.
+            error_log = state_directory / 'agent-errors.log'
+            if error_log.exists() and error_log.stat().st_size >= 65536:
+                os.replace(error_log, state_directory / 'agent-errors.previous.log')
+            log_stream = error_log.open('a', encoding='utf-8', buffering=1)
+            sys.stdout = sys.stderr = log_stream
+            import ctypes
+            ctypes.windll.kernel32.FreeConsole()
         outbox_path = state_directory / "outbox.sqlite3"
         outbox = Outbox(outbox_path, int(args.spool_mib * 1024 ** 2), args.spool_hours * 3600)
         sampler = SystemSampler(PROJECT_ROOT)

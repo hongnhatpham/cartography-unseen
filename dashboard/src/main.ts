@@ -57,7 +57,8 @@ function render() {
   }
 }
 
-async function refresh() {
+async function refresh(forceHistory = false) {
+  if (document.hidden) return;
   const startedAt = performance.now();
   clearTimeout(pollTimer);
   controller?.abort();
@@ -82,7 +83,7 @@ async function refresh() {
     render();
     if (selected) {
       const id = selected;
-      const [series, alerts] = await Promise.allSettled([getSeries(id, request.signal), getAlerts(id, request.signal)]);
+      const [series, alerts] = await Promise.allSettled([getSeries(id, request.signal, forceHistory), getAlerts(id, request.signal)]);
       if (controller !== request || id !== selected) return;
       details.loading = false;
       details.seriesError = series.status === 'rejected';
@@ -102,7 +103,7 @@ async function refresh() {
     if (controller === request) {
       refreshing = false;
       render();
-      pollTimer = setTimeout(() => { void refresh(); }, Math.max(0, 15_000 - (performance.now() - startedAt)));
+      if (!document.hidden) pollTimer = setTimeout(() => { void refresh(); }, Math.max(0, 15_000 - (performance.now() - startedAt)));
     }
   }
 }
@@ -111,7 +112,7 @@ picker.addEventListener('change', () => {
   details = emptyDetails();
   void refresh();
 });
-refreshButton.addEventListener('click', () => { void refresh(); });
+refreshButton.addEventListener('click', () => { void refresh(true); });
 document.addEventListener('visibilitychange', () => { if (!document.hidden && !refreshing) void refresh(); });
 window.addEventListener('online', () => { if (!refreshing) void refresh(); });
 setInterval(() => { if (!document.hidden && !refreshing) render(); }, 5_000);

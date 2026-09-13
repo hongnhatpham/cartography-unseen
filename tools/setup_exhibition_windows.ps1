@@ -423,7 +423,9 @@ try {
     if (-not (Test-Path -LiteralPath $mutableConfigDirectory)) { New-Item -ItemType Directory -Path $mutableConfigDirectory | Out-Null }
     $mutableConfig = Join-Path $mutableConfigDirectory 'config.json'
     if (-not (Test-Path -LiteralPath $mutableConfig)) {
-        Copy-Item -LiteralPath (Join-Path $root 'config.json') -Destination $mutableConfig
+        $preset = Join-Path $root 'config.exhibition.json'
+        if (-not (Test-Path -LiteralPath $preset)) { $preset = Join-Path $root 'config.json' }
+        Copy-Item -LiteralPath $preset -Destination $mutableConfig
     }
     $record.completedPhase = 'deployment-acl'; Save-Record
     if ($capability.State -ne 'Installed') {

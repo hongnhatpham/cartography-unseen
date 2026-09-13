@@ -144,6 +144,7 @@ class AppConfig:
     autowalk_idle_seconds: float = 60.0
     fullscreen: bool = True
     display_monitor: int = 0
+    map_display_monitor: int | None = None
     auto_resolution_fallback: bool = True
 
     @classmethod
@@ -217,6 +218,8 @@ class AppConfig:
             raise RuntimeError("target_display_fps must be at least 30")
         if self.display_monitor < 0:
             raise RuntimeError("display_monitor must be zero or greater")
+        if self.map_display_monitor is not None and (type(self.map_display_monitor) is not int or self.map_display_monitor < 0):
+            raise RuntimeError("map_display_monitor must be null or a nonnegative integer")
         if not 1 <= self.conditioning_fps <= self.target_display_fps:
             raise RuntimeError("conditioning_fps must be between 1 and target_display_fps")
         if self.warmup_passes < 0:

@@ -37,6 +37,22 @@ function Write-SupervisorLog {
     }
     Add-Content -LiteralPath $logPath -Encoding UTF8 -Value ("{0} {1}" -f (Get-Date).ToUniversalTime().ToString('o'), $Message)
 }
+function Write-AtomicSupervisorFile {
+    param([string]$Source, [string]$Destination)
+    # ReplaceFile leaves both names intact for 1175; retry only these bounded
+    # sharing conflicts. Persistent failures still reach the supervisor handler.
+    for ($attempt = 0; $attempt -le 10; $attempt++) {
+        try {
+            if ([IO.File]::Exists($Destination)) { [IO.File]::Replace($Source, $Destination, [NullString]::Value) }
+            else { [IO.File]::Move($Source, $Destination) }
+            return
+        } catch {
+            $nativeCode = $_.Exception.GetBaseException().HResult -band 0xFFFF
+            if ($attempt -eq 10 -or $nativeCode -notin @(5, 32, 33, 1175)) { throw }
+            Start-Sleep -Milliseconds 25
+        }
+    }
+}
 function Write-SupervisorStatus {
     param([string]$State, [string]$Detail = '')
     $script:lastState = $State
@@ -50,8 +66,7 @@ function Write-SupervisorStatus {
     } | ConvertTo-Json -Compress
     $temp = "$statusPath.$PID.tmp"
     [IO.File]::WriteAllText($temp, $payload, (New-Object Text.UTF8Encoding($false)))
-    if (Test-Path -LiteralPath $statusPath) { [IO.File]::Replace($temp, $statusPath, [NullString]::Value) }
-    else { [IO.File]::Move($temp, $statusPath) }
+    Write-AtomicSupervisorFile -Source $temp -Destination $statusPath
 }
 function Wait-WithHeartbeat {
     param([int]$Seconds, [string]$State)
@@ -101,6 +116,7 @@ if not torch.cuda.is_available():
 '@
     & $python -c $validation
     if ($LASTEXITCODE -ne 0) { throw "Offline prerequisite validation failed with exit code $LASTEXITCODE" }
+    & (Join-Path $PSScriptRoot 'configure_exhibition_gpu.ps1') -DeploymentPath $root
     # A kill-on-close Job Object prevents orphan renderers if Task Scheduler kills this supervisor.
     Add-Type -TypeDefinition @'
 using System;

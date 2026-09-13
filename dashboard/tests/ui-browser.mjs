@@ -23,6 +23,7 @@ try {
   await page.clock.install();
   let state = 'auth';
   let requests = 0;
+  let seriesRequests = 0;
   await page.route('**/api/v1/**', route => {
     requests++;
     if (state !== 'healthy') return route.fulfill({ status: state === 'auth' ? 401 : 503, json: { error: 'Test response' } });
@@ -30,7 +31,10 @@ try {
     const machine = uiMachine(now);
     const url = new URL(route.request().url());
     if (url.pathname.endsWith('/machines')) return route.fulfill({ json: { serverTime: now, machines: [machine], nextCursor: null } });
-    if (url.pathname.endsWith('/series')) return route.fulfill({ json: { machineId: machine.id, resolution: '5m', from: now - 86400_000, to: now, points: [] } });
+    if (url.pathname.endsWith('/series')) {
+      seriesRequests++;
+      return route.fulfill({ json: { machineId: machine.id, resolution: '5m', from: now - 86400_000, to: now, points: [] } });
+    }
     return route.fulfill({ json: { serverTime: now, alerts: [], nextCursor: null } });
   });
   await page.goto('http://127.0.0.1:4179/');
@@ -48,6 +52,15 @@ try {
   state = 'healthy';
   await page.locator('#refresh').click();
   await page.locator('.healthline').waitFor();
+  await page.waitForFunction(() => document.querySelector('#refresh').getAttribute('aria-busy') === 'false');
+  await page.clock.runFor(60_001);
+  assert.equal(seriesRequests, 1, 'Live polling repeatedly fetched the full history');
+  await page.waitForFunction(() => document.querySelector('#refresh').getAttribute('aria-busy') === 'false');
+  await page.evaluate(() => Object.defineProperty(document, 'hidden', { configurable: true, get: () => true }));
+  const requestsBeforeHidden = requests;
+  await page.clock.runFor(60_001);
+  assert.equal(requests, requestsBeforeHidden, 'Hidden dashboard continued polling');
+  await page.evaluate(() => { delete document.hidden; });
   state = 'auth';
   await page.locator('#refresh').click();
   await page.locator('#notice a').waitFor();

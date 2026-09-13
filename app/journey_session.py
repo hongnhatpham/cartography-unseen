@@ -20,7 +20,9 @@ class JourneySession:
             image_format=getattr(config, "map_image_format", "webp"),
             export_svg=getattr(config, "map_export_svg", False),
         )
-        self.window = MapWindow(root)
+        monitor = getattr(config, 'map_display_monitor', None)
+        self.window = (MapWindow(root) if monitor is None else
+                       MapWindow(root, display_monitor=monitor, fullscreen=config.fullscreen))
         self.idle_seconds = config.map_idle_seconds
         self.last_activity: float | None = None
         self.active = False

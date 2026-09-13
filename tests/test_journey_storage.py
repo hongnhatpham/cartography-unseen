@@ -70,3 +70,14 @@ def test_wrangler_setup_uses_existing_login_without_aws_credentials(tmp_path, mo
     assert environment["JOURNEY_S3_BUCKET"] == "private-journeys"
     assert "AWS_SHARED_CREDENTIALS_FILE" not in environment
     assert "AWS_PROFILE" not in environment
+
+
+def test_background_uploader_uses_physical_windows_login_location(tmp_path, monkeypatch):
+    import os
+    monkeypatch.setenv("XDG_CONFIG_HOME", "logical-desktop-location")
+    (tmp_path / "cache").mkdir()
+    (tmp_path / "cache/journey-storage.json").write_text(json.dumps({
+        "transport": "wrangler", "bucket": "private-journeys",
+        "wrangler_config_home": "physical-shared-location"}))
+    assert sync_environment(tmp_path)["XDG_CONFIG_HOME"] == "physical-shared-location"
+    assert os.environ["XDG_CONFIG_HOME"] == "logical-desktop-location"

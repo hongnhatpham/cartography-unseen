@@ -51,18 +51,34 @@ def _relative_file(name: str) -> str:
     return name
 
 
-def _files(directory: Path) -> list[Path]:
+def _files(directory: Path, *, allow_missing: bool = False) -> list[Path]:
     _no_links(directory)
     found = []
     for path in directory.iterdir():
-        _no_links(path)
-        if path.is_dir():
-            found.extend(_files(path))
-        elif path.is_file():
-            found.append(path)
-        else:
-            raise ArchiveError(f"Unsupported archive entry: {path}")
+        try:
+            _no_links(path)
+            if path.is_dir():
+                found.extend(_files(path, allow_missing=allow_missing))
+            elif path.is_file():
+                found.append(path)
+            elif not (allow_missing and not path.exists()):
+                raise ArchiveError(f"Unsupported archive entry: {path}")
+        except FileNotFoundError:
+            if not allow_missing:
+                raise
     return found
+
+
+def _directory_size(directory: Path, *, mutable: bool = False) -> int:
+    """Estimate active storage despite atomic temp-file renames; finalized data is strict."""
+    total = 0
+    for path in _files(directory, allow_missing=mutable):
+        try:
+            total += path.stat().st_size
+        except FileNotFoundError:
+            if not mutable:
+                raise
+    return total
 
 
 @dataclass(frozen=True)
@@ -348,7 +364,7 @@ def sync_once(root: Path, store: ObjectStore, *, cache_bytes: int = 5 * 1024 ** 
                 result.local_bytes += directory.stat().st_size
                 continue
             completed = (directory / "complete.json").exists()
-            result.local_bytes += sum(path.stat().st_size for path in _files(directory))
+            result.local_bytes += _directory_size(directory, mutable=not completed)
             pending = _pending_prune(root, directory, store)
             if pending is not None:
                 validated = True

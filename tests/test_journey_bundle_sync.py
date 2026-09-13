@@ -259,6 +259,19 @@ def test_large_bundle_streams_bounded_parts_and_reassembles(tmp_path, monkeypatc
     assert not result.errors and result.pruned == ["first"]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows npm installation")
+def test_wrangler_found_after_install_with_stale_desktop_path(tmp_path, monkeypatch):
+    import app.journey_bundle_sync as module
+    npm = tmp_path / "npm"
+    script = npm / "node_modules/wrangler/bin/wrangler.js"
+    script.parent.mkdir(parents=True)
+    script.touch()
+    (npm / "wrangler.cmd").touch()
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setattr(module.shutil, "which", lambda name: "node" if name == "node" else None)
+    assert WranglerTransport("private-bucket").command == ["node", str(script)]
+
+
 def test_changed_source_during_stream_never_publishes_descriptor(tmp_path, monkeypatch):
     import app.journey_bundle_sync as module
 

@@ -81,6 +81,7 @@ beforeEach(async () => {
   sqlite = new DatabaseSync(':memory:');
   sqlite.exec(readFileSync(new URL('../migrations/0001_monitor.sql', import.meta.url), 'utf8'));
   sqlite.exec(readFileSync(new URL('../migrations/0002_alert_feed.sql', import.meta.url), 'utf8'));
+  sqlite.exec(readFileSync(new URL('../migrations/0003_incremental_series.sql', import.meta.url), 'utf8'));
   sqlite.prepare('INSERT INTO machines(id,label,token_hash,created_at) VALUES(?,?,?,?)').run('a', 'Machine A', await tokenHash(TOKEN_A), now);
   sqlite.prepare('INSERT INTO machines(id,label,token_hash,created_at) VALUES(?,?,?,?)').run('b', 'Machine B', await tokenHash(TOKEN_B), now);
   sqlite.prepare('INSERT INTO alert_readers(id,label,token_hash,created_at) VALUES(?,?,?,?)').run('aria', 'ARIA', await tokenHash(READER_TOKEN), now);
@@ -112,6 +113,32 @@ describe('authentication and request boundary', () => {
     expect((await worker.fetch(new Request('https://other.test/api/v1/machines'), env)).status).toBe(403);
     expect((await post(sample(), { headers: { Origin: 'https://evil.test' } })).status).toBe(403);
     expect((await post(sample(), { headers: { 'Sec-Fetch-Site': 'cross-site' } })).status).toBe(403);
+  });
+  it('allows the authenticated document navigation back from Access login', async () => {
+    const headers = { 'Sec-Fetch-Site': 'cross-site', 'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Dest': 'document', 'Cf-Access-Jwt-Assertion': 'test-human' };
+    const response = await worker.fetch(new Request('https://monitor.test/', { headers }), env);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('placeholder');
+    const anonymous = { ...headers, 'Cf-Access-Jwt-Assertion': '' };
+    expect((await worker.fetch(new Request('https://monitor.test/', { headers: anonymous }), env)).status).toBe(401);
+    expect((await createWorker().fetch(new Request('https://monitor.test/', { headers }), env)).status).toBe(401);
+  });
+  it('keeps cross-site APIs, subresource loads, and embedded documents blocked', async () => {
+    const headers = { 'Sec-Fetch-Site': 'cross-site', 'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Dest': 'document', 'Cf-Access-Jwt-Assertion': 'test-human' };
+    for (const path of ['/api/v1/machines', '/api/v1/alerts', '/api/v1/alert-feed']) {
+      expect((await worker.fetch(new Request(`https://monitor.test${path}`, { headers }), env)).status).toBe(403);
+    }
+    expect((await post(sample(), { headers })).status).toBe(403);
+    const blockedHeaders: Record<string, string>[] = [
+      { 'Sec-Fetch-Mode': 'cors' }, { 'Sec-Fetch-Mode': 'no-cors' },
+      { 'Sec-Fetch-Dest': 'iframe' }, { 'Sec-Fetch-Dest': 'script' },
+      { Origin: 'https://evil.test' },
+    ];
+    for (const overrides of blockedHeaders) {
+      expect((await worker.fetch(new Request('https://monitor.test/', { headers: { ...headers, ...overrides } }), env)).status).toBe(403);
+    }
   });
   it('rejects rate excess before writing', async () => {
     env.INGEST_LIMIT = { limit: async () => ({ success: false }) } as RateLimit;
@@ -214,6 +241,54 @@ describe('identity, freshness and replay', () => {
 });
 
 describe('series and retention', () => {
+  it('follows receipt cursors, replaces late buckets, and uses bounded indexes', async () => {
+    const plans: string[] = [];
+    const prepare = env.DB.prepare.bind(env.DB);
+    env.DB.prepare = (sql: string) => {
+      if (sql.includes('FROM samples INDEXED')) {
+        plans.push(JSON.stringify(sqlite.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...Array((sql.match(/\?/g) ?? []).length).fill(0))));
+      }
+      return prepare(sql);
+    };
+    const read = async (since?: number) => {
+      const response = await worker.fetch(new Request(`https://monitor.test/api/v1/series?machineId=a${since === undefined ? '' : `&since=${since}`}`, { headers: { 'Cf-Access-Jwt-Assertion': 'test-human' } }), env);
+      expect(response.status).toBe(200);
+      return response.json() as Promise<{ cursor: number; points: { bucketAt: number; sampleCount: number; generationFps: number }[] }>;
+    };
+    now -= 3600_000;
+    const first = sample(1);
+    await post(first);
+    now += 30_001;
+    const initial = await read();
+    expect(initial.points).toHaveLength(1);
+    expect(plans.at(-1)).toContain('samples_machine_time (machine_id=? AND sampled_at>? AND sampled_at<?)');
+    now += 3600_000;
+    const empty = await read(initial.cursor);
+    expect(empty.points).toEqual([]);
+    const delayed = { ...first, sequence: 2, app: { ...first.app, generationFps: 40 } };
+    await post({ schemaVersion: 1, samples: [delayed] }, { path: '/api/v1/history' });
+    // A write in the cursor's exact millisecond must still be picked up.
+    const delta = await read(empty.cursor);
+    expect(delta.points).toHaveLength(1);
+    expect(delta.points[0]).toMatchObject({ sampleCount: 2, generationFps: 30 });
+    expect(plans.at(-2)).toContain('samples_machine_received (machine_id=? AND received_at>? AND received_at<?)');
+    expect(plans.at(-1)).toContain('samples_rollup (machine_id=? AND bucket_at=?)');
+    now += 30_001;
+    const replay = await read(delta.cursor);
+    expect(replay.points).toEqual(delta.points);
+    now += 1;
+    expect((await read(replay.cursor)).points).toEqual([]);
+  });
+  it('does not lose samples received with an allowed clock lead', async () => {
+    const future = sample(1);
+    future.sampledAt = new Date(now + 20_000).toISOString();
+    await post(future);
+    const read = async (since?: number) => (await worker.fetch(new Request(`https://monitor.test/api/v1/series?machineId=a${since === undefined ? '' : `&since=${since}`}`, { headers: { 'Cf-Access-Jwt-Assertion': 'test-human' } }), env)).json() as Promise<{ cursor: number; points: unknown[] }>;
+    const initial = await read();
+    expect(initial.points).toEqual([]);
+    now += 300_000;
+    expect((await read(initial.cursor)).points).toHaveLength(1);
+  });
   it('reads only the selected machine and computes five-minute means', async () => {
     await post(sample());
     await post({ ...sample(1), system: { ...sample().system, cpuPercent: 40 } });

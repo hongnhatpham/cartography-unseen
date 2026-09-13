@@ -60,8 +60,13 @@ publish that directory.
 This mode requires Node, Wrangler and a valid Wrangler login for the pinned
 Cloudflare account. If the login expires and cannot refresh, local archives stay
 on disk and uploads report an error. Run `wrangler login` interactively to restore
-access. Setup stores only the transport, bucket and account ID under `cache/`;
-Wrangler manages its own credentials.
+access. Setup stores the transport, bucket, account ID and, on Windows when
+needed, the physical Wrangler configuration directory under `cache/`; Wrangler
+manages its own credentials. This directory lets Task Scheduler use the same
+login when a packaged desktop redirects AppData. Setup resolves the existing
+file location instead of making a separate credential copy. Rerun setup if that
+installation location changes. The uploader also finds npm's standard per-user
+Wrangler install when the desktop still has a pre-install PATH.
 
 ### Scoped S3 credentials
 

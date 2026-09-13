@@ -33,6 +33,7 @@ def test_rendering_continues_during_native_input_pause_and_mode_changes(monkeypa
         for level in (32, 96, 160):
             renderer.poll_events()
             renderer.display(np.full((256, 384, 3), level, dtype=np.uint8), [])
+        assert renderer.ctx.error == 'GL_NO_ERROR', 'GL error while native input was paused'
         assert not finished.is_set(), "Presentation waited for native input"
         release.set()
         assert finished.wait(2)
@@ -42,14 +43,27 @@ def test_rendering_continues_during_native_input_pause_and_mode_changes(monkeypa
         assert renderer._window_call(pygame.mouse.get_visible)
         assert not renderer._window_call(pygame.event.get_grab)
 
-        placement = renderer._window_loop._placement
+        placement = renderer._window_loop.placement
         bounds = renderer._window_call(lambda: (placement.window.position, placement.window.size))
         # SDL mode changes must preserve the GL context and dragged window bounds.
         assert renderer.set_fullscreen(True)
         assert renderer.is_fullscreen
         assert renderer.set_fullscreen(True), "Repeated requests must not toggle"
-        renderer.display(np.full((256, 384, 3), 192, dtype=np.uint8), [])
+        captured = []
+        class Capture:
+            def submit(self, pixels, size):
+                captured.append((np.frombuffer(pixels, dtype=np.uint8), size))
+        renderer.display(np.full((256, 384, 3), 192, dtype=np.uint8), [], screenshot=Capture())
+        assert renderer.ctx.error == 'GL_NO_ERROR', 'GL error during fullscreen presentation'
+        assert captured and captured[0][0].mean() > 180, 'Saved fullscreen image was black'
+        assert captured[0][1] == renderer.window_size
+        assert renderer.ctx.viewport == (0, 0, *renderer.window_size)
+        actual = renderer._window_call(placement.snapshot)
+        assert actual['fullscreen'] and actual['presentation'] == 'borderless'
+        assert actual['position'] == actual['bounds'][:2]
+        assert actual['size'] == actual['bounds'][2:]
         assert not renderer.toggle_fullscreen()
+        assert renderer.ctx.error == 'GL_NO_ERROR', 'GL error while restoring window'
         assert renderer._window_call(lambda: (placement.window.position, placement.window.size)) == bounds
         assert renderer._window_call(pygame.mouse.get_visible), "Fullscreen must retain operator mode"
 

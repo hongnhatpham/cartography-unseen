@@ -50,6 +50,10 @@ def sync_environment(root: Path) -> dict[str, str]:
         environment.setdefault("JOURNEY_S3_BUCKET", settings["bucket"])
         if settings.get("account_id"):
             environment.setdefault("CLOUDFLARE_ACCOUNT_ID", settings["account_id"])
+        if settings.get("wrangler_config_home"):
+            # Packaged Windows desktops can virtualize AppData. Background
+            # tasks need the physical config location of the same login.
+            environment["XDG_CONFIG_HOME"] = settings["wrangler_config_home"]
         # A saved setup uses its dedicated profile unless explicit credentials exist.
         if (environment["JOURNEY_STORAGE_TRANSPORT"] == "s3" and
                 not environment.get("AWS_ACCESS_KEY_ID") and not environment.get("AWS_PROFILE")):

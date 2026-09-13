@@ -10,6 +10,21 @@ from app.journey_session import JourneySession
 from app.types import GeneratedFrame
 
 
+def test_configured_map_opens_on_assigned_fullscreen_display(monkeypatch, tmp_path):
+    received = []
+    class Window:
+        def __init__(self, root, **options):
+            received.append((root, options))
+        def close(self): pass
+    monkeypatch.setattr(map_view, 'MapWindow', Window)
+    session = JourneySession(tmp_path, SimpleNamespace(world_seed=42,
+        map_capture_distance=12., map_idle_seconds=1., map_display_monitor=1, fullscreen=True))
+    try:
+        assert received == [(tmp_path, {'display_monitor': 1, 'fullscreen': True})]
+    finally:
+        session.close()
+
+
 @pytest.fixture
 def session(monkeypatch, tmp_path):
     class Window:

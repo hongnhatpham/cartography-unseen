@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import os
 import multiprocessing as mp
 from pathlib import Path
 from queue import Empty, Full
@@ -14,18 +15,19 @@ from app.journey_updates import _merge_snapshot, _snapshot_delta
 class MapWindow:
     """Send small live poses separately from infrequent immutable recorder snapshots."""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, display_monitor=None, fullscreen=False):
         context = mp.get_context("spawn")
         self._poses = context.Queue(maxsize=2)
         self._maps = context.Queue(maxsize=1)
         self._notices = context.Queue(maxsize=16)
         self._stop = context.Event()
-        self._fullscreen = False
+        self._fullscreen = bool(fullscreen)
+        self.window_status = None
         self._operator = False
         self._snapshot = None
         self._reported_exit = False
         self._process = context.Process(target=_run, args=(str(root), self._poses,
-            self._maps, self._notices, self._stop), name="journey-map", daemon=True)
+            self._maps, self._notices, self._stop, display_monitor, fullscreen), name="journey-map", daemon=True)
         self._process.start()
 
     def update(self, snapshot: dict, position: list, rotation: list, active: bool):
@@ -54,7 +56,14 @@ class MapWindow:
         notices = []
         while True:
             try:
-                notices.append(self._notices.get_nowait())
+                message = self._notices.get_nowait()
+                if isinstance(message, dict) and 'window_status' in message:
+                    previous = self.window_status
+                    self.window_status = message['window_status']
+                    if previous is None or previous['fullscreen'] != self.window_status['fullscreen']:
+                        notices.append('__map_display_ready__')
+                else:
+                    notices.append(message)
             except Empty:
                 break
         if not self._process.is_alive() and not self._reported_exit:
@@ -395,17 +404,15 @@ class _Scene:
             self.player_ring[1].render(moderngl.LINE_LOOP)
             self.gl.enable(moderngl.DEPTH_TEST)
         caption = ""
-        if operator:
+        if operator and pose["active"]:
             caption = "JOURNEY MAP · Drag this window to its projector\nF · Fullscreen both displays     F1 · Close controls"
-            if not pose["active"]:
-                caption += "\nWaiting for a visitor. Automatic flight is not recorded."
         elif map_opacity > 0:
             if self.caption_prompt and time.monotonic() < self.prompt_until:
                 latest = self.caption_prompt
                 elapsed = latest.get("elapsed", latest.get("timestamp", 0)-
                                      (self.snapshot.get("started_monotonic") or 0))
                 caption = f"{latest.get('id', 'PROMPT')} · {elapsed:.1f}s\n{latest.get('prompt', '')}"
-        # Prompt captions fade with the map; operator controls stay above both views.
+        # The idle title is visitor-facing, including while F1 is open.
         if caption and not operator:
             self._draw_caption(caption, size)
         if map_opacity < 1:
@@ -414,7 +421,7 @@ class _Scene:
             self._draw_caption(caption, size)
 
 
-def _run(root, poses, maps, notices, stop):
+def _run(root, poses, maps, notices, stop, display_monitor=None, fullscreen=False):
     """The child owns SDL and GL. Failure only closes this process."""
     def notify(value):
         try:
@@ -430,20 +437,30 @@ def _run(root, poses, maps, notices, stop):
         pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
         pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
         pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE)
-        desktop = pygame.display.get_desktop_sizes()[0]
+        monitor = 0 if display_monitor is None else display_monitor
+        desktops = pygame.display.get_desktop_sizes()
+        if not 0 <= monitor < len(desktops):
+            raise RuntimeError(f'Map display {monitor} is unavailable')
+        desktop = desktops[monitor]
         size = (min(1100, max(320, desktop[0]-180)), min(720, max(240, desktop[1]-220)))
-        pygame.display.set_mode(size, pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE, vsync=0)
+        pygame.display.set_mode(size, pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE, display=monitor, vsync=0)
         pygame.display.set_caption("Cartography · Journey map")
         placement = WindowPlacement()
-        placement.window.position = (140, 140)
-        scene = _Scene(moderngl.create_context(), root)
+        if display_monitor is None:
+            placement.window.position = (140, 140)
+        if fullscreen:
+            placement.set_fullscreen(True)
+        context = moderngl.create_context()
+        scene = _Scene(context, root)
         fade = MapFade()
         pose = {"position": [0,0,0], "rotation": [0,0,0], "active": False,
-                "fullscreen": False, "operator": False}
+                "fullscreen": bool(fullscreen), "operator": False}
         clock = pygame.time.Clock()
         dirty, angle = True, 0.0
         received_snapshot = None
         snapshot_dirty = False
+        next_status = last_draw = 0.0
+        drawn_frames = 0
         while not stop.is_set():
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -486,8 +503,15 @@ def _run(root, poses, maps, notices, stop):
                 if min(size) > 0:
                     scene.draw(pose, angle, size, pose["operator"], map_opacity)
                     pygame.display.flip()
+                    last_draw = time.time()
+                    drawn_frames += 1
                 # One final draw is required after the last intermediate fade frame.
                 dirty = transitioning
+            if os.name == 'nt' and time.monotonic() >= next_status:
+                notify({'window_status': dict(placement.snapshot(), updated=time.time(),
+                    drawn_frames=drawn_frames, last_draw=last_draw, active=pose['active'],
+                    operator=pose['operator'], gl_renderer=context.info.get('GL_RENDERER'))})
+                next_status = time.monotonic() + 1
         pygame.quit()
     except Exception as error:
         notify(f"Map window failed: {type(error).__name__}: {error}. Journey recording continues.")

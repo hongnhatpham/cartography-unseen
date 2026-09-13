@@ -27,9 +27,33 @@ def configure_wrangler() -> None:
     sys.path.insert(0, str(ROOT))
     from app.journey_bundle_sync import WranglerTransport
     os.environ["CLOUDFLARE_ACCOUNT_ID"] = ACCOUNT_ID
+    config_home = None
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+        configured = os.environ.get("XDG_CONFIG_HOME")
+        logical_home = Path(configured) if configured else Path(os.environ["APPDATA"]) / "xdg.config"
+        login_path = logical_home / ".wrangler/config/default.toml"
+        if login_path.is_file():
+            # MSIX AppData redirection applies inside the desktop but not to
+            # Task Scheduler. Resolve the actual existing login; do not copy it
+            # and create two independently refreshed OAuth credential files.
+            function = ctypes.windll.kernel32.GetFinalPathNameByHandleW
+            function.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32]
+            function.restype = ctypes.c_uint32
+            buffer = ctypes.create_unicode_buffer(32768)
+            with login_path.open("rb") as stream:
+                length = function(msvcrt.get_osfhandle(stream.fileno()), buffer, len(buffer), 0)
+            if not 0 < length < len(buffer):
+                raise RuntimeError("Could not resolve the Windows Wrangler login location")
+            physical = Path(buffer.value.removeprefix("\\\\?\\"))
+            config_home = str(physical.parents[2])
+            os.environ["XDG_CONFIG_HOME"] = config_home
     WranglerTransport(BUCKET).check_bucket()
-    atomic_text(ROOT / "cache" / "journey-storage.json", json.dumps({
-        "transport": "wrangler", "bucket": BUCKET, "account_id": ACCOUNT_ID}))
+    settings = {"transport": "wrangler", "bucket": BUCKET, "account_id": ACCOUNT_ID}
+    if config_home:
+        settings["wrangler_config_home"] = config_home
+    atomic_text(ROOT / "cache" / "journey-storage.json", json.dumps(settings))
     enable_sync()
     print("Wrangler backup configured with the existing login. No new credentials were created.")
     print("Restart the installation to start automatic uploads and verified cache cleanup.")

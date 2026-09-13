@@ -78,13 +78,14 @@ if (Test-Path -LiteralPath $Target) {
 New-Item -ItemType Directory -Path $Target -Force | Out-Null
 
 $requiredFiles = @(
-    'config.json', 'prompts.json', 'requirements-app.txt', 'requirements-torch.txt',
+    'config.json', 'config.exhibition.json', 'prompts.json', 'requirements-app.txt', 'requirements-torch.txt',
     'requirements-monitor.txt', 'requirements-storage.txt',
     'run.bat', 'run_debug.bat', 'setup_first_run.bat', 'README.md', 'README_EXHIBITION.txt',
     'docs\performance\window-input-stutter-20260905.md',
     'docs\performance\inference-freezes-20260905.md',
-    'docs\journey-map.md', 'docs\journey-storage.md', 'docs\exhibition-windows.md',
-    'dashboard\README.md'
+    'docs\journey-map.md', 'docs\journey-storage.md', 'docs\exhibition-windows.md', 'docs\exhibition-commissioning.md',
+    'docs\performance\exhibition-soak-20260913.md', 'docs\performance\fullscreen-crash-20260913.md',
+    'dashboard\README.md', 'dashboard\INCREMENTAL-HISTORY.md'
 )
 foreach ($file in $requiredFiles) { Copy-PackageFile $file }
 foreach ($dir in @('app', 'shaders', 'assets')) { Copy-PackageTree $dir }
@@ -95,9 +96,11 @@ $toolFiles = @(
     'benchmark.py', 'soak_test.py', 'replay_performance.py',
     'bootstrap_first_run.ps1', 'download_models.py', 'prepare_models.ps1',
     'prepare_runtime.ps1', 'verify_offline.py',
-    'setup_exhibition_windows.ps1', 'run_exhibition.ps1', 'exhibition_status.ps1',
+    'setup_exhibition_windows.ps1', 'run_exhibition.ps1', 'exhibition_status.ps1', 'configure_exhibition_gpu.ps1',
     'monitor_agent.py', 'sync_journeys.py', 'configure_journey_sync.py',
-    'restore_journey.py', 'export_journey_svg.py'
+    'restore_journey.py', 'export_journey_svg.py', 'display_topology.py',
+    'check_borderless.py', 'check_fullscreen.py', 'start_soak.ps1',
+    'soak_app.py', 'soak_watch.py', 'soak_io.py', 'mock_visitors.py'
 )
 foreach ($file in $toolFiles) { Copy-PackageFile (Join-Path 'tools' $file) }
 

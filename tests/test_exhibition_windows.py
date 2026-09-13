@@ -49,6 +49,35 @@ def test_missing_runtime_reports_fault_without_running_installer(tmp_path: Path)
     assert not (tmp_path / "cache/monitoring/supervisor.json.tmp").exists()
 
 
+def test_gpu_preference_is_repeatable_and_preserves_other_settings(tmp_path: Path) -> None:
+    import uuid
+    import winreg
+
+    for name in ("python.exe", "pythonw.exe"):
+        executable = tmp_path / "runtime/python" / name
+        executable.parent.mkdir(parents=True, exist_ok=True)
+        executable.touch()
+    key_name = "Software\\CartographyGpuTest-" + uuid.uuid4().hex
+    python_path = str(tmp_path / "runtime/python/python.exe")
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_name) as key:
+            winreg.SetValueEx(key, python_path, 0, winreg.REG_SZ, "GpuPreference=1;AutoHDREnable=1;")
+            winreg.SetValueEx(key, "unrelated.exe", 0, winreg.REG_SZ, "GpuPreference=1;")
+        for _ in range(2):
+            result = subprocess.run([
+                str(POWERSHELL), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                str(ROOT / "tools/configure_exhibition_gpu.ps1"),
+                "-DeploymentPath", str(tmp_path), "-RegistryPath", "HKCU:\\" + key_name,
+            ], text=True, capture_output=True, timeout=30)
+            assert result.returncode == 0, result.stdout + result.stderr
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_name) as key:
+                assert winreg.QueryValueEx(key, python_path)[0] == "GpuPreference=2;AutoHDREnable=1;"
+                assert winreg.QueryValueEx(key, str(tmp_path / "runtime/python/pythonw.exe"))[0] == "GpuPreference=2;"
+                assert winreg.QueryValueEx(key, "unrelated.exe")[0] == "GpuPreference=1;"
+    finally:
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, key_name)
+
+
 def test_maintenance_prevents_python_launch(tmp_path: Path) -> None:
     # The invalid executable would fail if the maintenance branch tried to start it.
     for relative in (

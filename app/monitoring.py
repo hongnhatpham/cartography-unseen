@@ -73,6 +73,7 @@ def atomic_snapshot(path: Path, kind: str, data: dict) -> bool:
 
 def read_snapshot(path: Path, kind: str, *, now=None, stale_after=20) -> dict:
     now = time.time() if now is None else now
+    read_started = time.monotonic()
     data = {}
     try:
         with path.open("rb") as source:
@@ -85,6 +86,9 @@ def read_snapshot(path: Path, kind: str, *, now=None, stale_after=20) -> dict:
         pass
     result = sanitize_snapshot(kind, data)
     updated = result["updated_at"]
+    # A producer may publish after this read started. Judge freshness at the
+    # end of the read, preserving the supplied clock's epoch for replay/tests.
+    now += max(0, time.monotonic() - read_started)
     result["stale"] = updated is None or not 0 <= now - updated <= stale_after
     return result
 
@@ -287,6 +291,7 @@ def iso_time(value):
 
 def heartbeat(boot_id, sequence, directory: Path, sampler, *, now=None):
     now = time.time() if now is None else now
+    started = time.monotonic()
     metrics = sampler.metrics(now)
     mapping = dict(zip(METRICS, ("cpuPercent", "ramUsedBytes", "ramTotalBytes", "diskUsedBytes", "diskTotalBytes",
         "diskReadBytesPerSecond", "diskWriteBytesPerSecond", "networkTxBytesPerSecond", "networkRxBytesPerSecond",
@@ -294,8 +299,8 @@ def heartbeat(boot_id, sequence, directory: Path, sampler, *, now=None):
     system = {mapping[key]: number(metrics.get(key)) for key in METRICS}
     used = system.pop("diskUsedBytes")
     system["diskFreeBytes"] = system["diskTotalBytes"] - used if used is not None and system["diskTotalBytes"] is not None else None
-    app = read_snapshot(directory / "artwork.json", "artwork", now=now)
-    sync = read_snapshot(directory / "uploader.json", "uploader", now=now, stale_after=1800)
+    app = read_snapshot(directory / "artwork.json", "artwork", now=now + max(0, time.monotonic() - started))
+    sync = read_snapshot(directory / "uploader.json", "uploader", now=now + max(0, time.monotonic() - started), stale_after=1800)
     app_alive, sync_alive = sampler.process_alive(app["pid"]), sampler.process_alive(sync["pid"])
     app_state = {"loading": "starting", "running": "running", "stopped": "stopped", "error": "error"}.get(app["state"], "unknown")
     if app_alive is False:
@@ -419,7 +424,8 @@ def post_heartbeat(endpoint, token, payload, *, opener=None):
     try:
         validate_endpoint(endpoint)
         request = Request(endpoint, data=json.dumps(payload, separators=(",", ":"), allow_nan=False).encode(),
-                          headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+                          headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}",
+                                   "User-Agent": "Cartography-Monitor/1.0"},
                           method="POST")
         with (opener or build_opener(NoRedirect)).open(request, timeout=5) as response:
             return 200 <= response.status < 300

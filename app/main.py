@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
 import logging
 import secrets
@@ -53,6 +54,11 @@ def configure_logging(root: Path, debug: bool) -> Path:
         handlers=handlers,
         force=True,
     )
+    # Keep native crash stacks even when the supervisor has no visible console.
+    # Retain the handle: faulthandler writes directly to its file descriptor.
+    global _fault_log
+    _fault_log = log_path.with_suffix(".fault.log").open("a", encoding="utf-8")
+    faulthandler.enable(file=_fault_log, all_threads=True)
     return log_path
 
 
@@ -325,9 +331,10 @@ def _run() -> int:
         config.display_monitor = args.monitor
     if args.no_map:
         config.journey_map = False
-    # Exhibition windows open in placement mode; F applies fullscreen after
-    # the operator drags each title bar onto the intended projector.
-    fullscreen = config.fullscreen and not (args.debug or args.windowed or config.journey_map)
+    # An explicit map display enables unattended fullscreen startup. Legacy
+    # configurations retain manual placement before F fills both projectors.
+    fullscreen = config.fullscreen and not (args.debug or args.windowed or
+        (config.journey_map and config.map_display_monitor is None))
 
     try:
         import pygame
@@ -367,7 +374,7 @@ def _run() -> int:
             display_monitor=config.display_monitor,
             world_seed=config.world_seed,
             fog_distance=config.fog_distance,
-            window_position=(60, 60) if config.journey_map and config.display_monitor == 0 else None,
+            window_position=(60, 60) if config.journey_map and config.display_monitor == 0 and config.map_display_monitor is None else None,
         )
         renderer.loading_screen("INITIALIZING", "Starting renderer and diffusion worker")
         camera = Camera.create_default()
@@ -395,7 +402,8 @@ def _run() -> int:
         frame_age_ms = ExponentialAverage(0.15)
         running = True
         session_started = perf_counter()
-        overlay_enabled = bool(config.debug_overlay or debug_requested or config.journey_map)
+        overlay_enabled = bool(config.debug_overlay or debug_requested or
+                               (config.journey_map and config.map_display_monitor is None))
         renderer.set_operator_mode(overlay_enabled)
         force_proxy = False
         diagnostic_mode = "none"
@@ -549,7 +557,10 @@ def _run() -> int:
             events = list(renderer.poll_events())
             if journey is not None:
                 for message in journey.poll():
-                    if message == "__toggle_fullscreen__":
+                    if message == '__map_display_ready__':
+                        if not overlay_enabled:
+                            renderer.focus()
+                    elif message == "__toggle_fullscreen__":
                         events.append(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_f, mod=0))
                     elif message == "__toggle_overlay__":
                         events.append(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_F1, mod=0))
@@ -567,6 +578,7 @@ def _run() -> int:
                 ):
                     input_event = True
                 if event.type == pygame.QUIT:
+                    logging.info('Exit requested by SDL window-close event')
                     quit_requested = True
                 elif prompt_editing and event.type == pygame.TEXTINPUT:
                     if ignore_prompt_hotkey_text and event.text.lower() == "p":
@@ -621,6 +633,7 @@ def _run() -> int:
                     ):
                         continue
                     if event.key == pygame.K_ESCAPE:
+                        logging.info('Exit requested by Escape key')
                         quit_requested = True
                     elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                         if not screenshots.busy:

@@ -6,18 +6,63 @@
   "workers_dev": false,
   "preview_urls": false,
   "send_metrics": false,
-  "assets": { "directory": "./dist", "binding": "ASSETS", "run_worker_first": true },
-  "d1_databases": [{ "binding": "DB", "database_name": "monitor", "database_id": "8608cd35-342e-4cfb-9a8a-8ae214ada012", "migrations_dir": "migrations" }],
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "monitor",
+      "database_id": "8608cd35-342e-4cfb-9a8a-8ae214ada012",
+      "migrations_dir": "migrations"
+    }
+  ],
   "ratelimits": [
-    { "name": "REQUEST_LIMIT", "namespace_id": "10201", "simple": { "limit": 180, "period": 60 } },
-    { "name": "INGEST_LIMIT", "namespace_id": "10202", "simple": { "limit": 10, "period": 60 } },
-    { "name": "HISTORY_LIMIT", "namespace_id": "10203", "simple": { "limit": 2, "period": 60 } }
+    {
+      "name": "REQUEST_LIMIT",
+      "namespace_id": "10201",
+      "simple": {
+        "limit": 180,
+        "period": 60
+      }
+    },
+    {
+      "name": "INGEST_LIMIT",
+      "namespace_id": "10202",
+      "simple": {
+        "limit": 10,
+        "period": 60
+      }
+    },
+    {
+      "name": "HISTORY_LIMIT",
+      "namespace_id": "10203",
+      "simple": {
+        "limit": 2,
+        "period": 60
+      }
+    }
   ],
   "vars": {
     "PUBLIC_ORIGIN": "https://monitor.bynhat.com",
-    "ACCESS_TEAM_DOMAIN": "configure-me.cloudflareaccess.com",
-    "ACCESS_AUD": "configure-before-deployment"
+    "ACCESS_TEAM_DOMAIN": "hongnhatpham.cloudflareaccess.com",
+    "ACCESS_AUD": "1ac2bdc1e4c06439645f28c4a73b24fed8031ad304156c3be8e30c354065ab52"
   },
-  "triggers": { "crons": ["* * * * *"] },
-  "observability": { "enabled": false }
+  "triggers": {
+    "crons": [
+      "* * * * *"
+    ]
+  },
+  "observability": {
+    "enabled": false
+  },
+  "account_id": "9591985981c37caaf2ed403cb28f52e5",
+  "routes": [
+    {
+      "pattern": "monitor.bynhat.com",
+      "custom_domain": true
+    }
+  ]
 }

@@ -92,6 +92,13 @@ package. Neither package includes credentials, personal archives or source cache
 
 TWO-PROJECTOR PLACEMENT AND ARCHIVES
 ----------------------------------
+For the supervised exhibition installation, config.exhibition.json supplies
+the game-left/map-right borderless layout and F1 starts closed. Setup preserves
+the active copy in cache/exhibition/config.json. Startup reapplies the Windows
+high-performance GPU preference. See docs/exhibition-commissioning.md for the
+saved setup, verification results and next-exhibition checklist.
+
+For an unassigned, manually arranged map window:
 1. F1 starts open and releases the mouse.
 2. Drag the two windows by their title bars to the desired screens.
 3. Press F to fullscreen both windows on their current screens.
@@ -115,7 +122,7 @@ it smoothly. The player position stays current during automatic travel, so
 returning starts a new stroke at the actual position and leaves a gap for the
 automatic movement. Map scene rendering stops once the title has fully appeared.
 The title screen is cached and has no continuous animation. F1 placement
-instructions remain available over the idle screen.
+instructions are hidden on the idle title screen, including while F1 is open.
 
 Space archives the current map before clearing it and selecting a new prompt.
 Quitting also archives the current nonempty map. Failed saves keep the main

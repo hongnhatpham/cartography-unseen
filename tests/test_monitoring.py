@@ -48,6 +48,36 @@ def test_partial_malformed_and_missing_status_are_unknown(tmp_path, raw):
     assert result["stale"] is True and result["state"] is None
 
 
+def test_snapshot_published_during_system_probe_is_not_stalled(tmp_path, monkeypatch):
+    tick = [1000.0]
+    monkeypatch.setattr(m.time, 'monotonic', lambda: tick[0])
+    class PublishingSampler(EmptySampler):
+        def metrics(self, now):
+            m.atomic_snapshot(tmp_path / 'artwork.json', 'artwork',
+                              {'state': 'running', 'updated_at': now + .5, 'pid': 123})
+            tick[0] += .75
+            return {}
+        def process_alive(self, pid):
+            return True
+    value = m.heartbeat('test', 0, tmp_path, PublishingSampler(), now=100)
+    assert value['app']['state'] == 'running'
+
+
+def test_snapshot_published_during_read_is_not_from_the_future(tmp_path, monkeypatch):
+    path = tmp_path / 'artwork.json'
+    m.atomic_snapshot(path, 'artwork', {'state': 'running', 'updated_at': 100.25})
+    tick = [1000.0]
+    monkeypatch.setattr(m.time, 'monotonic', lambda: tick[0])
+    original = Path.open
+    def delayed_open(self, *args, **kwargs):
+        tick[0] += .5
+        return original(self, *args, **kwargs)
+    monkeypatch.setattr(Path, 'open', delayed_open)
+    assert not m.read_snapshot(path, 'artwork', now=100)['stale']
+    assert m.read_snapshot(path, 'artwork', now=80)['stale']
+    assert m.read_snapshot(path, 'artwork', now=121)['stale']
+
+
 def test_oversized_json_integer_cannot_stop_uploader_startup(tmp_path):
     path = tmp_path / "uploader.json"
     path.write_text(json.dumps({"schema_version": 1, "phase": "idle", "last_verified_at": 10 ** 400,
@@ -327,6 +357,7 @@ def test_https_auth_no_redirect_and_network_failure_isolation():
         def open(self, request, timeout):
             assert timeout == 5
             assert request.headers["Authorization"] == "Bearer secret"
+            assert request.get_header("User-agent") == "Cartography-Monitor/1.0"
             raise OSError("secret token in raw error")
     assert not m.post_heartbeat("https://example.test/api/v1/heartbeat", "secret", {}, opener=Offline())
     assert not m.post_heartbeat("http://example.test/api/v1/heartbeat", "secret", {})

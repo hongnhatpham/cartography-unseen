@@ -23,7 +23,7 @@ from app.window_placement import WindowPlacement
 class WindowLoop:
     active: WindowLoop | None = None
 
-    def __init__(self, create_window: Callable[[], None]):
+    def __init__(self, create_window: Callable[[], WindowPlacement]):
         self._commands: Queue = Queue(maxsize=16)
         self._stop = threading.Event()
         self._render_released = threading.Event()
@@ -62,7 +62,7 @@ class WindowLoop:
 
     def _run(self, create_window):
         try:
-            create_window()
+            self.placement = create_window()
             if self._stop.is_set():
                 raise RuntimeError("Window initialization cancelled")
             # Pygame's automatic resize watcher steals the GL context to call
@@ -72,7 +72,6 @@ class WindowLoop:
             pointer = ctypes.c_void_p
             self._make_current = self._api("SDL_GL_MakeCurrent", ctypes.c_int, pointer, pointer)
             self._get_error = self._api("SDL_GetError", ctypes.c_char_p)
-            self._placement = WindowPlacement()
             self.window = self._api("SDL_GL_GetCurrentWindow", pointer)()
             self.context = self._api("SDL_GL_GetCurrentContext", pointer)()
             if not self.window or not self.context:
@@ -191,11 +190,11 @@ class WindowLoop:
 
     @property
     def is_fullscreen(self):
-        return self._placement.is_fullscreen
+        return self.placement.is_fullscreen
 
     def set_fullscreen(self, enabled):
         def change():
-            fullscreen = self._placement.set_fullscreen(enabled)
+            fullscreen = self.placement.set_fullscreen(enabled)
             self.size = pygame.display.get_window_size()
             return fullscreen
         return self.call(change)

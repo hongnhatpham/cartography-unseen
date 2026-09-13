@@ -15,7 +15,7 @@ import zipfile
 from app.monitoring import UploadProgress
 
 from app.journey_sync import (
-    Archive, ArchiveError, SyncResult, _files, _no_links, _relative_file,
+    Archive, ArchiveError, SyncResult, _files, _directory_size, _no_links, _relative_file,
     _remaining_files, _sha256, _write_receipt, inspect_archive,
 )
 
@@ -39,6 +39,12 @@ class WranglerTransport:
         self.identity = {"transport": "wrangler-zip", "bucket": bucket,
                          "account_id": os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")}
         executable = shutil.which("wrangler.cmd" if os.name == "nt" else "wrangler")
+        # Task Scheduler and already-running desktops can retain the PATH from
+        # before npm was installed. Resolve npm's per-user Windows install too.
+        if not executable and os.name == "nt" and os.environ.get("APPDATA"):
+            installed = Path(os.environ["APPDATA"]) / "npm/wrangler.cmd"
+            if installed.is_file():
+                executable = str(installed)
         if not executable:
             raise RuntimeError("Install Wrangler and run wrangler login before enabling uploads")
         if os.name == "nt":
@@ -61,7 +67,12 @@ class WranglerTransport:
         except (OSError, subprocess.TimeoutExpired) as error:
             raise RuntimeError("Wrangler could not finish; local originals were retained") from error
         if result.returncode:
-            raise RuntimeError("Wrangler failed; check network access and run wrangler login if needed")
+            # Keep credential diagnostics private while exposing stable runtime
+            # codes needed to distinguish launch failures from network failures.
+            diagnostics = (result.stdout or b"") + (result.stderr or b"")
+            codes = sorted(set(re.findall(rb"\b(?:ERR_[A-Z_]+|EACCES|EPERM|ENOENT|EINVAL|ENOTFOUND)\b", diagnostics)))
+            detail = ', '.join(code.decode('ascii') for code in codes)
+            raise RuntimeError(f"Wrangler failed (exit {result.returncode}{': ' + detail if detail else ''}); check network access and run wrangler login if needed")
 
     def check_bucket(self) -> None:
         self._run(["r2", "bucket", "info", self.identity["bucket"]])
@@ -343,7 +354,7 @@ def sync_bundles_once(root: Path, transport: BundleTransport, *, prefix: str = "
                 result.local_bytes += directory.stat().st_size
                 continue
             completed = (directory / "complete.json").exists()
-            result.local_bytes += sum(path.stat().st_size for path in _files(directory))
+            result.local_bytes += _directory_size(directory, mutable=not completed)
             receipt = _read_receipt(root, directory, destination)
             if receipt and receipt.get("pruning"):
                 validated = True

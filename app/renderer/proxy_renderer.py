@@ -85,8 +85,9 @@ class ProxyRenderer:
         create_window = lambda: self._create_window(window_size, fullscreen, display_monitor, window_position)
         self._window_loop = WindowLoop(create_window) if sys.platform == "win32" else None
         if self._window_loop is None:
-            create_window()
-            self._placement = WindowPlacement()
+            self._placement = create_window()
+        else:
+            self._placement = self._window_loop.placement
         window_size = self._window_size()
 
         self.ctx = None
@@ -123,19 +124,18 @@ class ProxyRenderer:
         # Create a real windowed mode first so SDL remembers a useful restore
         # size when an app launched fullscreen later receives F11.
         pygame.display.set_mode(window_size, flags, display=display_monitor, vsync=0)
+        placement = WindowPlacement()
         if window_position is not None:
-            from pygame._sdl2 import Window
-            Window.from_display_module().position = window_position
+            placement.window.position = window_position
         if fullscreen:
-            result = pygame.display.toggle_fullscreen()
-            if result < 0:
-                raise RuntimeError(f"SDL could not enter fullscreen: {pygame.get_error()}")
+            placement.set_fullscreen(True)
         pygame.display.set_caption("Cartography Unseen")
         pygame.event.set_grab(True)
         pygame.mouse.set_visible(False)
         pygame.mouse.get_rel()
         # The prompt editor explicitly enables composition when opened.
         pygame.key.stop_text_input()
+        return placement
 
     def _initialize_renderer(self, project_root, resolution, window_size, world_seed, fog_distance):
         self.ctx.enable(moderngl.DEPTH_TEST)
@@ -302,10 +302,7 @@ class ProxyRenderer:
 
     def focus(self) -> None:
         """Return input to traversal after closing controls on the map projector."""
-        def activate():
-            from pygame._sdl2 import Window
-            Window.from_display_module().focus()
-        self._window_call(activate)
+        self._window_call(self._placement.window.focus)
 
     @property
     def is_fullscreen(self) -> bool:
@@ -328,9 +325,8 @@ class ProxyRenderer:
     def resize_window_to_render(self) -> None:
         """Match a windowed SDL window to the active generation dimensions."""
         def resize():
-            if not pygame.display.is_fullscreen():
-                from pygame._sdl2 import Window
-                Window.from_display_module().size = (self.render_width, self.render_height)
+            if not self._placement.is_fullscreen:
+                self._placement.window.size = (self.render_width, self.render_height)
             if self._window_loop:
                 self._window_loop.size = pygame.display.get_window_size()
         self._window_call(resize)
@@ -979,10 +975,20 @@ class ProxyRenderer:
         self.quad_vao.render()
 
         if screenshot is not None:
-            # Read the displayed crop, sharpening and warp before any text/trail.
-            screenshot.submit(self.ctx.screen.read(
-                viewport=(0, 0, *self.window_size), components=3, alignment=1,
-            ), self.window_size)
+            # ModernGL 5.12 selects GL_COLOR_ATTACHMENT0 even when reading the
+            # default backbuffer, which raises GL_INVALID_OPERATION. Draw the
+            # same crop/sharpening into a real color attachment for capture.
+            capture_texture = self.ctx.texture(self.window_size, 3)
+            capture = self.ctx.framebuffer(color_attachments=[capture_texture])
+            try:
+                capture.use()
+                self.quad_vao.render()
+                screenshot.submit(capture.read(components=3, alignment=1), self.window_size)
+            finally:
+                self.ctx.screen.use()
+                self.ctx.viewport = (0, 0, *self.window_size)
+                capture.release()
+                capture_texture.release()
 
         if trail is not None and trail_camera is not None and trail_depth is not None:
             self.trail_renderer.draw(

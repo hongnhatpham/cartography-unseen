@@ -134,11 +134,16 @@ async function readApi(url: URL, env: Env, now: number) {
     return json({ serverTime: now, machines, nextCursor: results.length > 200 ? machines.at(-1)!.id : null });
   }
   if (url.pathname === '/api/v1/series') {
-    queryParams(url, ['machineId', 'from', 'to', 'resolution']);
+    queryParams(url, ['machineId', 'from', 'to', 'resolution', 'since']);
     const id = machineId(url);
     const to = url.searchParams.has('to') ? Number(url.searchParams.get('to')) : now;
     const from = url.searchParams.has('from') ? Number(url.searchParams.get('from')) : to - 24 * 3600_000;
     const resolution = url.searchParams.get('resolution') ?? '5m';
+    const since = url.searchParams.has('since') ? Number(url.searchParams.get('since')) : null;
+    // Ingest permits 30 seconds of device clock skew. Keep that overlap so a
+    // sample initially ahead of the chart's end is picked up when time catches up.
+    const cursor = now - 30_000;
+    if (since !== null && (!Number.isSafeInteger(since) || since < now - RAW_RETENTION_MS || since > now || resolution !== '5m')) fail(400, 'Invalid series cursor');
     if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) || from >= to || to > now + 30_000 || from < now - RAW_RETENTION_MS || !['raw', '5m'].includes(resolution)) fail(400, 'Invalid series window or resolution');
     const exists = await env.DB.prepare('SELECT id FROM machines WHERE id = ?').bind(id).first();
     if (!exists) fail(404, 'Machine not found');
@@ -159,9 +164,29 @@ async function readApi(url: URL, env: Env, now: number) {
       pendingBytes: '$.archiveSync.pendingBytes', verifiedBytes: '$.archiveSync.verifiedBytes',
     };
     const columns = Object.entries(metrics).map(([key, path]) => `AVG(json_extract(payload_json, '${path}')) AS ${key}`).join(', ');
-    const { results } = await env.DB.prepare(`SELECT bucket_at AS bucketAt, COUNT(*) AS sampleCount, ${columns}
-      FROM samples WHERE machine_id = ? AND sampled_at >= ? AND sampled_at < ? GROUP BY bucket_at ORDER BY bucket_at LIMIT 2017`).bind(id, from, to).all();
-    return json({ machineId: id, from, to, resolution, points: results });
+    // Use receipt time for deltas: a late replay can change an older bucket.
+    // Inclusive cursor boundaries intentionally replay equal-millisecond writes.
+    let changed: number[] | null = null;
+    if (since !== null) {
+      const delta = await env.DB.prepare(`SELECT DISTINCT bucket_at AS bucketAt
+        FROM samples INDEXED BY samples_machine_received
+        WHERE machine_id = ? AND received_at >= ? AND received_at <= ?
+          AND bucket_at >= ? AND bucket_at < ?`).bind(id, since, now, Math.floor(from / 300_000) * 300_000, to).all<{ bucketAt: number }>();
+      changed = delta.results.map(row => row.bucketAt);
+      if (!changed.length) return json({ machineId: id, from, to, resolution, cursor, points: [] });
+    }
+    const query = changed === null
+      ? env.DB.prepare(`SELECT bucket_at AS bucketAt, COUNT(*) AS sampleCount, ${columns}
+          FROM samples INDEXED BY samples_machine_time
+          WHERE machine_id = ? AND sampled_at >= ? AND sampled_at < ?
+          GROUP BY bucket_at ORDER BY bucket_at LIMIT 2017`).bind(id, from, to)
+      : env.DB.prepare(`SELECT bucket_at AS bucketAt, COUNT(*) AS sampleCount, ${columns}
+          FROM samples INDEXED BY samples_rollup
+          WHERE machine_id = ? AND bucket_at IN (SELECT value FROM json_each(?))
+            AND sampled_at >= ? AND sampled_at < ?
+          GROUP BY bucket_at ORDER BY bucket_at LIMIT 2017`).bind(id, JSON.stringify(changed), from, to);
+    const { results } = await query.all();
+    return json({ machineId: id, from, to, resolution, cursor, points: results });
   }
   if (url.pathname === '/api/v1/alerts') {
     queryParams(url, ['machineId', 'before']);
@@ -257,7 +282,15 @@ export function createWorker(options: { humanVerifier?: HumanVerifier; now?: () 
         if (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['127.0.0.1', 'localhost'].includes(url.hostname))) fail(403, 'HTTPS required');
         const origin = request.headers.get('Origin');
         if (origin && origin !== env.PUBLIC_ORIGIN) fail(403, 'Origin not allowed');
-        if (request.headers.get('Sec-Fetch-Site') === 'cross-site') fail(403, 'Cross-site request not allowed');
+        // Access returns from its separate login origin via a document navigation.
+        // Allow that entry point; the human JWT is still verified before assets.
+        const documentNavigation = request.method === 'GET'
+          && request.headers.get('Sec-Fetch-Mode') === 'navigate'
+          && request.headers.get('Sec-Fetch-Dest') === 'document'
+          && !url.pathname.startsWith('/api/');
+        if (request.headers.get('Sec-Fetch-Site') === 'cross-site' && !documentNavigation) {
+          fail(403, 'Cross-site request not allowed');
+        }
         if (url.href.length > 2048) fail(414, 'URL too long');
         const now = (options.now ?? Date.now)();
         await rate(env.REQUEST_LIMIT, `ip:${request.headers.get('CF-Connecting-IP') ?? 'local'}`);

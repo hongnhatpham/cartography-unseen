@@ -120,7 +120,7 @@ def test_bounded_image_selection_keeps_nearby_and_older_coverage():
     assert any(item["id"] < 10 for item in selected)
 
 
-def test_render_crossfades_map_to_cached_title_and_keeps_operator_controls(tmp_path, monkeypatch):
+def test_render_crossfades_map_to_cached_title_and_hides_idle_operator_guide(tmp_path, monkeypatch):
     """Exercise GL composition and ensure settled idle never loads map images."""
     import moderngl
     import pygame
@@ -159,6 +159,6 @@ def test_render_crossfades_map_to_cached_title_and_keeps_operator_controls(tmp_p
     scene.draw(pose, 0, (640,480), False)
     assert scene.title_texture is texture
     scene.draw(pose, 0, (640,480), True)
-    assert framebuffer.read(components=3) != idle.tobytes()
+    assert framebuffer.read(components=3) == idle.tobytes()
     framebuffer.release()
     context.release()
