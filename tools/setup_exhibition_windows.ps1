@@ -404,7 +404,11 @@ try {
     Set-LocalUser -Name $UserName -AccountNeverExpires -PasswordNeverExpires $true
     # Add only the known local SID. Enumerating Users can fail on unrelated stale domain SIDs.
     try { Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $user.SID.Value -ErrorAction Stop }
-    catch [Microsoft.PowerShell.Commands.MemberExistsException] { }
+    catch {
+        # Windows PowerShell can wrap the exception for -ErrorAction Stop; its stable error ID survives.
+        if ($_.Exception -isnot [Microsoft.PowerShell.Commands.MemberExistsException] -and
+            $_.FullyQualifiedErrorId -ne 'MemberExists,Microsoft.PowerShell.Commands.AddLocalGroupMemberCommand') { throw }
+    }
     if ($MonitorCredentialPath -and $existingMonitor) {
         # Remove an earlier SYSTEM task before its executable becomes user-writable.
         Stop-ScheduledTask -TaskName $monitorTaskName

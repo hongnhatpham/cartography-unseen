@@ -343,7 +343,10 @@ foreach ($command in $commands) {{ Invoke-Expression $command.Extent.Text }}
     assert result.stdout.split() == ["created", "updated"]
 
 
-@pytest.mark.parametrize("outcome", ["added", "already", "denied", "trust"])
+@pytest.mark.parametrize("outcome", [
+    "added", "already", "already-record", "already-wrapped", "denied", "trust",
+    "denied-wrapped", "trust-wrapped", "ambiguous-message", "unrelated-command",
+])
 def test_setup_users_membership_never_enumerates_unrelated_sids(outcome: str) -> None:
     """Run the real account-update statements with the reported enumeration failure injected."""
     result = setup_function_command(rf"""
@@ -362,6 +365,28 @@ function Add-LocalGroupMember {{
     if ('{outcome}' -eq 'already') {{ throw [Microsoft.PowerShell.Commands.MemberExistsException]::new('already a member') }}
     if ('{outcome}' -eq 'denied') {{ throw [ComponentModel.Win32Exception]::new(5) }}
     if ('{outcome}' -eq 'trust') {{ throw [ComponentModel.Win32Exception]::new(1789) }}
+    if ('{outcome}' -eq 'already-record') {{
+        $errorRecord = [Management.Automation.ErrorRecord]::new(
+            [Microsoft.PowerShell.Commands.MemberExistsException]::new('already a member'),
+            'MemberExists', [Management.Automation.ErrorCategory]::ResourceExists, $Member)
+        $PSCmdlet.WriteError($errorRecord)
+    }}
+    if ('{outcome}' -in @('already-wrapped', 'denied-wrapped', 'trust-wrapped', 'ambiguous-message', 'unrelated-command')) {{
+        $errorId = switch ('{outcome}') {{
+            'already-wrapped' {{ 'MemberExists,Microsoft.PowerShell.Commands.AddLocalGroupMemberCommand' }}
+            'denied-wrapped' {{ 'AccessDenied,Microsoft.PowerShell.Commands.AddLocalGroupMemberCommand' }}
+            'trust-wrapped' {{ '1789,Microsoft.PowerShell.Commands.AddLocalGroupMemberCommand' }}
+            'unrelated-command' {{ 'MemberExists,OtherCommand' }}
+            default {{ 'UnidentifiedError,Microsoft.PowerShell.Commands.AddLocalGroupMemberCommand' }}
+        }}
+        # Preserve the cmdlet's stable ID while reproducing ErrorAction Stop's wrapper.
+        # All messages deliberately look like duplicates: text alone must never authorize swallowing.
+        $wrapped = [Management.Automation.ActionPreferenceStopException]::new('already a member')
+        $errorRecord = [Management.Automation.ErrorRecord]::new(
+            $wrapped, $errorId, [Management.Automation.ErrorCategory]::NotSpecified, $Member)
+        $script:injectedError = $errorRecord
+        throw $errorRecord
+    }}
 }}
 $outerTry = $ast.Find({{ param($node)
     $node -is [System.Management.Automation.Language.TryStatementAst] -and
@@ -376,10 +401,20 @@ foreach ($statement in $outerTry.Body.Statements) {{
 if (-not $statements.Count) {{ throw 'Missing production membership seam' }}
 $caughtCode = 0
 try {{ Invoke-Expression ($statements -join "`n") }} catch {{
-    if ($_.Exception -isnot [ComponentModel.Win32Exception]) {{ throw }}
-    $caughtCode = $_.Exception.NativeErrorCode
+    if ('{outcome}' -in @('denied-wrapped', 'trust-wrapped', 'ambiguous-message', 'unrelated-command')) {{
+        if ($_.Exception -ne $script:injectedError.Exception -or
+            $_.FullyQualifiedErrorId -ne $script:injectedError.FullyQualifiedErrorId) {{ throw }}
+        $caughtCode = -1
+    }} else {{
+        if ($_.Exception -isnot [ComponentModel.Win32Exception]) {{ throw }}
+        $caughtCode = $_.Exception.NativeErrorCode
+    }}
 }}
-$expectedCode = switch ('{outcome}') {{ 'denied' {{ 5 }} 'trust' {{ 1789 }} default {{ 0 }} }}
+$expectedCode = switch ('{outcome}') {{
+    'denied' {{ 5 }} 'trust' {{ 1789 }}
+    {{ $_ -in @('denied-wrapped', 'trust-wrapped', 'ambiguous-message', 'unrelated-command') }} {{ -1 }}
+    default {{ 0 }}
+}}
 if ($caughtCode -ne $expectedCode -or $script:addCalls -ne 1) {{ throw "Wrong membership result: code=$caughtCode calls=$script:addCalls" }}
 Write-Output 'membership verified'
 """)
