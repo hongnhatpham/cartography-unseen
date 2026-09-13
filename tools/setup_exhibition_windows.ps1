@@ -115,6 +115,33 @@ function Get-SshServicePaths {
     }
     return @{ executable = $Matches.exe; config = $(if ($Matches.ContainsKey('config')) { $Matches.config } else { $defaultConfig }) }
 }
+function Get-SshServiceRegistration {
+    $service = Get-CimInstance Win32_Service -Filter "Name='sshd'"
+    $registryExists = Test-Path -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\sshd'
+    if ([bool]$service -ne $registryExists) {
+        throw 'sshd registry and service manager state disagree. Reboot or repair the service registration before rerunning setup.'
+    }
+    return $service
+}
+function Resolve-TrustedSshd {
+    param([string]$Executable)
+    $canonical = Join-Path $env:SystemRoot 'System32\OpenSSH\sshd.exe'
+    $resolved = (Resolve-Path -LiteralPath $Executable).Path
+    if ($resolved -ne $canonical) { throw 'Missing sshd service can only be registered from the inbox System32\OpenSSH\sshd.exe.' }
+    $item = Get-Item -LiteralPath $resolved -Force
+    if ($item -isnot [IO.FileInfo]) { throw 'The sshd service executable must be a file.' }
+    $cursor = $item
+    while ($cursor) {
+        if ($cursor.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'The sshd service executable path must not traverse a reparse point.' }
+        $cursor = if ($cursor -is [IO.FileInfo]) { $cursor.Directory } else { $cursor.Parent }
+    }
+    $signature = Get-AuthenticodeSignature -LiteralPath $resolved
+    if ($signature.Status -ne 'Valid' -or -not $signature.SignerCertificate -or
+        $signature.SignerCertificate.Subject -notmatch '(^|,\s*)O=Microsoft Corporation(,|$)') {
+        throw 'The sshd service executable must have a valid Microsoft signature.'
+    }
+    return $resolved
+}
 function Restore-SshFile {
     param($Change)
     if ($Change.existed) {
@@ -289,7 +316,7 @@ $activateAccount = $activationPending -and (-not $user -or -not $user.Enabled)
 if ($prior -and $prior.deploymentPath -ne $root) { throw 'Existing deployment record uses a different path.' }
 if ((Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) -and -not $prior) { throw 'Unmanaged scheduled task name collision.' }
 if ($user -and (Test-LocalAdministrator -Account $UserName)) { throw 'The exhibition account is an administrator; remove that membership before continuing.' }
-$service = Get-CimInstance Win32_Service -Filter "Name='sshd'"
+$service = Get-SshServiceRegistration
 $sshPaths = Get-SshServicePaths -CommandLine $(if ($service) { $service.PathName } else { '' })
 $sshd = $sshPaths.executable
 $configPath = $sshPaths.config
@@ -313,6 +340,8 @@ $sshPort = $ports[0]
     writableDirectories = @($root); activeConfiguration = 'cache\exhibition\config.json'
     privilegedState = $stateRoot; publicKeyCount = $keys.Count; sshConfiguration = $candidate
     installOpenSsh = ($capability.State -ne 'Installed'); task = $taskName
+    registerSshService = (-not [bool]$service)
+    sshOperationalLogAvailable = [bool](Get-WinEvent -ListLog 'OpenSSH/Operational' -ErrorAction SilentlyContinue)
     interface = $adapter.Name; approvedPeers = $peers; sshPort = $sshPort; sshConfigPath = $configPath
     existingFirewallRules = 'unchanged'; existingServiceConfiguration = 'unchanged; restart running service to load the added user block'
     accountExists = [bool]$user; rollbackRecord = $recordPath
@@ -338,9 +367,13 @@ $record = if ($prior) { $prior } else {
         version = 1; deploymentPath = $root; userName = $UserName; userSid = $null; createdUser = $false
         taskName = $taskName; firewallRuleName = $ruleName; disabledFirewallRules = @()
         originalCapabilityState = [string]$capability.State; originalService = $service | Select-Object PathName, StartMode, State
+        createdService = $false
         originalServiceRecovery = $null; originalServiceFailureFlag = $null; originalAclFile = (Join-Path $stateRoot 'deployment-acl.txt')
         originalTask = $null; completedPhase = 'begin'; updatedAt = $null
     }
+}
+if ($record.PSObject.Properties.Name -notcontains 'createdService') {
+    $record | Add-Member -NotePropertyName createdService -NotePropertyValue $false
 }
 function Save-Record {
     $record.updatedAt = (Get-Date).ToUniversalTime().ToString('o')
@@ -350,6 +383,7 @@ Save-Record
 $sshChanges = @()
 $accountActivationAttempted = $false
 $passwordResetAttempted = $false
+$createdServiceThisRun = $false
 $candidatePath = $null
 $keyCandidate = $null
 try {
@@ -417,7 +451,30 @@ try {
     New-NetFirewallRule -Name $ruleName -DisplayName "Exhibition SSH ($UserName): approved Tailscale peers" `
         -Direction Inbound -Action Allow -Enabled True -Profile Any -Protocol TCP -LocalPort $sshPort `
         -RemoteAddress $peers -InterfaceAlias $adapter.Name -Program $sshd -Service sshd | Out-Null
-    if (-not $service) { Set-Service sshd -StartupType Automatic }
+    if (-not $service) {
+        $registeredService = Get-SshServiceRegistration
+        if ($registeredService -and $capability.State -eq 'Installed') {
+            throw 'sshd was registered after the setup plan was read. Rerun setup to preserve that service.'
+        }
+        $trustedSshd = Resolve-TrustedSshd -Executable $sshd
+        if ($registeredService) {
+            # A capability installed by this run may already have registered its service.
+            $installedPaths = Get-SshServicePaths -CommandLine $registeredService.PathName
+            if ($installedPaths.executable -ne $trustedSshd -or $installedPaths.config -ne $configPath -or
+                $registeredService.StartName -notin @('LocalSystem', 'NT AUTHORITY\SYSTEM')) {
+                throw 'The newly installed sshd service has unexpected paths or account. Review it before rerunning setup.'
+            }
+        }
+        else {
+            # Omitting Credential and DependsOn uses LocalSystem with no dependencies.
+            New-Service -Name sshd -BinaryPathName ('"{0}"' -f $trustedSshd) -DisplayName 'OpenSSH SSH Server' `
+                -Description 'SSH protocol based service to provide secure encrypted communications between two untrusted hosts over an insecure network.' `
+                -StartupType Manual -ErrorAction Stop | Out-Null
+        }
+        $createdServiceThisRun = $true
+        $record.createdService = $true
+        Save-Record
+    }
     $record.completedPhase = 'ssh-staged'; Save-Record
     $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
         -Argument ('-NoLogo -NoProfile -ExecutionPolicy Bypass -File "{0}" -DeploymentPath "{1}"' -f (Join-Path $root 'tools\run_exhibition.ps1'), $root) -WorkingDirectory $root
@@ -458,7 +515,11 @@ try {
     $sshChanges += Publish-SshFile -CandidatePath $keyCandidate -Path $keyPath -BackupPath (Join-Path $stateRoot 'authorized_keys.previous')
     $sshChanges += Publish-SshFile -CandidatePath $candidatePath -Path $configPath -BackupPath $configBackup
     if ($service -and $service.State -eq 'Running') { Restart-Service sshd }
-    elseif (-not $service) { Start-Service sshd }
+    elseif (-not $service) {
+        Start-Service sshd
+        if ((Get-Service sshd).Status -ne 'Running') { throw 'The newly registered sshd service did not reach Running state.' }
+        Set-Service sshd -StartupType Automatic
+    }
     # Windows PowerShell 5.1 accepts an empty SecureString; no plaintext password or prompt is needed.
     $blankPassword = New-Object Security.SecureString
     try {
@@ -478,6 +539,14 @@ try {
     Write-Output "Configured. Log on locally as $UserName to start the interactive task. Rollback record: $recordPath"
 }
 catch {
+    # A persisted ownership record alone never authorizes removing a service on a later run.
+    if ($createdServiceThisRun) {
+        if (Get-Service sshd -ErrorAction SilentlyContinue) {
+            Stop-Service sshd -ErrorAction Stop
+            Invoke-CheckedNative sc.exe @('delete', 'sshd')
+        }
+        $record.createdService = $false
+    }
     # Disable an account we just activated before rolling back its SSH restrictions.
     # If disabling fails, leave those restrictions in place rather than expose global login policy.
     if ($accountActivationAttempted) {

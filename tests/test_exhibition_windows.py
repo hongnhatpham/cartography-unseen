@@ -225,7 +225,7 @@ def setup_function_command(body: str) -> subprocess.CompletedProcess[str]:
 $ErrorActionPreference = 'Stop'
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile('{script_path}', [ref]$tokens, [ref]$errors)
-foreach ($name in @('Get-MonitorPlan', 'Read-MonitorCredential', 'New-ExhibitionMonitorTask', 'Add-ExhibitionSshConfiguration', 'Get-SshServicePaths', 'Publish-SshFile', 'Restore-SshFile')) {{
+foreach ($name in @('Get-MonitorPlan', 'Read-MonitorCredential', 'New-ExhibitionMonitorTask', 'Add-ExhibitionSshConfiguration', 'Get-SshServicePaths', 'Get-SshServiceRegistration', 'Resolve-TrustedSshd', 'Publish-SshFile', 'Restore-SshFile')) {{
     $function = $ast.Find({{ param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
     }}, $true)
@@ -493,6 +493,168 @@ def test_existing_ssh_service_keeps_executable_and_config_paths(custom: bool) ->
     paths = json.loads(result.stdout)
     assert paths["executable"] == (r"C:\Tools\OpenSSH\sshd.exe" if custom else r"C:\Windows\System32\OpenSSH\sshd.exe")
     assert paths["config"].lower() == (r"C:\SSH config\sshd_config" if custom else r"C:\ProgramData\ssh\sshd_config").lower()
+
+
+@pytest.mark.parametrize("scm,registry", [(False, False), (True, True), (True, False), (False, True)])
+def test_ssh_registration_requires_registry_and_service_manager_agreement(scm: bool, registry: bool) -> None:
+    result = setup_function_command(rf"""
+function Get-CimInstance {{ param($ClassName, $Filter); if (${str(scm).lower()}) {{ return [pscustomobject]@{{ Name = 'sshd' }} }} }}
+function Test-Path {{
+    param($LiteralPath)
+    if ($LiteralPath -ne 'HKLM:\SYSTEM\CurrentControlSet\Services\sshd') {{ throw 'Wrong service registry path' }}
+    return ${str(registry).lower()}
+}}
+$registration = Get-SshServiceRegistration
+if ([bool]$registration -ne ${str(scm).lower()}) {{ throw 'Wrong service lookup result' }}
+Write-Output 'registration verified'
+""")
+    assert (result.returncode == 0) == (scm == registry), result.stdout + result.stderr
+    if scm != registry:
+        assert "registry and service manager state disagree" in result.stderr
+
+
+@pytest.mark.parametrize("case", ["trusted", "wrong-path", "invalid-signature", "other-publisher"])
+def test_missing_service_requires_canonical_microsoft_signed_sshd(case: str, tmp_path: Path) -> None:
+    # Use a real regular-file object while isolating signature and canonical-path inputs.
+    fixture = tmp_path / "sshd.exe"
+    fixture.write_text("test executable", encoding="utf-8")
+    fixture_path = str(fixture).replace("'", "''")
+    result = setup_function_command(rf"""
+$canonical = Join-Path $env:SystemRoot 'System32\OpenSSH\sshd.exe'
+$fixture = Microsoft.PowerShell.Management\Get-Item -LiteralPath '{fixture_path}'
+function Resolve-Path {{
+    param($LiteralPath)
+    return [pscustomobject]@{{ Path = $(if ('{case}' -eq 'wrong-path') {{ 'C:\project\sshd.exe' }} else {{ $canonical }}) }}
+}}
+function Get-Item {{ param($LiteralPath, [switch]$Force); return $fixture }}
+function Get-AuthenticodeSignature {{
+    param($LiteralPath)
+    if ($LiteralPath -ne $canonical) {{ throw 'Signature was checked on the wrong binary' }}
+    return [pscustomobject]@{{
+        Status = $(if ('{case}' -eq 'invalid-signature') {{ 'HashMismatch' }} else {{ 'Valid' }})
+        SignerCertificate = [pscustomobject]@{{ Subject = $(if ('{case}' -eq 'other-publisher') {{ 'CN=Publisher, O=Other Corporation' }} else {{ 'CN=Microsoft Windows, O=Microsoft Corporation, C=US' }}) }}
+    }}
+}}
+$resolved = Resolve-TrustedSshd -Executable $canonical
+if ($resolved -ne $canonical) {{ throw 'Wrong service executable returned' }}
+Write-Output 'binary verified'
+""")
+    assert (result.returncode == 0) == (case == "trusted"), result.stdout + result.stderr
+    if case == "wrong-path":
+        assert "only be registered from the inbox" in result.stderr
+    elif case != "trusted":
+        assert "valid Microsoft signature" in result.stderr
+
+
+@pytest.mark.parametrize("existing,failure", [
+    ("missing", "none"), ("missing", "register"), ("missing", "start"),
+    ("missing", "record"), ("missing", "late"),
+    ("missing", "not-running"),
+    ("running", "late"), ("stopped", "none"), ("prior-created", "late"),
+])
+def test_setup_registers_missing_ssh_service_and_rolls_back_only_its_creation(existing: str, failure: str) -> None:
+    """Exercise production service setup/activation/catch statements with installed binaries."""
+    result = setup_function_command(rf"""
+$capability = [pscustomobject]@{{ State = 'Installed' }}
+$sshd = Join-Path $env:SystemRoot 'System32\OpenSSH\sshd.exe'
+$configPath = Join-Path $env:ProgramData 'ssh\sshd_config'
+$script:exists = '{existing}' -ne 'missing'
+$script:running = '{existing}' -in @('running', 'prior-created')
+$service = if ($script:exists) {{ [pscustomobject]@{{ PathName = $sshd; State = $(if ($script:running) {{ 'Running' }} else {{ 'Stopped' }}); StartMode = 'Manual' }} }} else {{ $null }}
+$record = [pscustomobject]@{{ completedPhase = 'deployment-acl'; originalService = $service }}
+if ('{existing}' -eq 'prior-created') {{ $record | Add-Member NoteProperty createdService $true }}
+$migration = $ast.EndBlock.Statements | Where-Object {{ $_.Extent.Text.StartsWith("if (`$record.PSObject.Properties.Name -notcontains 'createdService')") }}
+Invoke-Expression $migration.Extent.Text
+$createdServiceThisRun = $false
+$accountActivationAttempted = $false; $passwordResetAttempted = $false
+$sshChanges = @(); $script:published = $false
+$script:created = 0; $script:deleted = 0; $script:started = 0; $script:stopped = 0; $script:automatic = $false
+$script:recordFailed = $false
+$script:trusted = $false
+function Add-WindowsCapability {{ throw 'Installed capability must not be reinstalled' }}
+function Get-CimInstance {{ param($ClassName, $Filter); if ($script:exists) {{ return [pscustomobject]@{{ PathName = $sshd; State = $(if ($script:running) {{ 'Running' }} else {{ 'Stopped' }}) }} }} }}
+function Resolve-Path {{ param($LiteralPath); if ($LiteralPath -ne $sshd) {{ throw 'Wrong service executable' }}; return [pscustomobject]@{{ Path = $sshd }} }}
+function Resolve-TrustedSshd {{ param($Executable); if ($Executable -ne $sshd) {{ throw 'Wrong service executable' }}; $script:trusted = $true; return $sshd }}
+function Test-Path {{ param($LiteralPath); if ($LiteralPath -ne 'HKLM:\SYSTEM\CurrentControlSet\Services\sshd') {{ throw 'Unexpected registry lookup' }}; return $script:exists }}
+function New-Service {{
+    [CmdletBinding()]param($Name, $BinaryPathName, $DisplayName, $Description, $StartupType, $Credential)
+    if (-not $script:trusted -or $Name -ne 'sshd' -or $BinaryPathName -ne ('"' + $sshd + '"') -or
+        $DisplayName -ne 'OpenSSH SSH Server' -or -not $Description -or $StartupType -ne 'Manual' -or $Credential) {{ throw 'Incorrect service registration or non-LocalSystem account' }}
+    if ($script:exists) {{ throw 'Existing service was registered again' }}
+    if ('{failure}' -eq 'register') {{ throw 'Injected registration failure' }}
+    $script:exists = $true; $script:created++
+}}
+function Set-Service {{
+    param($Name, $StartupType)
+    if (-not $script:exists) {{ throw [ComponentModel.Win32Exception]::new(1060) }}
+    if ($StartupType -ne 'Automatic' -or -not $script:published -or -not $script:running) {{ throw 'Automatic startup enabled before verified SSH startup' }}
+    if ('{existing}' -ne 'missing') {{ throw 'Pre-existing startup policy changed' }}
+    $script:automatic = $true
+}}
+function Start-Service {{
+    param($Name)
+    if (-not $script:exists) {{ throw [ComponentModel.Win32Exception]::new(1060) }}
+    if (-not $script:published) {{ throw 'Service started before SSH activation' }}
+    $script:started++
+    if ('{failure}' -eq 'start') {{ throw 'Injected service startup failure' }}
+    $script:running = '{failure}' -ne 'not-running'
+}}
+function Restart-Service {{ param($Name); if (-not $script:running) {{ throw 'Stopped existing service restarted' }} }}
+function Stop-Service {{ param($Name); if ('{existing}' -ne 'missing') {{ throw 'Pre-existing service stopped' }}; $script:running = $false; $script:stopped++ }}
+function Get-Service {{ param($Name); if ($script:exists) {{ return [pscustomobject]@{{ Status = $(if ($script:running) {{ 'Running' }} else {{ 'Stopped' }}) }} }} }}
+function Invoke-CheckedNative {{
+    param($Executable, $Arguments)
+    if ($Executable -ne 'sc.exe' -or ($Arguments -join ' ') -ne 'delete sshd' -or
+        '{existing}' -ne 'missing' -or $script:running) {{ throw 'Unsafe service deletion' }}
+    $script:exists = $false; $script:deleted++
+}}
+function Save-Record {{
+    if ('{failure}' -eq 'record' -and $script:created -and -not $script:recordFailed) {{ $script:recordFailed = $true; throw 'Injected service record failure' }}
+}}
+function Restore-SshFile {{ throw 'No SSH file change was injected in this seam' }}
+$outerTry = $ast.Find({{ param($node)
+    $node -is [System.Management.Automation.Language.TryStatementAst] -and $node.Body.Extent.Text.Contains('$sshChanges += Publish-SshFile')
+}}, $true)
+$prepare = @($outerTry.Body.Statements | Where-Object {{
+    $_.Extent.Text.StartsWith('if ($capability.State') -or
+    ($_.Extent.Text.StartsWith('if (-not $service)') -and ($_.Extent.Text.Contains('New-Service') -or $_.Extent.Text.Contains('Set-Service')))
+}})
+$activate = $outerTry.Body.Statements | Where-Object {{ $_.Extent.Text.StartsWith('if ($service -and $service.State') }}
+if (-not $prepare.Count -or -not $activate) {{ throw 'Missing production service transaction seam' }}
+$caught = $false
+try {{
+    foreach ($statement in $prepare) {{ Invoke-Expression $statement.Extent.Text }}
+    $script:published = $true
+    Invoke-Expression $activate.Extent.Text
+    if ('{failure}' -eq 'late') {{ throw 'Injected later setup failure' }}
+}} catch {{
+    $caught = $true
+    $originalError = $_
+    try {{ Invoke-Expression ($outerTry.CatchClauses[0].Body.Statements.Extent.Text -join "`n") }} catch {{
+        if ($_.Exception.Message -ne $originalError.Exception.Message -and $_.Exception.Message -ne 'ScriptHalted') {{ throw }}
+    }}
+}}
+if ($caught -ne ('{failure}' -ne 'none')) {{ throw "Unexpected service setup failure=$caught : $originalError" }}
+if ('{existing}' -eq 'missing') {{
+    $expectedCreated = if ('{failure}' -eq 'register') {{ 0 }} else {{ 1 }}
+    if ($script:created -ne $expectedCreated) {{ throw 'Missing service was not registered exactly once' }}
+    if ($script:exists -ne ('{failure}' -eq 'none')) {{ throw 'Wrong service state after setup/rollback' }}
+    if ($expectedCreated -and $record.createdService -ne ('{failure}' -eq 'none')) {{ throw 'Wrong service ownership record' }}
+    if ('{failure}' -eq 'none') {{
+        if (-not $script:running -or $script:started -ne 1 -or -not $script:automatic) {{ throw 'New service did not start with automatic startup' }}
+        # A successful rerun sees the service as pre-existing, even with createdService in its record.
+        $service = Get-SshServiceRegistration
+        $createdServiceThisRun = $false
+        foreach ($statement in $prepare) {{ Invoke-Expression $statement.Extent.Text }}
+        Invoke-Expression $activate.Extent.Text
+        if ($script:created -ne 1 -or $script:started -ne 1 -or -not $record.createdService) {{ throw 'Rerun re-registered service or lost ownership history' }}
+    }}
+    if ('{failure}' -ne 'none' -and $script:deleted -ne $expectedCreated) {{ throw 'Created service was not rolled back' }}
+}} elseif ($script:created -or $script:deleted -or $script:stopped -or -not $script:exists) {{ throw 'Pre-existing service changed ownership' }}
+Write-Output 'service transaction verified'
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip().endswith("service transaction verified")
 
 
 @pytest.mark.parametrize("failure", ["staging", "activation", "after_activation"])
