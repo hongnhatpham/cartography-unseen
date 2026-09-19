@@ -30,6 +30,12 @@ heartbeat, restarts the app with bounded backoff, and latches repeated failures
 with `cache\monitoring\maintenance.stop`. Do not add an HKCU startup entry or
 start `run.bat` over SSH: either can create a duplicate or invisible app.
 
+Do not use `Stop-ScheduledTask` while the artwork/GPU process is running. On 19
+September 2026, two attempts correlated with a complete host crash before any
+deployment file copied. For a planned deployment, focus the main artwork window
+and press Esc once, confirm the task state is `Ready` and no artwork Python
+process remains, copy and hash-verify the files, then use `Start-ScheduledTask`.
+
 ## Live watch
 
 Copy the current watcher when it changes. For a watch that must survive SSH
