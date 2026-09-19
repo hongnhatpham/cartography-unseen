@@ -433,6 +433,10 @@ Launch directly in a particular generation mode with:
 
 TROUBLESHOOTING
 ---------------
+Remote operators should begin with docs\exhibition-remote-operations.md. It
+documents the hp-zbook SSH boundary, authoritative health snapshots, supervisor,
+live watcher, power baseline, storage checks and two-projector verification.
+
 Raw AI frames reuse their GPU image between updates, avoiding repeated uploads.
 Reprojection skips unused live-camera renders while retaining its display-rate
 interpolated depth. Bounded caches reuse exact world-field samples and chunk
