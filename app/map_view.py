@@ -60,7 +60,9 @@ class MapWindow:
                 if isinstance(message, dict) and 'window_status' in message:
                     previous = self.window_status
                     self.window_status = message['window_status']
-                    if previous is None or previous['fullscreen'] != self.window_status['fullscreen']:
+                    if (previous is None or
+                            previous['fullscreen'] != self.window_status['fullscreen'] or
+                            previous['display'] != self.window_status['display']):
                         notices.append('__map_display_ready__')
                 else:
                     notices.append(message)

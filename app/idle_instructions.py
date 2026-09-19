@@ -18,6 +18,11 @@ class IdleInstructions:
         progress = min(1.0, max(0.0, (now - self._fade_start) / duration))
         return self._fade_from + (self._target - self._fade_from) * progress
 
+    @property
+    def showing(self) -> bool:
+        """Whether the visitor title has entered its idle presentation state."""
+        return bool(self._target)
+
     def update(self, now: float, *, active: bool, suppressed: bool) -> float:
         """Wait ten idle seconds, then fade in; physical input fades back out."""
         if active:

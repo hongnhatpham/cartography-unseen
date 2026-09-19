@@ -333,8 +333,10 @@ def _run() -> int:
         config.journey_map = False
     # An explicit map display enables unattended fullscreen startup. Legacy
     # configurations retain manual placement before F fills both projectors.
+    unattended_projectors = bool(config.journey_map and
+                                 config.map_display_monitor is not None)
     fullscreen = config.fullscreen and not (args.debug or args.windowed or
-        (config.journey_map and config.map_display_monitor is None))
+        (config.journey_map and not unattended_projectors))
 
     try:
         import pygame
@@ -402,8 +404,10 @@ def _run() -> int:
         frame_age_ms = ExponentialAverage(0.15)
         running = True
         session_started = perf_counter()
-        overlay_enabled = bool(config.debug_overlay or debug_requested or
-                               (config.journey_map and config.map_display_monitor is None))
+        # Assigned exhibition displays always boot visitor-ready. --debug still
+        # provides an explicit operator override for troubleshooting.
+        overlay_enabled = bool(debug_requested or not unattended_projectors and
+                               (config.debug_overlay or config.journey_map))
         renderer.set_operator_mode(overlay_enabled)
         force_proxy = False
         diagnostic_mode = "none"
@@ -452,12 +456,17 @@ def _run() -> int:
             }, timestamp=session_started)
 
         def toggle_projectors() -> None:
-            """Use each window's current monitor and preserve its restore bounds."""
+            """Fullscreen both windows and remember their selected displays."""
             nonlocal notice, notice_until
             try:
-                enabled = renderer.set_fullscreen(not renderer.is_fullscreen)
+                enabled = not renderer.is_fullscreen
+                enabled = renderer.set_fullscreen(enabled)
                 if journey is not None:
                     journey.window.set_fullscreen(enabled)
+                if enabled:
+                    # Startup should return directly to fullscreen visitor mode.
+                    commit_many({"fullscreen": True,
+                                 "display_monitor": renderer.window_status["display"]}, live=False)
                 notice = "BOTH WINDOWS FULLSCREEN - F restores placement" if enabled else "DRAG WINDOW TITLE BARS TO SCREENS - F fullscreen both"
             except RuntimeError as exc:
                 notice = f"DISPLAY SETUP: {exc}"
@@ -558,6 +567,9 @@ def _run() -> int:
             if journey is not None:
                 for message in journey.poll():
                     if message == '__map_display_ready__':
+                        map_status = journey.window.window_status
+                        if map_status['fullscreen'] and config.map_display_monitor != map_status['display']:
+                            commit("map_display_monitor", map_status['display'], live=False)
                         if not overlay_enabled:
                             renderer.focus()
                     elif message == "__toggle_fullscreen__":
@@ -1057,6 +1069,15 @@ def _run() -> int:
                 now, active=physical_input,
                 suppressed=overlay is not None or hide_proxy_until_ai,
             )
+            if journey is not None:
+                try:
+                    journey.set_title_idle(
+                        idle_instructions.showing, now, resumed=physical_input,
+                    )
+                except (RuntimeError, OSError) as exc:
+                    notice = f"MAP IDLE SAVE FAILED - will retry. {exc}"
+                    notice_until = now + 8.0
+                    logging.error("Idle journey completion failed: %s", exc)
             screenshot = None
             if screenshot_requested:
                 if latest_ai is not None and not force_proxy and diagnostic_mode == "none":

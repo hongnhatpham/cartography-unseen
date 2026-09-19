@@ -1,6 +1,6 @@
 # Windows exhibition host
 
-Create a clean, standard local Windows account for the one-week exhibition starting November 19, 2026. The exhibition account has no local password or expiry date. Setup leaves other accounts and administrator membership alone and gives the exhibition user Modify access throughout the project, so ordinary editing and troubleshooting work normally. There is no kiosk mode or date-based shutdown.
+Create a clean, standard local Windows account for the one-week exhibition starting November 19, 2026. The exhibition account has no local password or expiry date. Setup leaves other accounts and administrator membership alone and gives the exhibition user Modify access throughout the project, so ordinary editing and troubleshooting work normally. There is no kiosk mode or date-based shutdown. For unattended power-on, run `tools/enable_exhibition_autologon.ps1` once from an elevated console after setup; it refuses administrator accounts and logon-notice policies.
 
 `tools/setup_exhibition_windows.ps1` prints a read-only plan by default. `-Apply` creates the account, grants project access, configures inbound OpenSSH, and registers tasks that run at the exhibition user's logon. Run setup from an elevated, 64-bit Windows PowerShell console on the target machine. It does not enable autologon or change Windows Update, sleep, display timeout, lock policy, or Defender.
 
@@ -58,7 +58,13 @@ See [commissioning and persistence](exhibition-commissioning.md) for the dual-di
 
 Select `exhibition` at the Windows sign-in screen and sign in with the password field empty. `CartographyExhibition-exhibition` starts the artwork supervisor in that user's desktop with limited privileges. Open `C:\Exhibition\Cartography` in Explorer and create a desktop shortcut there if useful. Confirm the user can open, edit and save project files. No task stores a password or runs project code as SYSTEM.
 
-Staff can restart Windows from Start > Power > Restart, then select `exhibition` and sign in without a password to start the artwork again. Setup does not enable automatic sign-in or change shutdown rights. Test this full flow from the exhibition desktop during commissioning; if venue policy hides or denies Restart, have the existing administrator resolve that policy. The project task can also be stopped and started from the exhibition account using the commands below.
+Without the optional autologon helper, staff restart Windows, select `exhibition`, and sign in without a password to start the artwork again. For unattended recovery, run the helper from an elevated PowerShell console:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Exhibition\Cartography\tools\enable_exhibition_autologon.ps1
+```
+
+It verifies that an empty password can perform an interactive logon, records the previous Winlogon values under `%ProgramData%\CartographyExhibition`, then enables automatic sign-in for the non-administrator account. This makes anyone with physical access able to enter the exhibition desktop; use it only on the dedicated installation machine. Reboot twice and verify automatic sign-in and both fullscreen windows after each boot; the registry method is not considered commissioned until both reboots pass. Also check BIOS power-after-loss behavior for power-cut recovery. The project task can be stopped and started from the exhibition account using the commands below.
 
 Choose the venue's power and update settings in Windows Settings. Record manual changes so they can be restored afterward. Check BIOS power-after-loss behavior if unattended recovery from a power cut matters.
 

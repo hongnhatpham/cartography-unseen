@@ -111,6 +111,72 @@ def test_prompt_markers_and_delayed_frames_follow_source_revision_across_reset(s
     assert session.window.updates[-1][0]["id"] != archived["id"]
 
 
+def test_title_idle_completes_each_nonempty_session_once(session):
+    camera = SimpleNamespace(position=np.zeros(3), pitch=12., yaw=35.)
+    session.prompt("forest", 3, "initial", camera, {}, timestamp=0.)
+    initial_id = session.recorder.id
+    assert session.set_title_idle(True, .05) is None
+    assert session.recorder.id == initial_id
+    assert session.recorder.snapshot()["prompts"][0]["revision"] == 3
+    session.set_title_idle(False, .06, resumed=True)
+
+    observe(session, [0., 0., 0.], .1, interacting=True)
+    observe(session, [2., 0., 0.], .2, interacting=True)
+
+    first = session.set_title_idle(True, 10.1)
+    assert first is not None
+    assert json.loads((first / "manifest.json").read_text(encoding="utf-8"))[
+        "completion_reason"
+    ] == "idle"
+    assert session.set_title_idle(True, 10.2) is None
+    assert len(list(session.recorder.root.glob("*/complete.json"))) == 1
+    opening = session.recorder.snapshot()["prompts"]
+    assert [(item["revision"], item["trigger"]) for item in opening] == [(3, "idle")]
+
+    session.set_title_idle(False, 10.3, resumed=True)
+    observe(session, [20., 0., 0.], 10.4, interacting=True)
+    session.offer_frame(frame(10.4, 4, [20., 0., 0.], 3))
+    session.recorder.flush()
+    assert session.recorder.snapshot()["images"][0]["position"] == [20., 0., 0.]
+    second = session.set_title_idle(True, 20.4)
+    assert second is not None and second != first
+    assert len(list(session.recorder.root.glob("*/complete.json"))) == 2
+
+
+def test_title_idle_blocks_ghost_capture_and_retries_a_failed_save(session, monkeypatch):
+    observe(session, [0., 0., 0.], .1, interacting=True)
+    session.idle_seconds = 30.
+    original = session.recorder.reset
+    attempts = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("disk busy")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(session.recorder, "reset", fail_once)
+    with pytest.raises(OSError, match="disk busy"):
+        session.set_title_idle(True, 10.1)
+    before_retry = session.recorder.snapshot()
+    observe(session, [10., 0., 0.], 10.15)
+    assert not session.active
+    after_gate = session.recorder.snapshot()["segments"]
+    assert len(after_gate) == 1
+    assert after_gate[0]["points"] == before_retry["segments"][0]["points"]
+    assert after_gate[0]["ended"] == 10.15
+    saved = session.set_title_idle(True, 10.2)
+    assert saved is not None and attempts == 2
+
+    observe(session, [10., 0., 0.], 11.)
+    assert not session.active
+    assert not session.recorder.nonempty
+    observe(session, [20., 0., 0.], 12., interacting=True)
+    assert session.active
+    assert session.recorder.snapshot()["segments"][0]["points"][0]["position"] == [20., 0., 0.]
+
+
 def test_low_disk_pauses_capture_and_resumes_with_a_disconnected_route(session):
     camera = SimpleNamespace(position=np.zeros(3), pitch=0., yaw=0.)
     session.prompt("forest", 0, "initial", camera, {}, timestamp=0.)

@@ -1,6 +1,7 @@
 import math
 from queue import Queue
 from threading import Event
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -62,6 +63,17 @@ def test_pose_channel_stays_bounded_and_pending_snapshot_retries():
     assert window._maps.get_nowait()["metadata"] == second
     window.update(second, [10, 20, 30], [0, 45, 0], False)
     assert window._maps.empty()
+
+
+def test_window_status_reports_display_change_even_when_fullscreen_stays_true():
+    window = MapWindow.__new__(MapWindow)
+    window._notices = Queue()
+    window._process = SimpleNamespace(is_alive=lambda: True)
+    window._reported_exit = False
+    window.window_status = {"display": 0, "fullscreen": True}
+    window._notices.put({"window_status": {"display": 1, "fullscreen": True}})
+    assert window.poll() == ['__map_display_ready__']
+    assert window.window_status["display"] == 1
 
 
 def test_deltas_replace_or_remove_live_tail_append_images_and_reset():
