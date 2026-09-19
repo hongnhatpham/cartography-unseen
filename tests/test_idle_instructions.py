@@ -16,11 +16,14 @@ from app.types import ConditioningFrame, GeneratedFrame
 def test_idle_delay_and_fades_use_elapsed_time():
     instructions = IdleInstructions(100.)
     sample = lambda now, active=False: instructions.update(now, active=active, suppressed=False)
+    assert not instructions.showing
     assert sample(109.9) == 0.
     assert sample(110.) == 0.
+    assert instructions.showing
     assert sample(110.6) == pytest.approx(.5)
     assert sample(111.2) == pytest.approx(1.)
     assert sample(115., active=True) == pytest.approx(1.)
+    assert not instructions.showing
     assert sample(115.125, active=True) == pytest.approx(.5)
     assert sample(115.25, active=True) == 0.
     assert sample(125.25) == 0.

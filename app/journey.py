@@ -350,8 +350,8 @@ class JourneyRecorder:
             raise
         return directory
 
-    def reset(self, timestamp: float) -> Path | None:
-        previous = self._archive("space", timestamp)
+    def reset(self, timestamp: float, *, reason: str = "space") -> Path | None:
+        previous = self._archive(reason, timestamp)
         self._new_journey(float(timestamp), previous.name if previous else None)
         return previous
 

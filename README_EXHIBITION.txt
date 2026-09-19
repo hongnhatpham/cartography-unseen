@@ -124,8 +124,11 @@ automatic movement. Map scene rendering stops once the title has fully appeared.
 The title screen is cached and has no continuous animation. F1 placement
 instructions are hidden on the idle title screen, including while F1 is open.
 
-Space archives the current map before clearing it and selecting a new prompt.
-Quitting also archives the current nonempty map. Failed saves keep the main
+When the idle title screen begins to appear, the current nonempty map is
+completed once and becomes immediately eligible for upload. Returning interaction
+starts a fresh map for the next visitor. Space still archives manually before
+clearing the map and selecting a new prompt. Quitting archives any remaining
+nonempty map. Failed saves keep the main
 window open with an error; resolve the disk problem and press Escape to retry.
 Closing only the map window leaves recording running until the main app exits.
 

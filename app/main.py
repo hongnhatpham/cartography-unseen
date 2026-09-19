@@ -1069,6 +1069,15 @@ def _run() -> int:
                 now, active=physical_input,
                 suppressed=overlay is not None or hide_proxy_until_ai,
             )
+            if journey is not None:
+                try:
+                    journey.set_title_idle(
+                        idle_instructions.showing, now, resumed=physical_input,
+                    )
+                except (RuntimeError, OSError) as exc:
+                    notice = f"MAP IDLE SAVE FAILED - will retry. {exc}"
+                    notice_until = now + 8.0
+                    logging.error("Idle journey completion failed: %s", exc)
             screenshot = None
             if screenshot_requested:
                 if latest_ai is not None and not force_proxy and diagnostic_mode == "none":

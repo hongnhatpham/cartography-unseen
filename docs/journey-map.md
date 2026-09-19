@@ -322,8 +322,10 @@ two-projector workload before choosing final update rates and texture budgets.
   and F1 placement instructions remain readable over the idle screen.
 - Resuming at another location updates the player marker immediately and
   starts a disconnected segment without counting automatic travel.
-- Space saves a nonempty archive before clearing the map. Normal quit saves
-  the current nonempty archive. Repeated saves do not overwrite prior journeys.
+- The transition to the idle title completes a nonempty visitor map once, making
+  it immediately uploadable; returning interaction starts a fresh journey.
+  Space still saves manually, and normal quit saves any remaining nonempty map.
+  Repeated idle frames and saves do not overwrite prior journeys.
 - Save failures preserve recoverable journey data, and delayed frames cannot
   cross a journey reset or enter the wrong human segment.
 - The archive retains original image resolution and enough data to rebuild
