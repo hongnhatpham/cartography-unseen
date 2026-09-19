@@ -309,6 +309,11 @@ class ProxyRenderer:
         placement = self._window_loop if self._window_loop else self._placement
         return placement.is_fullscreen
 
+    @property
+    def window_status(self) -> dict:
+        """Return the owning thread's actual display and presentation state."""
+        return self._window_call(self._placement.snapshot)
+
     def set_fullscreen(self, enabled: bool) -> bool:
         """Fill the current monitor, preserving the window and its restore bounds."""
         if self._window_loop:

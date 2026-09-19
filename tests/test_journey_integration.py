@@ -39,7 +39,8 @@ def exhibition(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "configure_logging", lambda *a, **k: tmp_path / "test.log")
     monkeypatch.setattr(sys, "argv", ["app"])
     state = SimpleNamespace(tick=0, events={}, displays=[], windows=[], renderer=None,
-                            moving=True, close_ticks=[], focus_ticks=[], root=tmp_path)
+                            moving=True, close_ticks=[], focus_ticks=[], root=tmp_path,
+                            main_display=0, map_display=1)
     monkeypatch.setattr(main, "perf_counter", lambda: 10. + state.tick / 10.)
     monkeypatch.setattr(journey_session, "perf_counter", lambda: 10. + state.tick / 10.)
 
@@ -48,17 +49,29 @@ def exhibition(monkeypatch, tmp_path):
         def tick(self, fps): state.tick += 1
 
     class Window:
-        def __init__(self, root):
+        def __init__(self, root, **options):
             self.fullscreen = []
             self.operator = []
             self.updates = []
             self.closed = False
+            self.options = options
+            self.window_status = {"display": state.map_display,
+                                  "fullscreen": bool(options.get("fullscreen", False))}
+            self.ready = True
             state.windows.append(self)
 
-        def set_fullscreen(self, enabled): self.fullscreen.append((state.tick, enabled))
+        def set_fullscreen(self, enabled):
+            self.fullscreen.append((state.tick, enabled))
+            self.window_status["fullscreen"] = enabled
+            self.ready = True
         def set_operator_mode(self, enabled): self.operator.append((state.tick, enabled))
+
         def update(self, *args): self.updates.append(args)
-        def poll(self): return []
+        def poll(self):
+            if self.ready:
+                self.ready = False
+                return ['__map_display_ready__']
+            return []
         def close(self): self.closed = True
 
     class Renderer:
@@ -81,6 +94,10 @@ def exhibition(monkeypatch, tmp_path):
         def close(self): state.close_ticks.append(state.tick)
         def focus(self): state.focus_ticks.append(state.tick)
         def set_operator_mode(self, enabled): self.operator.append((state.tick, enabled))
+
+        @property
+        def window_status(self):
+            return {"display": state.main_display, "fullscreen": self.is_fullscreen}
 
         def set_fullscreen(self, enabled):
             self.is_fullscreen = enabled
@@ -150,6 +167,33 @@ def test_f_requires_overlay_and_space_hold_archives_once_then_quit_saves(exhibit
     assert current["prompts"][0]["prompt"] != previous["prompts"][0]["prompt"]
     assert current["preceding_archive"] == previous["id"]
     assert all((state.root / "journeys" / item["id"] / "map.svg").exists() for item in archived)
+
+
+def test_placement_fullscreen_persists_both_selected_monitors(exhibition):
+    state = exhibition
+    state.main_display = 2
+    state.map_display = 3
+    state.events = {0: [key(pygame.K_f)], 1: [key(pygame.K_ESCAPE)]}
+    assert main.run() == 0
+    config = json.loads((state.root / "config.json").read_text(encoding="utf-8"))
+    assert config["fullscreen"] is True
+    assert config["display_monitor"] == 2
+    assert config["map_display_monitor"] == 3
+
+
+def test_configured_displays_start_both_fullscreen_with_overlay_closed(exhibition):
+    state = exhibition
+    config_path = state.root / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config.update(display_monitor=0, map_display_monitor=1, fullscreen=True,
+                  debug_overlay=True)
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    state.events = {0: [key(pygame.K_ESCAPE)]}
+    assert main.run() == 0
+    assert state.renderer.initial_fullscreen is True
+    assert state.renderer.operator[0] == (0, False)
+    assert state.windows[0].options == {"display_monitor": 1, "fullscreen": True}
+    assert state.windows[0].operator[0] == (0, False)
 
 
 def test_failed_quit_save_keeps_windows_open_and_retries_same_journey(exhibition, monkeypatch):

@@ -98,11 +98,11 @@ the active copy in cache/exhibition/config.json. Startup reapplies the Windows
 high-performance GPU preference. See docs/exhibition-commissioning.md for the
 saved setup, verification results and next-exhibition checklist.
 
-For an unassigned, manually arranged map window:
-1. F1 starts open and releases the mouse.
-2. Drag the two windows by their title bars to the desired screens.
-3. Press F to fullscreen both windows on their current screens.
-4. Press F1 to close the overlay and return mouse control to the main experience.
+With `display_monitor` and `map_display_monitor` configured, both windows open
+fullscreen on those displays and F1 starts closed, ready for visitors. To change
+placement, press F1, then F to restore both windows. Drag them to the desired
+screens and press F again. The selected monitor indices are saved automatically;
+the next launch restores both fullscreen windows there with F1 closed.
 
 To rearrange later, open F1, press F to restore the window bounds, drag the
 windows, and press F again. F works in either window while F1 is open.
@@ -408,9 +408,11 @@ what keeps text, gamepads and interiors out of the picture.
 
 DISPLAY AND MONITORS
 --------------------
-The default two-window launch starts in placement mode. Drag the windows to
-their screens, press F to fullscreen both, then close F1 to play. With --no-map,
-the first-person window follows the fullscreen setting in config.json.
+The configured two-window launch starts both windows fullscreen on their saved
+display indices with the F1 overlay closed. Use F1 then F to enter placement
+mode; pressing F again saves both current displays for the next launch. Legacy
+configs without map_display_monitor still start in placement mode. With
+--no-map, the first-person window follows the fullscreen setting in config.json.
 
 Set display_monitor in config.json to a zero-based monitor index, or launch from
 a Command Prompt with:
